@@ -40,6 +40,10 @@ def _probe_quality(row):
     schema = evidence.get("schema") or {}
     return (
         2 if scope == "kernel" else 1,
+        # Trace-native Input Dims bound by name + ordered position outrank a
+        # runtime wrapper/launcher probe at the same scope: the dims are the
+        # profiler's own record of that kernel's operands, not a reconstruction.
+        1 if evidence.get("evidence_origin") == "two_trace_mapping" else 0,
         1 if bucket == "exact" else 0,
         len(schema.get("tensors") or []),
     )
@@ -51,14 +55,17 @@ def _normalise_probe(row, source_path):
     scope = evidence.get("probe_scope")
     if not scope:
         scope = "kernel" if evidence.get("level") == "P" else "wrapper"
+    origin = evidence.get("evidence_origin") or "shape_logger"
     evidence.update({
         "level": "P",
         "probe_scope": scope,
-        "evidence_origin": "shape_logger",
+        "evidence_origin": origin,
         "probe_table": os.path.abspath(source_path),
     })
     value["semantic_evidence"] = evidence
-    value.setdefault("shape", {})["source"] = "runtime_probe_%s" % scope
+    value.setdefault("shape", {})["source"] = (
+        "two_trace_kernel_dims" if origin == "two_trace_mapping"
+        else "runtime_probe_%s" % scope)
     return value
 
 
@@ -234,12 +241,15 @@ def merge(clean_table_path, probe_table_paths, out_dir):
         }
         for audit in audits if audit["evidence"]["level"] == "U"]
     probe_scope_counts = {}
+    probe_origin_counts = {}
     for audit in audits:
         evidence = audit["evidence"]
         if evidence["level"] != "P":
             continue
         label = "P(%s)" % evidence.get("probe_scope", "wrapper")
         probe_scope_counts[label] = probe_scope_counts.get(label, 0) + 1
+        origin = evidence.get("evidence_origin", "shape_logger")
+        probe_origin_counts[origin] = probe_origin_counts.get(origin, 0) + 1
     unavailable_reason_counts = {}
     for item in unavailable:
         code = item["reason_code"]
@@ -249,10 +259,17 @@ def merge(clean_table_path, probe_table_paths, out_dir):
         "schema_version": 1,
         "status": "pass" if classified else "fail",
         "classification_complete": classified,
-        "priority": ["K", "P(kernel)", "P(wrapper)", "U"],
+        "priority": [
+            "K",
+            "P(kernel via two_trace_mapping)",
+            "P(kernel via shape_logger)",
+            "P(wrapper)",
+            "U",
+        ],
         "row_count": len(audits),
         "evidence_counts": counts,
         "probe_scope_counts": probe_scope_counts,
+        "probe_origin_counts": probe_origin_counts,
         "unavailable_reason_counts": unavailable_reason_counts,
         "probe_tables": [
             os.path.abspath(path) for path in probe_table_paths],

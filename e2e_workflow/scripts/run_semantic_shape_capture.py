@@ -5,6 +5,7 @@ import base64
 import glob
 import json
 import os
+import re
 import subprocess
 import time
 
@@ -84,13 +85,41 @@ if sentinel not in text:
             encoded)
 
 
+def _rank0_stage_traces(trace_dir):
+    """Rank-0 per-stage windows, keyed by stage.
+
+    ``profile_by_stage`` writes ``<id>-TP-0-EXTEND.trace.json.gz`` and
+    ``<id>-TP-0-DECODE.trace.json.gz``.  These are the only files a
+    single-rank consumer may read; ``merged-*.trace.json.gz`` is a cross-TP-rank
+    merge and is excluded on purpose.
+    """
+    stages = {}
+    for path in glob.glob(
+            os.path.join(trace_dir, "**", "*.trace.json*"), recursive=True):
+        match = re.search(
+            r"-TP-0-([A-Za-z_]+)\.trace\.json(\.gz)?$", os.path.basename(path))
+        if not match:
+            continue
+        stage = match.group(1).upper()
+        current = stages.get(stage)
+        if current is None or os.path.getmtime(path) > os.path.getmtime(current):
+            stages[stage] = path
+    return stages
+
+
 def _latest_trace(trace_dir):
     candidates = glob.glob(
         os.path.join(trace_dir, "**", "*.trace.json*"), recursive=True)
     if not candidates:
         return ""
+    # sglang writes "-TP-0-EXTEND.trace.json.gz" / "-TP-0-DECODE.trace.json.gz",
+    # which the old "-TP-0.trace.json" test never matched, so this silently fell
+    # back to the cross-rank merged trace. Match the stage-suffixed rank-0 files
+    # first, then the unsuffixed form, and only then anything else.
     rank_zero = [
-        path for path in candidates if "-TP-0.trace.json" in path]
+        path for path in candidates
+        if re.search(
+            r"-TP-0(-[A-Za-z_]+)?\.trace\.json(\.gz)?$", os.path.basename(path))]
     if rank_zero:
         candidates = rank_zero
     return max(candidates, key=os.path.getmtime)
@@ -241,6 +270,10 @@ bash %s
             setup.get("source_wrapper_map", [])),
         "shape_log": shape_log,
         "capture_trace": trace,
+        # Rank-0 per-stage windows of this replay. When the replay ran with
+        # disable_cuda_graph, these are exactly the graph-off "mapping" traces
+        # that two-trace op mapping consumes.
+        "rank0_stage_traces": _rank0_stage_traces(trace_dir),
         "benchmark_log": benchmark_log,
         "elapsed_seconds": round(time.time() - started, 3),
     }

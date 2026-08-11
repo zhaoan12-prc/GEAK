@@ -155,7 +155,7 @@ def _normalize(value):
     return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
 
-def _candidate_groups(row, target, groups, table):
+def _candidate_groups(row, target, groups, table, two_trace_entry=None):
     phase = str(table["phase"]).lower()
     layer_id = int(table["representative_layer_id"])
     candidates = [
@@ -171,6 +171,13 @@ def _candidate_groups(row, target, groups, table):
         "candidate_wrapper")
     if not explicit and target.get("parent_operator") != "unresolved":
         explicit = target.get("parent_operator")
+    if not explicit and two_trace_entry:
+        # Position-bound identity beats a bare kernel name: the two-trace map
+        # already resolved WHICH launch this row is, so use its operator as the
+        # wrapper hint instead of falling back to name-only text matching.
+        recovered = (two_trace_entry.get("op") or {})
+        if recovered.get("recovered"):
+            explicit = recovered.get("canonical_op")
     if not explicit:
         return []
     needle = _normalize(explicit)
@@ -675,9 +682,62 @@ def _markdown(table_doc):
     return "\n".join(lines) + "\n"
 
 
-def merge(table_path, capture_plan_path, shape_log_path, out_dir):
+def _two_trace_schema(entry):
+    """Trace-native Input Dims of the bound kernel, as an axis-free tensor list."""
+    tensors = []
+    dims = (entry.get("shape") or {}).get("input_dims") or []
+    types = (entry.get("shape") or {}).get("input_types") or []
+    for index, dim in enumerate(dims):
+        if not isinstance(dim, list) or not dim:
+            continue
+        tensors.append({
+            "arg_name": "args[%d]" % index,
+            "io": "input",
+            "shape": [int(value) for value in dim],
+            "dtype": types[index] if index < len(types) else None,
+            "source": "two_trace_graph_off_external_id",
+        })
+    return {"tensors": tensors, "linear_interface": None}
+
+
+def _two_trace_evidence(entry, table):
+    """Kernel-scope P evidence recovered from the workload-identical graph-off run."""
+    match = entry.get("match") or {}
+    return {
+        "level": "P",
+        "probe_scope": "kernel",
+        "status": "matched",
+        "source": "two_trace_graph_off_external_id",
+        "evidence_origin": "two_trace_mapping",
+        "contained_by": (entry.get("op") or {}).get("canonical_op"),
+        "op_instance_id": (entry.get("op") or {}).get("op_instance_id"),
+        "confidence": match.get("confidence", "medium"),
+        "mapping_basis": (
+            "kernel name + ordered position inside the layer instance "
+            "(order-preserving LCS; name match %s, position delta %s)" % (
+                match.get("kernel_name_match"),
+                match.get("position_delta"))),
+        "binding": match.get("binding"),
+        "position_delta": match.get("position_delta"),
+        "kernel_name_match": match.get("kernel_name_match"),
+        "representative_layer_match": match.get("representative_layer_match"),
+        "bucket_match": (
+            "exact" if match.get("representative_layer_match") == "same_layer"
+            else "compatible"),
+        "wrapper_scope": None,
+        "source_evidence": [],
+        "schema": _two_trace_schema(entry),
+    }
+
+
+def merge(table_path, capture_plan_path, shape_log_path, out_dir,
+          two_trace_map_path=""):
     table_doc = _load(table_path)
     capture_plan = _load(capture_plan_path)
+    two_trace_entries = {}
+    if two_trace_map_path:
+        two_trace_entries = (
+            _load(two_trace_map_path).get("entries") or {})
     groups = _groups(_shape_records(shape_log_path))
     target_by_row = {
         target["row_id"]: target
@@ -741,17 +801,55 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir):
             }
         for row in table.get("rows", []):
             original = json.loads(json.dumps(row))
+            two_trace_entry = two_trace_entries.get(row["row_id"])
+            # Operator attribution is transplanted whenever the graph-off run
+            # resolved it and this graph-on row could not.  That is independent
+            # of which shape evidence wins below: a replayed graph loses the
+            # parent link and the Input Dims for the same reason, but a row may
+            # legitimately take its shape from the runtime probe while still
+            # wanting the recovered parent.
+            if (two_trace_entry
+                    and (two_trace_entry.get("op") or {}).get("recovered")
+                    and row.get("parent_operator", {}).get("mapping_level")
+                    in (None, "unresolved")):
+                recovered_op = two_trace_entry["op"]
+                row["parent_operator"] = {
+                    **row.get("parent_operator", {}),
+                    "canonical_op": recovered_op.get("canonical_op"),
+                    "op_instance_id": recovered_op.get("op_instance_id"),
+                    "mapping_level": "two_trace_external_id",
+                    "mapping_cardinality": recovered_op.get(
+                        "mapping_cardinality", "unresolved"),
+                    "device_launch_count": recovered_op.get(
+                        "device_launch_count"),
+                    "confidence": (
+                        two_trace_entry.get("match") or {}).get(
+                            "confidence", "medium"),
+                    "recovered_by": "two_trace_mapping",
+                }
             if row.get("shape", {}).get("source") == "kernel_exact":
                 evidence = {
                     "level": "K", "status": "preserved",
                     "source": "clean_trace_external_id",
+                }
+            elif (two_trace_entry
+                    and (two_trace_entry.get("shape") or {}).get("recovered")):
+                evidence = _two_trace_evidence(two_trace_entry, table)
+                recovered_shape = two_trace_entry["shape"]
+                row["shape"] = {
+                    **row.get("shape", {}),
+                    "source": "two_trace_kernel_dims",
+                    "input_dims": recovered_shape.get("input_dims"),
+                    "input_types": recovered_shape.get("input_types"),
+                    "logger_schema": evidence["schema"],
                 }
             else:
                 target = target_by_row.get(row["row_id"], {})
                 runtime_internal = _is_runtime_internal(row)
                 candidates = (
                     [] if runtime_internal
-                    else _candidate_groups(row, target, groups, table))
+                    else _candidate_groups(
+                        row, target, groups, table, two_trace_entry))
                 alignment_source = False
                 if len(candidates) == 1:
                     group = candidates[0]
@@ -827,6 +925,8 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir):
                 "row_id": row["row_id"],
                 "kernel": row["short_name"],
                 "evidence": evidence,
+                "parent_recovered_by": row.get(
+                    "parent_operator", {}).get("recovered_by"),
                 "clean_trace_identity_unchanged": all(
                     row.get(key) == original.get(key)
                     for key in ("row_id", "raw_event_index", "device_seq_index",
@@ -876,6 +976,19 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir):
     for audit in audits:
         level = audit["evidence"]["level"]
         counts[level] = counts.get(level, 0) + 1
+    two_trace_stats = {
+        "enabled": bool(two_trace_map_path),
+        "map_path": (
+            os.path.abspath(two_trace_map_path)
+            if two_trace_map_path else ""),
+        "shape_rows": sum(
+            1 for audit in audits
+            if audit["evidence"].get("source")
+            == "two_trace_graph_off_external_id"),
+        "operator_rows": sum(
+            1 for audit in audits
+            if audit.get("parent_recovered_by") == "two_trace_mapping"),
+    }
     verification = {
         "schema_version": 1,
         "status": "pass" if unchanged else "fail",
@@ -883,6 +996,7 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir):
         "evidence_counts": counts,
         "row_count": len(audits),
         "shape_log_group_count": len(groups),
+        "two_trace_mapping": two_trace_stats,
         "representative_table_checks": table_checks,
     }
     with open(verify_out, "w") as fh:
@@ -924,10 +1038,12 @@ def main():
     parser.add_argument("--capture-plan", required=True)
     parser.add_argument("--shape-log", required=True)
     parser.add_argument("--out-dir", required=True)
+    parser.add_argument("--two-trace-map", default="")
     parser.add_argument("--result-json", default="")
     args = parser.parse_args()
     result = merge(
-        args.table, args.capture_plan, args.shape_log, args.out_dir)
+        args.table, args.capture_plan, args.shape_log, args.out_dir,
+        args.two_trace_map)
     if args.result_json:
         with open(args.result_json, "w") as fh:
             json.dump(result, fh, indent=2)

@@ -11,6 +11,8 @@ import semantic_evidence_ledger
 import semantic_runtime_marker_mapping
 import semantic_shape_merge
 import semantic_source_mapping
+import semantic_two_trace_mapping
+import semantic_workload_identity
 import validate_structural_patterns
 import run_semantic_shape_capture
 
@@ -23,10 +25,62 @@ def _sha256(path):
     return digest.hexdigest()
 
 
+def _two_trace_mapping(out_dir, patterns_path, phase_1_1_json,
+                       capture_results, mapping_traces, capture_setup_path,
+                       formal_workload_path):
+    """Recover graph-erased op attribution from a workload-identical graph-off run.
+
+    The mapping traces default to the rank-0 stage windows of the shape-capture
+    replay, which already runs with ``disable_cuda_graph`` -- so the graph-off
+    trace this needs is normally produced for free by Semantics 1.2 itself.
+    """
+    trace_paths = list(mapping_traces or [])
+    mapping_setup = {}
+    if capture_setup_path:
+        with open(capture_setup_path) as fh:
+            mapping_setup = json.load(fh)
+    if not trace_paths:
+        for capture in capture_results:
+            if not capture.get("disable_cuda_graph"):
+                continue
+            stages = capture.get("rank0_stage_traces") or {}
+            trace_paths.extend(stages[key] for key in sorted(stages))
+            mapping_setup.setdefault(
+                "disable_cuda_graph", capture.get("disable_cuda_graph"))
+    trace_paths = [path for path in trace_paths if path]
+    if not trace_paths:
+        return "", None
+
+    if not formal_workload_path:
+        raise ValueError(
+            "two-trace op mapping requires --formal-workload: the Clean Trace "
+            "run's declared workload must be supplied so it can be proven "
+            "identical to the mapping run")
+    with open(formal_workload_path) as fh:
+        formal_workload = json.load(fh)
+
+    two_trace_dir = os.path.join(out_dir, "two_trace")
+    os.makedirs(two_trace_dir, exist_ok=True)
+    with open(phase_1_1_json) as fh:
+        formal_table_doc = json.load(fh)
+    document, mapping_table_doc = semantic_two_trace_mapping.build_from_traces(
+        formal_table_doc, trace_paths, patterns_path, two_trace_dir)
+    # Hard gate: a workload mismatch would bind unrelated kernels positionally.
+    document["workload_identity"] = semantic_workload_identity.verify(
+        formal_workload, mapping_setup, formal_table_doc, mapping_table_doc,
+        os.path.join(two_trace_dir, "WORKLOAD_IDENTITY.json"), strict=True)
+    map_path = os.path.join(two_trace_dir, "TWO_TRACE_OP_MAP.json")
+    with open(map_path, "w") as fh:
+        json.dump(document, fh, indent=2)
+    document["result_json"] = map_path
+    return map_path, document
+
+
 def run(config_path, trace_path, shape_log_path, out_dir,
         config_key="", runtime_sources=None, capture_setup_path="",
         capture_result_path="", capture_result_paths=None,
-        structural_patterns_path=""):
+        structural_patterns_path="", mapping_traces=None,
+        formal_workload_path=""):
     os.makedirs(out_dir, exist_ok=True)
     runtime_sources = list(runtime_sources or [])
     if not structural_patterns_path:
@@ -153,12 +207,17 @@ def run(config_path, trace_path, shape_log_path, out_dir,
             "shape_log_path, capture_setup_path, or capture_result_path "
             "is required")
 
+    two_trace_map_path, two_trace_document = _two_trace_mapping(
+        out_dir, patterns_path, phase_1_1_json, capture_results,
+        mapping_traces, capture_setup_path, formal_workload_path)
+
     probe_tables = []
     probe_runs = []
     if shape_log_path:
         direct_dir = os.path.join(out_dir, "probe_runs", "direct")
         direct = semantic_shape_merge.merge(
-            phase_1_1_json, source_plan_path, shape_log_path, direct_dir)
+            phase_1_1_json, source_plan_path, shape_log_path, direct_dir,
+            two_trace_map_path)
         probe_tables.append(direct["semantic_table_json"])
         probe_runs.append({
             "kind": "direct_shape_log",
@@ -180,7 +239,7 @@ def run(config_path, trace_path, shape_log_path, out_dir,
         capture_result["runtime_marker_mapping"] = marker_mapping
         merged_probe = semantic_shape_merge.merge(
             phase_1_1_json, merge_plan_path,
-            capture_result["shape_log"], run_dir)
+            capture_result["shape_log"], run_dir, two_trace_map_path)
         probe_tables.append(merged_probe["semantic_table_json"])
         probe_runs.append({
             "kind": "runtime_capture",
@@ -247,6 +306,8 @@ def run(config_path, trace_path, shape_log_path, out_dir,
         "structural_patterns_json": patterns_path,
         "structural_pattern_validation": (
             structural_validation.get("validation", {})),
+        "two_trace_mapping": two_trace_document,
+        "two_trace_map_json": two_trace_map_path,
         "semantic_mapping": semantic,
         "shape_merge": merged,
         "probe_runs": probe_runs,
@@ -272,13 +333,26 @@ def main():
     parser.add_argument("--runtime-source", action="append", default=[])
     parser.add_argument("--structural-patterns", required=True)
     parser.add_argument("--out-dir", required=True)
+    parser.add_argument(
+        "--mapping-trace", action="append", default=[],
+        help=("Graph-off trace of a workload-identical run, used to recover "
+              "op attribution the graph-on Clean Trace cannot carry. Repeat "
+              "per stage window. Defaults to the shape-capture replay's own "
+              "rank-0 stage traces when it ran with disable_cuda_graph."))
+    parser.add_argument(
+        "--formal-workload", default="",
+        help=("JSON describing the Clean Trace run's workload. Required "
+              "whenever two-trace mapping is active: it is checked field by "
+              "field against the mapping run and the run fails on mismatch."))
     parser.add_argument("--result-json", default="")
     args = parser.parse_args()
     result = run(
         args.config, args.trace, args.shape_log, args.out_dir,
         args.config_key, args.runtime_source,
         args.capture_setup, capture_result_paths=args.capture_result,
-        structural_patterns_path=args.structural_patterns)
+        structural_patterns_path=args.structural_patterns,
+        mapping_traces=args.mapping_trace,
+        formal_workload_path=args.formal_workload)
     if args.result_json:
         with open(args.result_json, "w") as fh:
             json.dump(result, fh, indent=2)
