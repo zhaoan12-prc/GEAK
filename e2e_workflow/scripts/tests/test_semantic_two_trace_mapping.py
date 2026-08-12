@@ -137,6 +137,39 @@ class TwoTraceMappingTest(unittest.TestCase):
         self.assertEqual(doc["kernel_scope_shape_row_count"], 1)
         self.assertEqual(doc["wrapper_scope_shape_row_count"], 1)
 
+    def test_drop_tables_removes_only_the_skipped_windows_bindings(self):
+        formal_doc = {"tables": [
+            _table([_row("d0", 0, "gemm", level="unresolved")], phase="decode"),
+            _table([_row("p0", 0, "gemm", level="unresolved")], phase="prefill"),
+        ]}
+        mapping_doc = {"tables": [
+            _table([_row("m0", 0, "gemm", dims=[[1, 1]], op="decode_op")],
+                   phase="decode"),
+            _table([_row("m1", 0, "gemm", dims=[[2, 2]], op="prefill_op")],
+                   phase="prefill"),
+        ]}
+        doc = two_trace.build(formal_doc, mapping_doc)
+        self.assertEqual(doc["matched_row_count"], 2)
+        two_trace.drop_tables(doc, ["p0|decode"])
+        self.assertNotIn("d0", doc["entries"])
+        self.assertIn("p0", doc["entries"])
+        self.assertEqual(doc["dropped_entry_count"], 1)
+        self.assertEqual(doc["matched_row_count"], 1)
+        self.assertEqual(doc["shape_recovered_row_count"], 1)
+        skipped = [item for item in doc["tables"]
+                   if item["table"] == "p0|decode"]
+        self.assertEqual(
+            skipped[0]["status"], "skipped_not_workload_identical")
+        self.assertEqual(skipped[0]["matched_rows"], 0)
+
+    def test_drop_tables_with_nothing_to_drop_is_a_no_op(self):
+        formal = _table([_row("f0", 0, "gemm", level="unresolved")])
+        mapping = _table([_row("m0", 0, "gemm", dims=[[1, 1]])])
+        doc = two_trace.build({"tables": [formal]}, {"tables": [mapping]})
+        two_trace.drop_tables(doc, [])
+        self.assertIn("f0", doc["entries"])
+        self.assertNotIn("dropped_entry_count", doc)
+
     def test_tables_are_matched_per_pattern_and_phase(self):
         formal_doc = {"tables": [
             _table([_row("d0", 0, "gemm", level="unresolved")], phase="decode"),

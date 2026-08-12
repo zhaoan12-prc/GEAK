@@ -8,18 +8,26 @@ and -- critically -- the same profiled step bucket.  If the two runs differ in
 anything other than the graph/fusion switch, positional alignment silently binds
 unrelated kernels and every downstream shape becomes wrong.
 
-So this module is a gate, not a report.  It checks two independent levels:
+So this module is a gate, not a report.  It checks two independent levels, and
+they fail differently because they mean different things:
 
 1. **Declared workload** -- the setup both runs were launched with.  Every field
    in ``WORKLOAD_FIELDS`` must be identical.  Only ``ALLOWED_DIFFERENCES`` may
-   differ, and the mapping run must be the graph-off side.
+   differ, and the mapping run must be the graph-off side.  A difference here is
+   a statement about the whole comparison: the two runs are not the same
+   experiment, so no table from them may be bound.  ``verify()`` raises
+   :class:`WorkloadIdentityError`, and callers must not downgrade that to a
+   warning.
 2. **Observed bucket** -- what the profiler actually captured, read back out of
    the two semantic tables (``selected_bucket``: phase, batch size, input
    tokens).  This is the stronger check: it catches a run that was *launched*
-   identically but landed on a different step.
-
-``verify()`` raises :class:`WorkloadIdentityError` on any mismatch.  Callers must
-not downgrade that to a warning.
+   identically but landed on a different step.  It is also **per table**.  A
+   mapping replay routinely captures a shorter window than the formal run, so a
+   ``(pattern, phase)`` that is missing or landed on another bucket says nothing
+   about the tables that did line up.  Those tables are listed in
+   ``skipped_tables`` and the caller drops their bindings; the rest proceed.
+   Skipping never produces a wrong claim -- the rows simply keep the weaker
+   evidence they already had.
 """
 import argparse
 import json
@@ -149,6 +157,7 @@ def verify(formal_setup, mapping_setup, formal_table_doc,
     declared = compare_declared(formal, mapping)
     buckets = compare_buckets(formal_table_doc, mapping_table_doc)
 
+    # Whole-comparison contradictions: the two runs are not the same experiment.
     reasons = []
     if declared["mismatches"]:
         reasons.append(
@@ -163,20 +172,38 @@ def verify(formal_setup, mapping_setup, formal_table_doc,
             "mapping run must be the graph-off side "
             "(disable_cuda_graph=true); op attribution cannot be recovered "
             "from a graph-on mapping trace")
-    if buckets["mismatches"]:
-        reasons.append(
-            "profiled bucket differs for: %s" % ", ".join(
-                item["table"] for item in buckets["mismatches"]))
-    if not buckets["compared_tables"]:
-        reasons.append("no table was comparable between the two traces")
+
+    # Per-table verdicts: one window the mapping replay did not cover the same
+    # way is not evidence about the windows it did.
+    skipped = [
+        {"table": item["table"], "reason": item["reason"],
+         "formal": item["formal"], "mapping": item["mapping"]}
+        for item in buckets["mismatches"]]
+    bound = list(buckets["compared_tables"])
+    skipped_keys = {item["table"] for item in skipped}
+    bound = [key for key in bound if key not in skipped_keys]
+
+    if reasons:
+        status = "fail"
+    elif not bound:
+        # Nothing to transplant. Two-trace becomes a no-op rather than an error:
+        # every row keeps the evidence it already had.
+        status = "skipped"
+    elif skipped:
+        status = "partial"
+    else:
+        status = "pass"
 
     result = {
-        "schema_version": 1,
-        "status": "pass" if not reasons else "fail",
+        "schema_version": 2,
+        "status": status,
         "formal": formal,
         "mapping": mapping,
         "declared_workload": declared,
         "observed_bucket": buckets,
+        "bound_tables": bound,
+        "skipped_tables": skipped,
+        "skipped_table_keys": sorted(skipped_keys),
         "failure_reasons": reasons,
     }
     if out_path:

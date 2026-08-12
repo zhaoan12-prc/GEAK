@@ -294,6 +294,46 @@ def build(formal_table_doc, mapping_table_doc):
     }
 
 
+def drop_tables(document, table_keys):
+    """Remove the bindings for tables the identity gate would not vouch for.
+
+    Called after :func:`semantic_workload_identity.verify` reports which
+    ``(pattern, phase)`` windows the mapping replay did not cover the same way.
+    Their rows keep whatever evidence they already had, so dropping is always
+    safe; leaving them would let a positional alignment across two different
+    step buckets reach the published table.
+    """
+    keys = set(table_keys or ())
+    if not keys:
+        return document
+    dropped = {
+        row_id: entry for row_id, entry in
+        (document.get("entries") or {}).items()
+        if "%s|%s" % (entry.get("pattern_id"), entry.get("phase")) in keys}
+    for row_id in dropped:
+        del document["entries"][row_id]
+    for report in document.get("tables", []):
+        if report.get("table") in keys:
+            report["status"] = "skipped_not_workload_identical"
+            for name in ("matched_rows", "op_recovered_rows",
+                         "shape_recovered_rows", "kernel_scope_shape_rows",
+                         "wrapper_scope_shape_rows"):
+                if name in report:
+                    report[name] = 0
+    document["skipped_tables"] = sorted(keys)
+    document["dropped_entry_count"] = len(dropped)
+    for name, field in (
+            ("matched_row_count", "matched_rows"),
+            ("op_recovered_row_count", "op_recovered_rows"),
+            ("shape_recovered_row_count", "shape_recovered_rows"),
+            ("kernel_scope_shape_row_count", "kernel_scope_shape_rows"),
+            ("wrapper_scope_shape_row_count", "wrapper_scope_shape_rows")):
+        if name in document:
+            document[name] = sum(
+                report.get(field, 0) for report in document.get("tables", []))
+    return document
+
+
 def build_from_traces(formal_table_doc, mapping_trace_paths, patterns_path,
                       out_dir):
     """Run the ordinary semantic mapping over the graph-off trace(s), then bind.

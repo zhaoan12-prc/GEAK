@@ -26,8 +26,8 @@ def _setup(**overrides):
     return setup
 
 
-def _table(batch_size=4, input_tokens=0, pattern="P", phase="decode"):
-    return {"tables": [{
+def _one(batch_size=4, input_tokens=0, pattern="P", phase="decode"):
+    return {
         "pattern_id": pattern,
         "phase": phase,
         "selected_bucket": {
@@ -35,7 +35,11 @@ def _table(batch_size=4, input_tokens=0, pattern="P", phase="decode"):
             "batch_size": batch_size,
             "input_tokens": input_tokens,
         },
-    }]}
+    }
+
+
+def _table(batch_size=4, input_tokens=0, pattern="P", phase="decode"):
+    return {"tables": [_one(batch_size, input_tokens, pattern, phase)]}
 
 
 class WorkloadIdentityTest(unittest.TestCase):
@@ -64,19 +68,53 @@ class WorkloadIdentityTest(unittest.TestCase):
                 _table(), _table())
         self.assertIn("graph-off", str(ctx.exception))
 
-    def test_observed_bucket_mismatch_raises(self):
-        """Launched identically is not enough; the profiled step must match."""
-        with self.assertRaises(identity.WorkloadIdentityError) as ctx:
-            identity.verify(
-                _setup(), _setup(disable_cuda_graph=True),
-                _table(batch_size=4), _table(batch_size=1))
-        self.assertIn("bucket differs", str(ctx.exception))
+    def test_observed_bucket_mismatch_skips_that_table(self):
+        """Launched identically is not enough; the profiled step must match.
 
-    def test_missing_mapping_table_raises(self):
+        But it is a verdict on one table, not on the comparison.
+        """
+        result = identity.verify(
+            _setup(), _setup(disable_cuda_graph=True),
+            _table(batch_size=4), _table(batch_size=1))
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["failure_reasons"], [])
+        self.assertEqual(result["skipped_table_keys"], ["P|decode"])
+        self.assertEqual(result["bound_tables"], [])
+        self.assertEqual(
+            result["skipped_tables"][0]["reason"], "bucket_differs")
+
+    def test_a_table_the_mapping_replay_missed_does_not_sink_the_rest(self):
+        # The mapping replay's window is routinely shorter than the formal run's.
+        formal = {"tables": [
+            _one(phase="prefill", input_tokens=8192),
+            _one(phase="decode"),
+        ]}
+        mapping = {"tables": [_one(phase="prefill", input_tokens=8192)]}
+        result = identity.verify(
+            _setup(), _setup(disable_cuda_graph=True), formal, mapping)
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["failure_reasons"], [])
+        self.assertEqual(result["bound_tables"], ["P|prefill"])
+        self.assertEqual(result["skipped_table_keys"], ["P|decode"])
+        self.assertEqual(
+            result["skipped_tables"][0]["reason"], "missing_in_mapping_trace")
+
+    def test_no_comparable_table_is_a_no_op_not_an_error(self):
+        result = identity.verify(
+            _setup(), _setup(disable_cuda_graph=True),
+            _table(), {"tables": []})
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["failure_reasons"], [])
+        self.assertEqual(result["bound_tables"], [])
+
+    def test_declared_mismatch_still_raises_even_when_buckets_line_up(self):
+        # A per-table verdict cannot rescue two runs that are not the same
+        # experiment: nothing from them may be bound.
         with self.assertRaises(identity.WorkloadIdentityError):
             identity.verify(
-                _setup(), _setup(disable_cuda_graph=True),
-                _table(), {"tables": []})
+                _setup(),
+                _setup(disable_cuda_graph=True, tensor_parallel_size=4),
+                _table(), _table())
 
     def test_undeclared_workload_field_raises(self):
         broken = _setup(disable_cuda_graph=True)
@@ -92,10 +130,10 @@ class WorkloadIdentityTest(unittest.TestCase):
         result = identity.verify(left, right, _table(), _table())
         self.assertEqual(result["status"], "pass")
 
-    def test_non_strict_reports_without_raising(self):
+    def test_non_strict_reports_a_declared_mismatch_without_raising(self):
         result = identity.verify(
-            _setup(), _setup(disable_cuda_graph=True),
-            _table(batch_size=4), _table(batch_size=2), strict=False)
+            _setup(), _setup(disable_cuda_graph=True, model="other"),
+            _table(), _table(), strict=False)
         self.assertEqual(result["status"], "fail")
         self.assertTrue(result["failure_reasons"])
 

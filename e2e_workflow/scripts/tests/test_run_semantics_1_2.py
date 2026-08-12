@@ -175,6 +175,80 @@ class RunSemantics12Test(unittest.TestCase):
             self.assertEqual(mapping_descriptor["model"], "m")
             self.assertTrue(mapping_descriptor["disable_cuda_graph"])
 
+    def test_a_skipped_table_drops_its_bindings_and_the_run_continues(self):
+        # The mapping replay covered prefill but not decode. Two-trace is
+        # additive, so the decode rows keep their weaker evidence and the run
+        # is not sunk -- but their bindings must not reach the merge.
+        with tempfile.TemporaryDirectory() as tmp:
+            def _write(name, value):
+                path = os.path.join(tmp, name)
+                with open(path, "w") as fh:
+                    fh.write(value if isinstance(value, str)
+                             else json.dumps(value))
+                return path
+
+            document = {
+                "matched_row_count": 2,
+                "tables": [{"table": "P|prefill", "matched_rows": 1},
+                           {"table": "P|decode", "matched_rows": 1}],
+                "entries": {
+                    "event-1": {"pattern_id": "P", "phase": "prefill"},
+                    "event-9": {"pattern_id": "P", "phase": "decode"},
+                },
+            }
+            semantic = {
+                "status": "pass",
+                "semantic_table_json": _write("table.json", {"tables": []}),
+                "semantic_table_md": _write("table.md", "# 1.1\n"),
+                "shape_capture_plan_json": _write(
+                    "plan.json", {"capture_targets": []}),
+                "layer_instance_audit_json": _write(
+                    "audit.json", {"module_scope_count": 61}),
+            }
+            merged = {
+                "status": "pass",
+                "semantic_table_json": _write("merged.json", {"tables": []}),
+                "semantic_table_md": _write("merged.md", "# merged\n"),
+            }
+            with mock.patch.object(
+                    runner.validate_structural_patterns, "validate",
+                    return_value={"validation": {}}), mock.patch.object(
+                        runner.semantic_kernel_mapping, "build",
+                        return_value=semantic), mock.patch.object(
+                            runner.semantic_source_mapping, "map_plan",
+                            return_value={}), mock.patch.object(
+                                runner.semantic_shape_merge, "merge",
+                                return_value=merged), mock.patch.object(
+                                    runner.semantic_evidence_ledger, "merge",
+                                    return_value=merged), mock.patch.object(
+                                        runner.semantic_two_trace_mapping,
+                                        "build_from_traces",
+                                        return_value=(
+                                            document, {"tables": []})
+                                    ), mock.patch.object(
+                                        runner.semantic_workload_identity,
+                                        "verify",
+                                        return_value={
+                                            "status": "partial",
+                                            "skipped_table_keys": ["P|decode"],
+                                        }):
+                result = runner.run(
+                    _write("config.json", {}), _write("trace.json", {}),
+                    _write("shape.log", "shape\n"), os.path.join(tmp, "out"),
+                    structural_patterns_path=_write(
+                        "agent_patterns.json", {"pattern_definition": {}}),
+                    mapping_traces=[_write("mapping.json", {})],
+                    formal_workload_path=_write("formal.json", {}))
+            self.assertEqual(result["status"], "pass")
+            self.assertEqual(result["two_trace_identity_status"], "partial")
+            self.assertEqual(
+                result["two_trace_skipped_tables"], ["P|decode"])
+            with open(result["two_trace_map_json"]) as fh:
+                written = json.load(fh)
+            self.assertEqual(list(written["entries"]), ["event-1"])
+            self.assertEqual(written["dropped_entry_count"], 1)
+            self.assertEqual(written["matched_row_count"], 1)
+
     def test_rejects_missing_agent_structural_patterns(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(

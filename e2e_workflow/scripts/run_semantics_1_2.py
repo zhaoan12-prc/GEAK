@@ -72,10 +72,17 @@ def _two_trace_mapping(out_dir, patterns_path, phase_1_1_json,
         formal_table_doc = json.load(fh)
     document, mapping_table_doc = semantic_two_trace_mapping.build_from_traces(
         formal_table_doc, trace_paths, patterns_path, two_trace_dir)
-    # Hard gate: a workload mismatch would bind unrelated kernels positionally.
-    document["workload_identity"] = semantic_workload_identity.verify(
+    # A declared-workload mismatch raises: the two runs are not the same
+    # experiment, so nothing from them may be bound. A per-table bucket
+    # difference only disqualifies that table -- the mapping replay's window is
+    # routinely shorter than the formal run's, and one uncovered (pattern,
+    # phase) is no reason to discard the ones that did line up.
+    identity = semantic_workload_identity.verify(
         formal_workload, mapping_setup, formal_table_doc, mapping_table_doc,
         os.path.join(two_trace_dir, "WORKLOAD_IDENTITY.json"), strict=True)
+    document["workload_identity"] = identity
+    semantic_two_trace_mapping.drop_tables(
+        document, identity.get("skipped_table_keys") or [])
     map_path = os.path.join(two_trace_dir, "TWO_TRACE_OP_MAP.json")
     with open(map_path, "w") as fh:
         json.dump(document, fh, indent=2)
@@ -289,6 +296,15 @@ def run(config_path, trace_path, shape_log_path, out_dir,
         "status": status,
         "capture_phase_coverage_complete": (
             capture_phase_coverage_complete),
+        # Additive: a table the mapping replay could not cover is skipped, not
+        # transplanted, so this never gates `status`. It is surfaced because a
+        # long run of "partial" is the signal to lengthen the mapping window.
+        "two_trace_identity_status": (
+            (two_trace_document or {}).get(
+                "workload_identity", {}).get("status", "not_run")),
+        "two_trace_skipped_tables": (
+            (two_trace_document or {}).get(
+                "workload_identity", {}).get("skipped_table_keys", [])),
         "boundary_evidence": boundary_evidence,
         "module_scope_count": module_scope_count,
         "inputs": {
