@@ -163,6 +163,42 @@ class ShapeMergeTwoTraceTest(unittest.TestCase):
             self.assertEqual(
                 verification["two_trace_mapping"]["operator_rows"], 1)
 
+    def test_tensor_list_argument_yields_one_tensor_per_element(self):
+        # aten::cat takes a TensorList, so the trace nests one shape per element
+        # in a single argument. Those are the shapes the row is about.
+        with tempfile.TemporaryDirectory() as tmp:
+            two_trace = self._two_trace_map(
+                dims=[[[4, 16, 512], [4, 16, 64]], []])
+            two_trace["entries"]["event-2"]["shape"]["input_types"] = [
+                "TensorList", "Scalar"]
+            result = self._run(tmp, two_trace)
+            self.assertEqual(result["status"], "pass")
+            with open(result["semantic_table_json"]) as fh:
+                rows = json.load(fh)["tables"][0]["rows"]
+            tensors = rows[1]["shape"]["logger_schema"]["tensors"]
+            self.assertEqual(
+                [tensor["arg_name"] for tensor in tensors],
+                ["args[0][0]", "args[0][1]"])
+            self.assertEqual(
+                [tensor["shape"] for tensor in tensors],
+                [[4, 16, 512], [4, 16, 64]])
+            # The scalar argument carries no shape and is not invented.
+            self.assertTrue(
+                all(tensor["dtype"] == "TensorList" for tensor in tensors))
+
+    def test_unrepresentable_argument_is_skipped_not_crashed(self):
+        for dims in ([[4, [16]], [8, 8]], [[[[4, 8]]], [8, 8]]):
+            with tempfile.TemporaryDirectory() as tmp:
+                result = self._run(tmp, self._two_trace_map(dims=dims))
+                self.assertEqual(result["status"], "pass")
+                with open(result["semantic_table_json"]) as fh:
+                    rows = json.load(fh)["tables"][0]["rows"]
+                tensors = rows[1]["shape"]["logger_schema"]["tensors"]
+                self.assertEqual(
+                    [tensor["shape"] for tensor in tensors], [[8, 8]],
+                    "unreadable argument %r should yield no tensor" % (
+                        dims[0],))
+
     def test_without_map_the_row_stays_unavailable(self):
         with tempfile.TemporaryDirectory() as tmp:
             result = self._run(tmp, None)

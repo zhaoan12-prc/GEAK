@@ -263,6 +263,90 @@ def _scope_at(ts, scopes, starts):
     return best
 
 
+# Python frames that name the machinery instead of the caller.  aiter's JIT
+# trampoline and Triton's launcher are the same two frames for every kernel they
+# dispatch, so reporting them as the launch site says nothing about which one ran.
+LAUNCHER_FRAME_MARKERS = (
+    "triton/runtime", "triton/backends", "aiter/jit/core.py",
+    # aiter/jit/utils/torch_guard.py, which the tracer records unqualified.
+    "torch_guard.py",
+    "torch/_ops.py", "torch/autograd", "torch/_dynamo", "torch/_inductor",
+    "torch/nn/modules/module.py", "<built-in",
+)
+
+# Under CUDA/HIP graphs a decode step replays with no Python running, so the only
+# enclosing frame is the replay call itself.  Attributing a kernel to it would be
+# worse than leaving it unresolved: it looks like an answer and blocks two-trace
+# mapping, which is the route that does work for that case.
+GRAPH_REPLAY_FRAME_MARKERS = (
+    "cuda_graph_runner.py", "torch/cuda/graphs.py",
+)
+
+
+
+def _python_launch_sites(events):
+    """Resolve each kernel launch to the Python frame that issued it.
+
+    A kernel reaches a ``cpu_op`` parent only when it was launched through the
+    dispatcher.  A Triton kernel is not: ``kernel[grid](...)`` is an ordinary
+    Python call, so ``External id`` leads nowhere and the row falls back to the
+    enclosing module wrapper.  The profiler does record the Python stack, and it
+    names the launcher exactly -- follow correlation to the ``cuda_runtime``
+    launch, then take the innermost enclosing frame on that thread.
+
+    Resolution is a sweep rather than a search back from each launch.  Frames
+    nest, so the enclosing one can start arbitrarily far back with any number of
+    already-closed siblings in between -- on a trace with 280k frames a bounded
+    backward scan silently misses it, and an unbounded one is quadratic.
+    Replaying the frames and launches in timestamp order keeps an exact stack
+    for the cost of one pass.
+
+    Returns a dict of correlation id -> launch site, holding only the launches
+    whose stack names something more specific than framework machinery.
+    """
+    per_tid = {}
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            continue
+        cat = event.get("cat")
+        timestamp = event.get("ts")
+        if timestamp is None:
+            continue
+        if cat == "cuda_runtime":
+            corr = (event.get("args") or {}).get("correlation")
+            if corr is not None:
+                per_tid.setdefault(event.get("tid"), []).append(
+                    (timestamp, 1, 0, corr, None, index))
+        elif cat == "python_function" and event.get("dur") is not None:
+            end = timestamp + event["dur"]
+            # Sort key puts a frame before any launch at the same instant, and
+            # an outer frame before the inner one it contains.
+            per_tid.setdefault(event.get("tid"), []).append(
+                (timestamp, 0, -end, None, event, index))
+
+    sites = {}
+    for entries in per_tid.values():
+        entries.sort(key=lambda item: item[:3])
+        stack = []
+        for timestamp, kind, _, corr, frame, index in entries:
+            while stack and stack[-1][0] < timestamp:
+                stack.pop()
+            if kind == 0:
+                stack.append((timestamp + frame["dur"], frame, index))
+                continue
+            for _, candidate, candidate_index in reversed(stack):
+                name = str(candidate.get("name", ""))
+                if any(marker in name for marker in LAUNCHER_FRAME_MARKERS):
+                    continue
+                if any(marker in name for marker in GRAPH_REPLAY_FRAME_MARKERS):
+                    # Everything inside a replay is the replay, not a caller.
+                    break
+                sites[corr] = {"name": name, "ts": candidate["ts"],
+                               "event_index": candidate_index}
+                break
+    return sites
+
+
 def _flow_layer_index(events, module_scopes, module_starts):
     """Map GPU flow-marker timestamps from CPU-side DecoderLayer spans."""
     flows = {}
@@ -307,6 +391,7 @@ def _event_rows(events, pattern_doc):
         events, spans, pattern_doc)
     module_starts = [scope["ts"] for scope in module_scopes]
     flow_layers = _flow_layer_index(events, module_scopes, module_starts)
+    launch_sites = _python_launch_sites(events)
     rows = []
     out_of_scope = {"count": 0, "duration_us": 0.0}
     device_sequence = 0
@@ -374,6 +459,13 @@ def _event_rows(events, pattern_doc):
             "parent_context" if parent else "unresolved")
         stage, stage_rule_id, stage_source = _stage_detail(
             name, event.get("cat"), (parent or {}).get("name", ""))
+        # Only when the dispatcher route found nothing: a Triton launch has no
+        # cpu_op to reach, so without this the row can never name its caller.
+        # Purely additive -- an external-id or scope parent always wins.
+        correlation = args.get("correlation", args.get("Correlation ID"))
+        launch_site = (
+            launch_sites.get(correlation)
+            if ext not in cpu_by_ext and not scope else None)
         rows.append({
             "row_id": "event-%d" % raw_index,
             "raw_event_index": raw_index,
@@ -406,16 +498,23 @@ def _event_rows(events, pattern_doc):
             "provider": provider,
             "parent_operator": {
                 "op_instance_id": "ext-%s" % ext if ext is not None else None,
-                "canonical_op": (parent or {}).get("name", "unresolved"),
+                "canonical_op": (
+                    (parent or {}).get("name")
+                    or (launch_site or {}).get("name")
+                    or "unresolved"),
                 "mapping_level": "external_id" if ext in cpu_by_ext else (
-                    "cpu_scope" if scope else "unresolved"),
+                    "cpu_scope" if scope else
+                    "python_stack" if launch_site else "unresolved"),
                 "mapping_cardinality": (
                     "1:1" if ext in cpu_by_ext and one_to_one_launch else
                     "1:N" if ext in cpu_by_ext else "unresolved"),
                 "device_launch_count": external_id_launch_count.get(ext),
                 "confidence": "high" if ext in cpu_by_ext else (
-                    "medium" if scope else "low"),
-                "evidence_event_index": (parent or {}).get("event_index"),
+                    "medium" if scope or launch_site else "low"),
+                "evidence_event_index": (
+                    (parent or {}).get("event_index")
+                    if parent else (launch_site or {}).get("event_index")),
+                "python_launch_site": (launch_site or {}).get("name"),
             },
             "shape": {
                 "source": shape_source,

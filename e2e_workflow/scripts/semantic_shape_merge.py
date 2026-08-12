@@ -18,6 +18,35 @@ LEGACY_LOG_RE = re.compile(
     r".*?stride=\[(?P<stride>[^\]]*)\]")
 
 
+# Routes that establish which call launched a kernel, as opposed to which
+# module encloses it. The shape-logger probe knows only the latter, so when one
+# of these already holds the op, the probe contributes its shape and nothing
+# else.
+OP_LEVEL_SOURCES = {
+    "external_id": "clean_trace_external_id",
+    "python_stack": "python_stack_launch_site",
+    "two_trace_external_id": "two_trace_graph_off_external_id",
+    "two_trace_python_stack": "two_trace_graph_off_python_stack",
+}
+OP_LEVEL_ORIGINS = {
+    "external_id": "clean_trace",
+    "python_stack": "python_stack",
+    "two_trace_external_id": "two_trace_mapping",
+    "two_trace_python_stack": "two_trace_mapping",
+}
+_STACK_BASIS = ("innermost enclosing python_function frame of the launching "
+                "thread, via correlation")
+OP_LEVEL_BASIS = {
+    "external_id": "cpu_op reached by External id in the Clean Trace",
+    "python_stack": _STACK_BASIS,
+    "two_trace_external_id": (
+        "cpu_op of the positionally bound row in the graph-off mapping trace"),
+    "two_trace_python_stack": (
+        "%s, in the graph-off mapping trace" % _STACK_BASIS),
+}
+KERNEL_SCOPE_OP_LEVELS = tuple(OP_LEVEL_SOURCES)
+
+
 def _load(path):
     with open(path) as fh:
         return json.load(fh)
@@ -530,6 +559,12 @@ def _shape_text(row):
                 "metadata", "metadata=+%d tensors" % (len(tensors) - 12)))
         scope = evidence.get("probe_scope", "wrapper")
         return _semantic_shape_text("P(%s)" % scope, values)
+    if level == "P":
+        # Attribution without shape: the Python stack names the launching call
+        # but, unlike a cpu_op, carries no Input Dims.
+        return "P(%s): op=%s, shape unavailable" % (
+            evidence.get("probe_scope", "wrapper"),
+            evidence.get("contained_by") or "unresolved")
     reason_code = evidence.get("reason_code", "unavailable")
     reason = evidence.get("reason", "shape unavailable")
     return "U(%s): %s" % (reason_code, reason)
@@ -682,21 +717,50 @@ def _markdown(table_doc):
     return "\n".join(lines) + "\n"
 
 
+def _is_trace_shape(value):
+    """A trace shape is a list of plain ints -- possibly empty, for a 0-d tensor."""
+    return isinstance(value, list) and all(
+        isinstance(item, int) and not isinstance(item, bool)
+        for item in value)
+
+
+def _two_trace_arg_shapes(index, dim):
+    """One trace Input Dims argument -> (arg_name, shape) per tensor it carries.
+
+    Most arguments are one tensor, so ``[4, 7168]`` is one shape.  A TensorList
+    argument nests one shape per element instead -- ``aten::cat`` reaches here
+    as ``[[4, 16, 512], [4, 16, 64]]`` -- and those element shapes are exactly
+    what a cat row needs, so the list is expanded rather than dropped.
+
+    Only these two forms are read.  A scalar argument's ``[]``, a mixed list, or
+    a nesting deeper than one level carries nothing this can name unambiguously,
+    so it yields no tensor rather than a guess.
+    """
+    if not isinstance(dim, list) or not dim:
+        return []
+    if _is_trace_shape(dim):
+        return [("args[%d]" % index, list(dim))]
+    if all(_is_trace_shape(inner) for inner in dim):
+        return [("args[%d][%d]" % (index, position), list(inner))
+                for position, inner in enumerate(dim) if inner]
+    return []
+
+
 def _two_trace_schema(entry):
     """Trace-native Input Dims of the bound kernel, as an axis-free tensor list."""
     tensors = []
     dims = (entry.get("shape") or {}).get("input_dims") or []
     types = (entry.get("shape") or {}).get("input_types") or []
     for index, dim in enumerate(dims):
-        if not isinstance(dim, list) or not dim:
-            continue
-        tensors.append({
-            "arg_name": "args[%d]" % index,
-            "io": "input",
-            "shape": [int(value) for value in dim],
-            "dtype": types[index] if index < len(types) else None,
-            "source": "two_trace_graph_off_external_id",
-        })
+        dtype = types[index] if index < len(types) else None
+        for arg_name, shape in _two_trace_arg_shapes(index, dim):
+            tensors.append({
+                "arg_name": arg_name,
+                "io": "input",
+                "shape": shape,
+                "dtype": dtype,
+                "source": "two_trace_graph_off_external_id",
+            })
     return {"tensors": tensors, "linear_interface": None}
 
 
@@ -808,16 +872,29 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir,
             # parent link and the Input Dims for the same reason, but a row may
             # legitimately take its shape from the runtime probe while still
             # wanting the recovered parent.
-            if (two_trace_entry
-                    and (two_trace_entry.get("op") or {}).get("recovered")
-                    and row.get("parent_operator", {}).get("mapping_level")
-                    in (None, "unresolved")):
+            # python_stack is overridable, but only by a binding that actually
+            # adds something. Two-trace reaches across runs to a different layer
+            # instance, so when its op came from a python stack too and it
+            # carries no dims, it restates what this trace already said from
+            # closer up. An external-id parent is never overridden.
+            two_trace_op = (two_trace_entry or {}).get("op") or {}
+            two_trace_adds = (
+                two_trace_op.get("mapping_level") != "python_stack"
+                or bool((two_trace_entry or {}).get("shape", {}).get(
+                    "recovered")))
+            own_level = row.get("parent_operator", {}).get("mapping_level")
+            if (two_trace_entry and two_trace_op.get("recovered")
+                    and (own_level in (None, "unresolved")
+                         or (own_level == "python_stack" and two_trace_adds))):
                 recovered_op = two_trace_entry["op"]
                 row["parent_operator"] = {
                     **row.get("parent_operator", {}),
                     "canonical_op": recovered_op.get("canonical_op"),
                     "op_instance_id": recovered_op.get("op_instance_id"),
-                    "mapping_level": "two_trace_external_id",
+                    "mapping_level": (
+                        "two_trace_python_stack"
+                        if recovered_op.get("mapping_level") == "python_stack"
+                        else "two_trace_external_id"),
                     "mapping_cardinality": recovered_op.get(
                         "mapping_cardinality", "unresolved"),
                     "device_launch_count": recovered_op.get(
@@ -845,6 +922,12 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir,
                 }
             else:
                 target = target_by_row.get(row["row_id"], {})
+                # The shape-logger probe below knows only the enclosing module,
+                # so it must not overwrite an op that a kernel-scope route
+                # already established -- the logger's shape is worth taking,
+                # its "model.layers.N" is not.
+                op_level = row.get("parent_operator", {}).get("mapping_level")
+                kernel_scope_op = op_level in KERNEL_SCOPE_OP_LEVELS
                 runtime_internal = _is_runtime_internal(row)
                 candidates = (
                     [] if runtime_internal
@@ -888,15 +971,33 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir,
                         "schema": _tensor_schema(
                             group, row, table, bucket_status == "exact"),
                     }
-                    row["parent_operator"] = {
-                        **row.get("parent_operator", {}),
-                        "canonical_op": group["op_path"],
-                        "mapping_level": (
-                            "logger_one_to_one" if probe_scope == "kernel"
-                            else "parent_wrapper_context"),
-                        "confidence": (
-                            "high" if probe_scope == "kernel" else "medium"),
-                    }
+                    if kernel_scope_op and probe_scope == "wrapper":
+                        # Keep the logger's shape, but not its op. Only the op
+                        # is kernel-scope here, which shape_scope records so the
+                        # two are not read as one claim.
+                        evidence.update({
+                            "probe_scope": "kernel",
+                            "source": OP_LEVEL_SOURCES[op_level],
+                            "contained_by": row["parent_operator"].get(
+                                "canonical_op"),
+                            "evidence_origin": OP_LEVEL_ORIGINS[op_level],
+                            "shape_scope": "wrapper",
+                            "shape_source": "shape_logger_parent_wrapper",
+                            "wrapper_op_path": group["op_path"],
+                            "confidence": "medium",
+                            "mapping_basis": OP_LEVEL_BASIS[op_level],
+                        })
+                    else:
+                        row["parent_operator"] = {
+                            **row.get("parent_operator", {}),
+                            "canonical_op": group["op_path"],
+                            "mapping_level": (
+                                "logger_one_to_one" if probe_scope == "kernel"
+                                else "parent_wrapper_context"),
+                            "confidence": (
+                                "high" if probe_scope == "kernel"
+                                else "medium"),
+                        }
                     row["shape"] = {
                         **row.get("shape", {}),
                         "source": (
@@ -904,6 +1005,24 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir,
                             if probe_scope == "kernel"
                             else "runtime_probe_wrapper"),
                         "logger_schema": evidence["schema"],
+                    }
+                elif kernel_scope_op:
+                    # No usable shape probe, but the row is not unattributed:
+                    # the trace says which call launched it.
+                    evidence = {
+                        "level": "P",
+                        "probe_scope": "kernel",
+                        "status": "matched",
+                        "source": OP_LEVEL_SOURCES[op_level],
+                        "evidence_origin": OP_LEVEL_ORIGINS[op_level],
+                        "contained_by": row["parent_operator"].get(
+                            "canonical_op"),
+                        "shape_scope": "none",
+                        "confidence": "medium",
+                        "mapping_basis": OP_LEVEL_BASIS[op_level],
+                        "candidate_count": len(candidates),
+                        "wrapper_scope": None,
+                        "source_evidence": [],
                     }
                 else:
                     reason_code, reason = _unavailable_reason(

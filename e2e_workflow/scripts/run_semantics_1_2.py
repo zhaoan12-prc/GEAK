@@ -27,17 +27,24 @@ def _sha256(path):
 
 def _two_trace_mapping(out_dir, patterns_path, phase_1_1_json,
                        capture_results, mapping_traces, capture_setup_path,
-                       formal_workload_path):
+                       formal_workload_path, mapping_setup_path=""):
     """Recover graph-erased op attribution from a workload-identical graph-off run.
 
     The mapping traces default to the rank-0 stage windows of the shape-capture
     replay, which already runs with ``disable_cuda_graph`` -- so the graph-off
     trace this needs is normally produced for free by Semantics 1.2 itself.
+
+    The identity gate needs the mapping run's *declared* workload as well as its
+    trace.  When the capture runs here that is ``capture_setup_path``, but a
+    re-analysis of traces captured earlier reuses them via ``--capture-result``
+    and so has no setup to run; ``mapping_setup_path`` supplies the descriptor
+    in that case, and takes precedence when both are given.
     """
     trace_paths = list(mapping_traces or [])
     mapping_setup = {}
-    if capture_setup_path:
-        with open(capture_setup_path) as fh:
+    setup_path = mapping_setup_path or capture_setup_path
+    if setup_path:
+        with open(setup_path) as fh:
             mapping_setup = json.load(fh)
     if not trace_paths:
         for capture in capture_results:
@@ -80,7 +87,7 @@ def run(config_path, trace_path, shape_log_path, out_dir,
         config_key="", runtime_sources=None, capture_setup_path="",
         capture_result_path="", capture_result_paths=None,
         structural_patterns_path="", mapping_traces=None,
-        formal_workload_path=""):
+        formal_workload_path="", mapping_setup_path=""):
     os.makedirs(out_dir, exist_ok=True)
     runtime_sources = list(runtime_sources or [])
     if not structural_patterns_path:
@@ -209,7 +216,8 @@ def run(config_path, trace_path, shape_log_path, out_dir,
 
     two_trace_map_path, two_trace_document = _two_trace_mapping(
         out_dir, patterns_path, phase_1_1_json, capture_results,
-        mapping_traces, capture_setup_path, formal_workload_path)
+        mapping_traces, capture_setup_path, formal_workload_path,
+        mapping_setup_path)
 
     probe_tables = []
     probe_runs = []
@@ -340,6 +348,12 @@ def main():
               "per stage window. Defaults to the shape-capture replay's own "
               "rank-0 stage traces when it ran with disable_cuda_graph."))
     parser.add_argument(
+        "--mapping-setup", default="",
+        help=("JSON describing the mapping run's declared workload, for when "
+              "its capture is reused via --capture-result instead of being "
+              "run here. Same schema as --capture-setup, which supplies this "
+              "when the capture does run."))
+    parser.add_argument(
         "--formal-workload", default="",
         help=("JSON describing the Clean Trace run's workload. Required "
               "whenever two-trace mapping is active: it is checked field by "
@@ -352,7 +366,8 @@ def main():
         args.capture_setup, capture_result_paths=args.capture_result,
         structural_patterns_path=args.structural_patterns,
         mapping_traces=args.mapping_trace,
-        formal_workload_path=args.formal_workload)
+        formal_workload_path=args.formal_workload,
+        mapping_setup_path=args.mapping_setup)
     if args.result_json:
         with open(args.result_json, "w") as fh:
             json.dump(result, fh, indent=2)
