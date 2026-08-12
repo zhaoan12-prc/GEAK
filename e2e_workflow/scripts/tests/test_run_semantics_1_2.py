@@ -26,17 +26,22 @@ class RunSemantics12Test(unittest.TestCase):
             table = os.path.join(tmp, "table.json")
             table_md = os.path.join(tmp, "table.md")
             plan = os.path.join(tmp, "plan.json")
+            audit = os.path.join(tmp, "layer_instance_audit.json")
             with open(table, "w") as fh:
                 json.dump({"tables": []}, fh)
             with open(table_md, "w") as fh:
                 fh.write("# phase 1.1\n")
             with open(plan, "w") as fh:
                 json.dump({"capture_targets": []}, fh)
+            # The module-span gate reads this; a real build always writes it.
+            with open(audit, "w") as fh:
+                json.dump({"module_scope_count": 61}, fh)
             semantic = {
                 "status": "pass",
                 "semantic_table_json": table,
                 "semantic_table_md": table_md,
                 "shape_capture_plan_json": plan,
+                "layer_instance_audit_json": audit,
             }
             merged_json = os.path.join(tmp, "merged.json")
             merged_md = os.path.join(tmp, "merged.md")
@@ -120,6 +125,8 @@ class RunSemantics12Test(unittest.TestCase):
                 "semantic_table_json": table,
                 "semantic_table_md": table_md,
                 "shape_capture_plan_json": plan,
+                "layer_instance_audit_json": _write(
+                    "layer_instance_audit.json", {"module_scope_count": 61}),
             }
             merged = {
                 "status": "pass",
