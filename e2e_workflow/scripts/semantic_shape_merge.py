@@ -557,7 +557,12 @@ def _shape_text(row):
         if len(tensors) > 12:
             values.append((
                 "metadata", "metadata=+%d tensors" % (len(tensors) - 12)))
-        scope = evidence.get("probe_scope", "wrapper")
+        # This column is the shape, so it is labelled with the shape's scope.
+        # A kernel-scope op whose dims came from an enclosing wrapper reads
+        # P(wrapper) here and still shows its launch site in the operator
+        # column; probe_scope is the op's and stays in the evidence record.
+        scope = evidence.get("shape_scope") or evidence.get(
+            "probe_scope", "wrapper")
         return _semantic_shape_text("P(%s)" % scope, values)
     if level == "P":
         # Attribution without shape: the Python stack names the launching call
@@ -746,9 +751,36 @@ def _two_trace_arg_shapes(index, dim):
     return []
 
 
+# A transplanted shape keeps the scope it had in the mapping trace. Only a
+# kernel_exact mapping row -- one cpu_op, one device kernel -- describes the
+# bound kernel's own operands; a 1:N parent hands the same dims to every kernel
+# it launched, so reporting those as kernel scope would assert N kernels share
+# one operand list. semantic_two_trace_mapping._shape_scope makes the call.
+TWO_TRACE_SHAPE_SOURCES = {
+    "kernel": "two_trace_graph_off_external_id",
+    "wrapper": "two_trace_graph_off_parent_context",
+}
+TWO_TRACE_ROW_SHAPE_SOURCES = {
+    "kernel": "two_trace_kernel_dims",
+    "wrapper": "two_trace_wrapper_dims",
+}
+
+
+def _two_trace_shape_scope(entry):
+    scope = (entry.get("shape") or {}).get("scope")
+    if scope in TWO_TRACE_SHAPE_SOURCES:
+        return scope
+    # Maps written before the scope field existed recorded the mapping row's
+    # own shape source, which is what the scope is derived from.
+    return ("kernel"
+            if (entry.get("shape") or {}).get("source") == "kernel_exact"
+            else "wrapper")
+
+
 def _two_trace_schema(entry):
     """Trace-native Input Dims of the bound kernel, as an axis-free tensor list."""
     tensors = []
+    shape_source = TWO_TRACE_SHAPE_SOURCES[_two_trace_shape_scope(entry)]
     dims = (entry.get("shape") or {}).get("input_dims") or []
     types = (entry.get("shape") or {}).get("input_types") or []
     for index, dim in enumerate(dims):
@@ -759,19 +791,26 @@ def _two_trace_schema(entry):
                 "io": "input",
                 "shape": shape,
                 "dtype": dtype,
-                "source": "two_trace_graph_off_external_id",
+                "source": shape_source,
             })
     return {"tensors": tensors, "linear_interface": None}
 
 
 def _two_trace_evidence(entry, table):
-    """Kernel-scope P evidence recovered from the workload-identical graph-off run."""
+    """P evidence recovered from the workload-identical graph-off run.
+
+    The op is kernel scope whenever this is reached -- the binding resolved
+    which launch the row is.  The shape is only kernel scope when the mapping
+    row's dims were the kernel's own; ``shape_scope`` keeps the two readable
+    apart rather than letting the op's precision speak for the dims.
+    """
     match = entry.get("match") or {}
+    shape_scope = _two_trace_shape_scope(entry)
     return {
         "level": "P",
         "probe_scope": "kernel",
         "status": "matched",
-        "source": "two_trace_graph_off_external_id",
+        "source": TWO_TRACE_SHAPE_SOURCES[shape_scope],
         "evidence_origin": "two_trace_mapping",
         "contained_by": (entry.get("op") or {}).get("canonical_op"),
         "op_instance_id": (entry.get("op") or {}).get("op_instance_id"),
@@ -785,6 +824,10 @@ def _two_trace_evidence(entry, table):
         "position_delta": match.get("position_delta"),
         "kernel_name_match": match.get("kernel_name_match"),
         "representative_layer_match": match.get("representative_layer_match"),
+        "shape_scope": shape_scope,
+        "shape_source": TWO_TRACE_SHAPE_SOURCES[shape_scope],
+        "mapping_shape_cardinality": (
+            "1:1" if shape_scope == "kernel" else "1:N"),
         "bucket_match": (
             "exact" if match.get("representative_layer_match") == "same_layer"
             else "compatible"),
@@ -915,7 +958,8 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir,
                 recovered_shape = two_trace_entry["shape"]
                 row["shape"] = {
                     **row.get("shape", {}),
-                    "source": "two_trace_kernel_dims",
+                    "source": TWO_TRACE_ROW_SHAPE_SOURCES[
+                        evidence["shape_scope"]],
                     "input_dims": recovered_shape.get("input_dims"),
                     "input_types": recovered_shape.get("input_types"),
                     "logger_schema": evidence["schema"],
@@ -1103,7 +1147,15 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir,
         "shape_rows": sum(
             1 for audit in audits
             if audit["evidence"].get("source")
-            == "two_trace_graph_off_external_id"),
+            in TWO_TRACE_SHAPE_SOURCES.values()),
+        "kernel_scope_shape_rows": sum(
+            1 for audit in audits
+            if audit["evidence"].get("source")
+            == TWO_TRACE_SHAPE_SOURCES["kernel"]),
+        "wrapper_scope_shape_rows": sum(
+            1 for audit in audits
+            if audit["evidence"].get("source")
+            == TWO_TRACE_SHAPE_SOURCES["wrapper"]),
         "operator_rows": sum(
             1 for audit in audits
             if audit.get("parent_recovered_by") == "two_trace_mapping"),

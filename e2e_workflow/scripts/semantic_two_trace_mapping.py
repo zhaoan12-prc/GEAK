@@ -36,8 +36,17 @@ Binding is **kernel name + ordered position inside the layer instance**:
   prefix/substring fallback: an unmatched row keeps its original (weaker)
   evidence rather than acquiring a plausible-but-unproven parent.
 
+What a transplanted shape claims
+-------------------------------
+The dims move with the scope they had in the mapping trace.  A bound row is
+``kernel`` scope only when the mapping row was ``kernel_exact`` -- its ``cpu_op``
+parent launched exactly one device kernel, so the dims are that kernel's own
+operands.  A 1:N parent also carries dims, but every kernel it launched carries
+the same list, so those stay ``wrapper`` scope.  See :func:`_shape_scope`.
+
 The two traces must be workload-identical; see :mod:`semantic_workload_identity`,
-which callers are expected to run first and which fails hard on any mismatch.
+which callers are expected to run first and which skips any table it cannot
+prove identical.
 """
 import argparse
 import json
@@ -146,6 +155,21 @@ def _usable_shape(shape):
     return bool(dims)
 
 
+def _shape_scope(shape):
+    """Whether the bound row's dims are that kernel's operands or its wrapper's.
+
+    ``semantic_kernel_mapping`` marks a row ``kernel_exact`` only when its
+    ``cpu_op`` parent launched exactly one device kernel.  A 1:N parent still
+    supplies dims -- every kernel it launched carries the same ``Input Dims``
+    list -- but those describe the wrapper call, not the individual kernel.
+    Transplanting them as kernel scope would assert that N different kernels
+    have identical operands, which is the claim ``one_to_one_launch`` exists to
+    prevent on the formal side.  Carry the distinction instead of erasing it.
+    """
+    return ("kernel" if (shape or {}).get("source") == "kernel_exact"
+            else "wrapper")
+
+
 def _table_key(table):
     return "%s|%s" % (table.get("pattern_id"), table.get("phase"))
 
@@ -179,6 +203,7 @@ def build(formal_table_doc, mapping_table_doc):
         matches = align_rows(formal_rows, mapping_rows)
 
         matched = op_recovered = shape_recovered = 0
+        kernel_scope_shapes = 0
         for index, formal_row in enumerate(formal_rows):
             if index not in matches:
                 continue
@@ -194,6 +219,8 @@ def build(formal_table_doc, mapping_table_doc):
                 op_recovered += 1
             if has_shape:
                 shape_recovered += 1
+                if _shape_scope(shape) == "kernel":
+                    kernel_scope_shapes += 1
             entries[formal_row["row_id"]] = {
                 "row_id": formal_row["row_id"],
                 "pattern_id": formal_table.get("pattern_id"),
@@ -224,6 +251,7 @@ def build(formal_table_doc, mapping_table_doc):
                     "input_dims": shape.get("input_dims"),
                     "input_types": shape.get("input_types"),
                     "source": shape.get("source", "unresolved"),
+                    "scope": _shape_scope(shape),
                     "recovered": bool(has_shape),
                 },
             }
@@ -235,6 +263,8 @@ def build(formal_table_doc, mapping_table_doc):
             "matched_rows": matched,
             "op_recovered_rows": op_recovered,
             "shape_recovered_rows": shape_recovered,
+            "kernel_scope_shape_rows": kernel_scope_shapes,
+            "wrapper_scope_shape_rows": shape_recovered - kernel_scope_shapes,
             "representative_layer_match": representative_match,
         })
 
@@ -255,6 +285,10 @@ def build(formal_table_doc, mapping_table_doc):
             item.get("op_recovered_rows", 0) for item in table_reports),
         "shape_recovered_row_count": sum(
             item.get("shape_recovered_rows", 0) for item in table_reports),
+        "kernel_scope_shape_row_count": sum(
+            item.get("kernel_scope_shape_rows", 0) for item in table_reports),
+        "wrapper_scope_shape_row_count": sum(
+            item.get("wrapper_scope_shape_rows", 0) for item in table_reports),
         "tables": table_reports,
         "entries": entries,
     }

@@ -58,7 +58,10 @@ class ShapeMergeTwoTraceTest(unittest.TestCase):
             }],
         }
 
-    def _two_trace_map(self, dims=None):
+    def _two_trace_map(self, dims=None, shape_source="kernel_exact",
+                       shape_scope=None):
+        scope = shape_scope or (
+            "kernel" if shape_source == "kernel_exact" else "wrapper")
         return {
             "schema_version": 1,
             "entries": {
@@ -87,7 +90,8 @@ class ShapeMergeTwoTraceTest(unittest.TestCase):
                     "shape": {
                         "input_dims": dims if dims is not None else [[4, 16]],
                         "input_types": ["c10::BFloat16"],
-                        "source": "kernel_exact",
+                        "source": shape_source,
+                        "scope": scope,
                         "recovered": dims is not False,
                     },
                 },
@@ -126,6 +130,67 @@ class ShapeMergeTwoTraceTest(unittest.TestCase):
                 evidence["binding"], "kernel_name_plus_ordered_position")
             self.assertEqual(rows[1]["shape"]["source"], "two_trace_kernel_dims")
             self.assertEqual(rows[1]["shape"]["input_dims"], [[4, 16]])
+            self.assertEqual(evidence["shape_scope"], "kernel")
+            self.assertEqual(evidence["mapping_shape_cardinality"], "1:1")
+
+    def test_parent_context_dims_stay_wrapper_scope(self):
+        # A 1:N cpu_op parent in the mapping trace hands the same Input Dims to
+        # every kernel it launched. Those dims are worth transplanting, but as
+        # the wrapper's operands -- calling them kernel scope would assert that
+        # N different kernels have identical inputs.
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self._run(
+                tmp, self._two_trace_map(shape_source="parent_context"))
+            self.assertEqual(result["status"], "pass")
+            with open(result["semantic_table_json"]) as fh:
+                rows = json.load(fh)["tables"][0]["rows"]
+            evidence = rows[1]["semantic_evidence"]
+            self.assertEqual(evidence["level"], "P")
+            self.assertEqual(evidence["shape_scope"], "wrapper")
+            self.assertEqual(evidence["mapping_shape_cardinality"], "1:N")
+            self.assertEqual(
+                evidence["source"], "two_trace_graph_off_parent_context")
+            self.assertEqual(
+                rows[1]["shape"]["source"], "two_trace_wrapper_dims")
+            self.assertTrue(all(
+                tensor["source"] == "two_trace_graph_off_parent_context"
+                for tensor in rows[1]["shape"]["logger_schema"]["tensors"]))
+            # The op is still kernel scope: the binding did resolve the launch.
+            self.assertEqual(evidence["probe_scope"], "kernel")
+            self.assertEqual(
+                rows[1]["parent_operator"]["mapping_level"],
+                "two_trace_external_id")
+
+    def test_wrapper_scope_dims_are_labelled_wrapper_in_the_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self._run(
+                tmp, self._two_trace_map(shape_source="parent_context"))
+            with open(result["semantic_table_md"]) as fh:
+                markdown = fh.read()
+            self.assertIn("P(wrapper): ", markdown)
+            self.assertNotIn("P(kernel): ", markdown)
+
+    def test_scopeless_map_falls_back_to_the_mapping_shape_source(self):
+        # Maps written before the scope field existed still carry the source
+        # it is derived from.
+        with tempfile.TemporaryDirectory() as tmp:
+            two_trace = self._two_trace_map(shape_source="parent_context")
+            del two_trace["entries"]["event-2"]["shape"]["scope"]
+            result = self._run(tmp, two_trace)
+            with open(result["semantic_table_json"]) as fh:
+                rows = json.load(fh)["tables"][0]["rows"]
+            self.assertEqual(
+                rows[1]["semantic_evidence"]["shape_scope"], "wrapper")
+
+    def test_shape_scope_split_is_counted_in_the_verification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self._run(
+                tmp, self._two_trace_map(shape_source="parent_context"))
+            with open(result["shape_type_verification_json"]) as fh:
+                stats = json.load(fh)["two_trace_mapping"]
+            self.assertEqual(stats["shape_rows"], 1)
+            self.assertEqual(stats["kernel_scope_shape_rows"], 0)
+            self.assertEqual(stats["wrapper_scope_shape_rows"], 1)
 
     def test_operator_attribution_is_transplanted(self):
         with tempfile.TemporaryDirectory() as tmp:

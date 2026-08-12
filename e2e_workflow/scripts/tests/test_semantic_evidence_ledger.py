@@ -109,6 +109,71 @@ class SemanticEvidenceLedgerTest(unittest.TestCase):
             self.assertEqual(coverage["probe_scope_counts"], {
                 "P(wrapper)": 1, "P(kernel)": 1})
 
+    def test_kernel_scope_dims_outrank_wrapper_dims_at_the_same_op_scope(self):
+        # Both probes resolved which call launched the row; only one of them
+        # brought that kernel's own operands.
+        with tempfile.TemporaryDirectory() as tmp:
+            clean = self._document([self._row("event-0")])
+            wrapper_dims = self._document([{
+                **self._row("event-0"),
+                "semantic_evidence": {
+                    "level": "P", "probe_scope": "kernel",
+                    "shape_scope": "wrapper",
+                    "evidence_origin": "two_trace_mapping",
+                    "bucket_match": "exact",
+                    "schema": {"tensors": [
+                        {"io": "input", "shape": [4, 8]},
+                        {"io": "input", "shape": [8, 8]},
+                    ]},
+                },
+            }])
+            kernel_dims = self._document([{
+                **self._row("event-0"),
+                "semantic_evidence": {
+                    "level": "P", "probe_scope": "kernel",
+                    "shape_scope": "kernel",
+                    "evidence_origin": "shape_logger",
+                    "bucket_match": "compatible",
+                    "schema": {"tensors": [{"io": "input", "shape": [4, 16]}]},
+                },
+            }])
+            result = ledger.merge(
+                self._write(tmp, "clean.json", clean),
+                [
+                    self._write(tmp, "wrapper.json", wrapper_dims),
+                    self._write(tmp, "kernel.json", kernel_dims),
+                ],
+                os.path.join(tmp, "out"))
+            with open(result["semantic_table_json"]) as fh:
+                row = json.load(fh)["tables"][0]["rows"][0]
+            evidence = row["semantic_evidence"]
+            self.assertEqual(evidence["shape_scope"], "kernel")
+            self.assertEqual(evidence["evidence_origin"], "shape_logger")
+            with open(result["coverage_manifest"]) as fh:
+                coverage = json.load(fh)
+            self.assertEqual(coverage["shape_scope_counts"], {"shape(kernel)": 1})
+
+    def test_two_trace_wrapper_dims_are_recorded_as_wrapper_dims(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            clean = self._document([self._row("event-0")])
+            probe = self._document([{
+                **self._row("event-0"),
+                "semantic_evidence": {
+                    "level": "P", "probe_scope": "kernel",
+                    "shape_scope": "wrapper",
+                    "evidence_origin": "two_trace_mapping",
+                    "schema": {"tensors": [{"io": "input", "shape": [4, 8]}]},
+                },
+            }])
+            result = ledger.merge(
+                self._write(tmp, "clean.json", clean),
+                [self._write(tmp, "probe.json", probe)],
+                os.path.join(tmp, "out"))
+            with open(result["semantic_table_json"]) as fh:
+                row = json.load(fh)["tables"][0]["rows"][0]
+            self.assertEqual(
+                row["shape"]["source"], "two_trace_wrapper_dims")
+
     def test_u_is_complete_only_with_machine_readable_reason(self):
         with tempfile.TemporaryDirectory() as tmp:
             clean = self._document([self._row("event-0")])

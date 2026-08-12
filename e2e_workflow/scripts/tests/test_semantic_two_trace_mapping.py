@@ -115,6 +115,28 @@ class TwoTraceMappingTest(unittest.TestCase):
             "different_layer_same_pattern")
         self.assertEqual(match["confidence"], "medium")
 
+    def test_shape_scope_follows_the_mapping_rows_own_cardinality(self):
+        # kernel_exact means one cpu_op launched one kernel, so the dims are
+        # this kernel's. parent_context means a 1:N wrapper handed the same
+        # dims to every kernel it launched.
+        formal = _table([
+            _row("f0", 0, "one_to_one", level="unresolved"),
+            _row("f1", 1, "one_of_many", level="unresolved"),
+        ])
+        exact = _row("m0", 0, "one_to_one", dims=[[4, 16]])
+        shared = _row("m1", 1, "one_of_many", dims=[[4, 16]])
+        shared["shape"]["source"] = "parent_context"
+        shared["parent_operator"]["mapping_cardinality"] = "1:N"
+        shared["parent_operator"]["device_launch_count"] = 3
+        doc = two_trace.build({"tables": [formal]},
+                              {"tables": [_table([exact, shared])]})
+        self.assertEqual(doc["entries"]["f0"]["shape"]["scope"], "kernel")
+        self.assertEqual(doc["entries"]["f1"]["shape"]["scope"], "wrapper")
+        # Both are still recovered -- wrapper dims are weaker, not useless.
+        self.assertEqual(doc["shape_recovered_row_count"], 2)
+        self.assertEqual(doc["kernel_scope_shape_row_count"], 1)
+        self.assertEqual(doc["wrapper_scope_shape_row_count"], 1)
+
     def test_tables_are_matched_per_pattern_and_phase(self):
         formal_doc = {"tables": [
             _table([_row("d0", 0, "gemm", level="unresolved")], phase="decode"),

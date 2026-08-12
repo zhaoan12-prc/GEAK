@@ -29,17 +29,35 @@ def _table_key(table):
     )
 
 
+SHAPE_SCOPE_RANK = {"kernel": 2, "wrapper": 1, "none": 0}
+
+
+def _scopes(evidence):
+    """(op scope, shape scope) of one probe's evidence.
+
+    ``probe_scope`` is the op's -- which call the row was proven to be.
+    ``shape_scope`` is the dims' and may be weaker: a kernel-scope route can
+    still end up with an enclosing wrapper's dims. Evidence written before that
+    split existed carried one scope for both, so fall back to it.
+    """
+    scope = evidence.get("probe_scope")
+    if not scope:
+        scope = "kernel" if evidence.get("level") == "P" else "wrapper"
+    return scope, evidence.get("shape_scope") or scope
+
+
 def _probe_quality(row):
     evidence = row.get("semantic_evidence") or {}
     if evidence.get("level") not in ("P", "C"):
         return None
-    scope = evidence.get("probe_scope")
-    if not scope:
-        scope = "kernel" if evidence.get("level") == "P" else "wrapper"
+    scope, shape_scope = _scopes(evidence)
     bucket = evidence.get("bucket_match")
     schema = evidence.get("schema") or {}
     return (
         2 if scope == "kernel" else 1,
+        # Then by how precise the dims themselves are, before origin: a wrapper's
+        # operand list is the same weaker claim whichever route carried it.
+        SHAPE_SCOPE_RANK.get(shape_scope, 1),
         # Trace-native Input Dims bound by name + ordered position outrank a
         # runtime wrapper/launcher probe at the same scope: the dims are the
         # profiler's own record of that kernel's operands, not a reconstruction.
@@ -52,19 +70,18 @@ def _probe_quality(row):
 def _normalise_probe(row, source_path):
     value = copy.deepcopy(row)
     evidence = copy.deepcopy(value.get("semantic_evidence") or {})
-    scope = evidence.get("probe_scope")
-    if not scope:
-        scope = "kernel" if evidence.get("level") == "P" else "wrapper"
+    scope, shape_scope = _scopes(evidence)
     origin = evidence.get("evidence_origin") or "shape_logger"
     evidence.update({
         "level": "P",
         "probe_scope": scope,
+        "shape_scope": shape_scope,
         "evidence_origin": origin,
         "probe_table": os.path.abspath(source_path),
     })
     value["semantic_evidence"] = evidence
     value.setdefault("shape", {})["source"] = (
-        "two_trace_kernel_dims" if origin == "two_trace_mapping"
+        "two_trace_%s_dims" % shape_scope if origin == "two_trace_mapping"
         else "runtime_probe_%s" % scope)
     return value
 
@@ -241,13 +258,18 @@ def merge(clean_table_path, probe_table_paths, out_dir):
         }
         for audit in audits if audit["evidence"]["level"] == "U"]
     probe_scope_counts = {}
+    shape_scope_counts = {}
     probe_origin_counts = {}
     for audit in audits:
         evidence = audit["evidence"]
         if evidence["level"] != "P":
             continue
-        label = "P(%s)" % evidence.get("probe_scope", "wrapper")
+        scope, shape_scope = _scopes(evidence)
+        label = "P(%s)" % scope
         probe_scope_counts[label] = probe_scope_counts.get(label, 0) + 1
+        shape_label = "shape(%s)" % shape_scope
+        shape_scope_counts[shape_label] = (
+            shape_scope_counts.get(shape_label, 0) + 1)
         origin = evidence.get("evidence_origin", "shape_logger")
         probe_origin_counts[origin] = probe_origin_counts.get(origin, 0) + 1
     unavailable_reason_counts = {}
@@ -261,14 +283,16 @@ def merge(clean_table_path, probe_table_paths, out_dir):
         "classification_complete": classified,
         "priority": [
             "K",
-            "P(kernel via two_trace_mapping)",
-            "P(kernel via shape_logger)",
+            "P(kernel op, kernel shape via two_trace_mapping)",
+            "P(kernel op, kernel shape via shape_logger)",
+            "P(kernel op, wrapper shape)",
             "P(wrapper)",
             "U",
         ],
         "row_count": len(audits),
         "evidence_counts": counts,
         "probe_scope_counts": probe_scope_counts,
+        "shape_scope_counts": shape_scope_counts,
         "probe_origin_counts": probe_origin_counts,
         "unavailable_reason_counts": unavailable_reason_counts,
         "probe_tables": [
