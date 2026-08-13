@@ -199,6 +199,22 @@ class SemanticRuntimeLogger(object):
         }
 
     def mark_forward(self):
+        # Only a forward that could actually be recorded may consume a bucket's
+        # budget.  Warmup forwards -- and the benchmark forwards that run
+        # before the profiler window opens -- are dropped by _allowed(), so
+        # counting them spends the budget on a forward that left neither a
+        # shape row nor a trace marker.
+        #
+        # That stayed invisible for as long as the workload produced many
+        # distinct buckets: a varied-length run always had a later bucket still
+        # unspent, which is why 20260812v2 recorded (extend,1,5885) and
+        # decode bs=3/bs=2 but never the first bucket of either phase.  It is
+        # fatal once the bucket space collapses.  A uniform-length workload
+        # (random_range_ratio=1.0) gives one prefill bucket and one steady
+        # decode batch size, so the pre-profiler forward consumed the only
+        # budget there was and the capture produced no shape metadata at all.
+        if self.require_profiler and not self._profile_seen:
+            return
         key = (
             self._context["phase"], self._context["batch_size"],
             self._context["input_tokens"])

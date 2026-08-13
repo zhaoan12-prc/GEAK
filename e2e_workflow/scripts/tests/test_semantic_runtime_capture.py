@@ -63,6 +63,52 @@ class SemanticRuntimeCaptureTest(unittest.TestCase):
                     capture, "_profiler_active", return_value=False):
             self.assertTrue(logger._allowed(3))
 
+    def test_pre_profiler_forward_does_not_spend_the_only_bucket(self):
+        """A collapsed bucket space must survive the pre-profiler forwards.
+
+        install_on_model calls mark_forward() after EVERY forward, including
+        the warmup and benchmark forwards that ran before the profiler window
+        opened and were therefore never recorded.  With a varied-length
+        workload that only wasted some buckets -- a later one was always still
+        unspent.  With a uniform-length workload there is exactly one prefill
+        bucket and one steady decode batch size, so spending it there left the
+        capture with no shape metadata at all.
+        """
+        logger = capture.SemanticRuntimeLogger.__new__(
+            capture.SemanticRuntimeLogger)
+        logger.layers = {3}
+        logger.phases = {"PREFILL"}
+        logger.require_profiler = True
+        logger._profile_seen = False
+        logger.max_forwards = 1
+        logger._bucket_forwards = {}
+        logger._context = {
+            "phase": "EXTEND", "batch_size": 1, "input_tokens": 8192}
+
+        # Warmup / pre-profiler forward: dropped, and must not be counted.
+        with mock.patch.object(logger, "active", return_value=True), \
+                mock.patch.object(
+                    capture, "_profiler_active", return_value=False):
+            self.assertFalse(logger._allowed(3))
+        logger.mark_forward()
+        self.assertEqual(logger._bucket_forwards, {})
+
+        # The profiler window opens on a forward of the SAME bucket -- the only
+        # bucket this workload produces.  Its budget must still be available.
+        with mock.patch.object(logger, "active", return_value=True), \
+                mock.patch.object(
+                    capture, "_profiler_active", return_value=True):
+            self.assertTrue(logger._allowed(3))
+        logger.mark_forward()
+        self.assertEqual(
+            logger._bucket_forwards, {("EXTEND", 1, 8192): 1})
+
+        # Budget is spent now, so a second recorded forward is refused.
+        with mock.patch.object(logger, "active", return_value=True), \
+                mock.patch.object(
+                    capture, "_profiler_active", return_value=True):
+            self.assertFalse(logger._allowed(3))
+
     def test_targeted_callable_is_monkeypatched_and_logged(self):
         module = types.SimpleNamespace(launcher=lambda value: value + 1)
         logger = _Logger()
