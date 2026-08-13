@@ -82,6 +82,74 @@ class TwoTraceMappingTest(unittest.TestCase):
         self.assertEqual(entries["f1"]["match"]["position_delta"], 1)
         self.assertEqual(entries["f1"]["match"]["confidence"], "medium")
 
+    def test_leading_mapping_kernels_do_not_mis_anchor_a_repeated_name(self):
+        """The real 20260812v3 Qwen decode failure, reduced.
+
+        The mapping layer instance starts with four kernels the formal window
+        does not have, and the first of them repeats the name of formal row 0.
+        Two maximum-length alignments exist -- bind row 0 to the leading MoE
+        quant (offset 0, everything else offset 4) or to the attention input
+        quant (offset 4 throughout) -- and a greedy backtrack takes the first,
+        putting MoE shapes on the attention row.  Every pair must agree on one
+        offset instead.
+        """
+        formal = _table([
+            _row("f0", 0, "quant", level="unresolved"),
+            _row("f1", 1, "gemm", level="unresolved"),
+            _row("f2", 2, "copy", level="unresolved"),
+        ])
+        mapping = _table([
+            _row("m0", 0, "quant", dims=[[4, 11, 128]], op="moe_quant"),
+            _row("m1", 1, "moe_gemm", dims=[[1, 1]], op="moe_gemm"),
+            _row("m2", 2, "memcpy", dims=[[1, 1]], op="memcpy"),
+            _row("m3", 3, "allreduce", dims=[[1, 1]], op="all_reduce"),
+            _row("m4", 4, "quant", dims=[[4, 4096]], op="attn_input_quant"),
+            _row("m5", 5, "gemm", dims=[[4, 4096]], op="qkv_proj"),
+            _row("m6", 6, "copy", dims=[[4, 4, 256]], op="split_qkv"),
+        ])
+        doc = two_trace.build({"tables": [formal]}, {"tables": [mapping]})
+        entries = doc["entries"]
+        self.assertEqual(
+            entries["f0"]["op"]["canonical_op"], "attn_input_quant")
+        self.assertEqual(entries["f0"]["shape"]["input_dims"], [[4, 4096]])
+        self.assertEqual(entries["f1"]["op"]["canonical_op"], "qkv_proj")
+        self.assertEqual(entries["f2"]["op"]["canonical_op"], "split_qkv")
+        self.assertEqual(
+            [entry["match"]["position_delta"] for entry in entries.values()],
+            [4, 4, 4])
+
+    def test_preferring_an_offset_never_costs_a_matched_row(self):
+        """A tidier offset must never be bought with a shorter alignment.
+
+        Only one alignment here is maximum length (three pairs) and its offsets
+        are unavoidably mixed, so aiming at any offset must leave it alone.
+        """
+        formal = ["a", "b", "c"]
+        mapping = ["a", "x", "b", "y", "y", "c"]
+        plain = two_trace._lcs_pairs(formal, mapping)
+        self.assertEqual(plain, [(0, 0), (1, 2), (2, 5)])
+        for target in (-2, 0, 1, 3, 7):
+            aimed = two_trace._lcs_pairs(formal, mapping, target)
+            self.assertEqual(len(aimed), len(plain))
+            self.assertEqual(aimed, plain)
+
+    def test_alignment_length_is_invariant_under_any_preferred_offset(self):
+        """Deferring a pair is gated on the DP table, so length cannot drop."""
+        formal = ["q", "g", "q", "g", "n", "q"]
+        mapping = ["q", "z", "q", "g", "q", "g", "n", "q", "q"]
+        best = len(two_trace._lcs_pairs(formal, mapping))
+        for target in range(-4, 6):
+            aimed = two_trace._lcs_pairs(formal, mapping, target)
+            self.assertEqual(len(aimed), best)
+            self.assertEqual(aimed, sorted(aimed))
+            self.assertEqual(
+                len({i for i, _ in aimed}), len(aimed))
+            self.assertEqual(
+                len({j for _, j in aimed}), len(aimed))
+            for (i0, j0), (i1, j1) in zip(aimed, aimed[1:]):
+                self.assertLess(i0, i1)
+                self.assertLess(j0, j1)
+
     def test_name_mismatch_is_never_bridged(self):
         """No fuzzy fallback: an unmatched row must stay unmatched."""
         formal = _table([_row("f0", 0, "totally_different", level="unresolved")])

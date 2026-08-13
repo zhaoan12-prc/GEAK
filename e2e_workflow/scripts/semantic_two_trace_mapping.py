@@ -36,6 +36,29 @@ Binding is **kernel name + ordered position inside the layer instance**:
   prefix/substring fallback: an unmatched row keeps its original (weaker)
   evidence rather than acquiring a plausible-but-unproven parent.
 
+Choosing between equally long alignments
+----------------------------------------
+Order preservation alone is not enough.  An LCS maximises the *number* of
+matched pairs and is indifferent to which occurrence of a repeated name each
+pair uses, so when the mapping layer instance carries extra leading kernels
+there are several maximum-length alignments and a plain greedy backtrack takes
+the earliest one.  20260812v3's Qwen decode table is what that looks like: the
+mapping instance began with four kernels the formal window does not have (a MoE
+quant, ``ck::kernel_moe_gemm``, a DtoD ``Memcpy`` and the closing all-reduce),
+its first kernel shares a name with the formal row 0, and the greedy backtrack
+bound formal row 0 -- the attention input quant -- to the MoE quant.  Every
+other row shifted by 4, so the table's ``position_delta`` read ``{0: 1, 4: 12,
+5: 10}``: a single row out of step with all of its neighbours, holding MoE
+shapes on an attention row.
+
+So among alignments of equal length this module prefers the one whose pairs
+share a consistent offset.  :func:`_lcs_pairs` takes a ``preferred_delta`` and,
+at a name match, defers the pair when doing so moves ``j - i`` toward that
+offset *and* costs no length -- the DP table is what proves the deferral free,
+so an alignment can never be shortened to make it tidier.  :func:`align_rows`
+runs the plain pass first, takes the dominant offset of the result, and
+re-runs aimed at it until the alignment stops changing.
+
 What a transplanted shape claims
 -------------------------------
 The dims move with the scope they had in the mapping trace.  A bound row is
@@ -49,6 +72,7 @@ which callers are expected to run first and which skips any table it cannot
 prove identical.
 """
 import argparse
+import collections
 import json
 import os
 import re
@@ -58,16 +82,41 @@ import semantic_kernel_mapping
 
 CONFIDENCE_ORDER = {"high": 3, "medium": 2, "low": 1, "none": 0}
 
+# align_rows re-aims the backtrack at the offset the previous pass settled on.
+# Each pass can only change the alignment by moving pairs onto that offset, so
+# this converges almost immediately; the bound just makes termination obvious.
+MAX_REALIGN_PASSES = 4
+
 
 def _normalize_name(value):
     return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
 
-def _lcs_pairs(left_keys, right_keys):
+def _delta_mode(pairs):
+    """The offset most of an alignment's pairs agree on, or None if empty.
+
+    Ties break on the offset closest to zero so the choice never depends on
+    dict ordering.
+    """
+    if not pairs:
+        return None
+    counts = collections.Counter(j - i for i, j in pairs)
+    return min(counts.items(),
+               key=lambda item: (-item[1], abs(item[0]), item[0]))[0]
+
+
+def _lcs_pairs(left_keys, right_keys, preferred_delta=None):
     """Longest common subsequence over two key streams -> ordered index pairs.
 
     Order preservation is what makes repeated kernel names resolvable: the k-th
     occurrence on the left can only pair with the k-th occurrence on the right.
+
+    ``preferred_delta`` picks between alignments that are all of maximum length.
+    At a name match the backtrack may defer the pair when that moves ``j - i``
+    toward the preferred offset, but only when the DP table proves the deferral
+    free: advancing a side is allowed exactly when the longest subsequence
+    reachable from there is the same as from here.  Length is therefore
+    invariant -- this reorders which occurrences pair, never how many.
     """
     n, m = len(left_keys), len(right_keys)
     if not n or not m:
@@ -85,6 +134,16 @@ def _lcs_pairs(left_keys, right_keys):
     i = j = 0
     while i < n and j < m:
         if left_keys[i] == right_keys[j]:
+            if preferred_delta is not None:
+                delta = j - i
+                # Skipping this occurrence of the name is only permitted while
+                # the reachable subsequence stays exactly as long.
+                if delta < preferred_delta and table[i][j + 1] == table[i][j]:
+                    j += 1
+                    continue
+                if delta > preferred_delta and table[i + 1][j] == table[i][j]:
+                    i += 1
+                    continue
             pairs.append((i, j))
             i += 1
             j += 1
@@ -95,11 +154,14 @@ def _lcs_pairs(left_keys, right_keys):
     return pairs
 
 
-def _gap_pairs(formal_rows, mapping_rows, anchors):
+def _gap_pairs(formal_rows, mapping_rows, anchors, preferred_delta=None):
     """Second pass: normalized-name LCS inside the gaps between exact anchors.
 
     Confined to each gap so the global order established by the exact pass can
-    never be violated.
+    never be violated.  A gap's indices are contiguous ranges, so a pair's
+    offset in table coordinates is the enclosing anchor's offset plus the pair's
+    offset inside the slice -- which is what converts the caller's preferred
+    offset into the one this slice should aim for.
     """
     extra = []
     bounds = [(-1, -1)] + anchors + [(len(formal_rows), len(mapping_rows))]
@@ -113,19 +175,45 @@ def _gap_pairs(formal_rows, mapping_rows, anchors):
         right_keys = [
             _normalize_name(mapping_rows[j].get("raw_name"))
             for j in right_slice]
-        for a, b in _lcs_pairs(left_keys, right_keys):
+        local_preferred = None
+        if preferred_delta is not None:
+            local_preferred = preferred_delta - (
+                right_slice[0] - left_slice[0])
+        for a, b in _lcs_pairs(left_keys, right_keys, local_preferred):
             if left_keys[a]:
                 extra.append((left_slice[a], right_slice[b]))
     return extra
 
 
 def align_rows(formal_rows, mapping_rows):
-    """Bind formal rows to mapping rows by name + ordered position."""
+    """Bind formal rows to mapping rows by name + ordered position.
+
+    The first pass is the plain backtrack.  Its dominant offset then aims a
+    re-run, which can only move pairs onto that offset and never shorten the
+    alignment, so repeating it until the result stops changing settles on the
+    alignment whose pairs agree with each other.  Without this a mapping layer
+    instance that starts with extra kernels binds its first repeated name to the
+    wrong occurrence and leaves one row out of step with the whole table.
+    """
     formal_keys = [str(row.get("raw_name") or "") for row in formal_rows]
     mapping_keys = [str(row.get("raw_name") or "") for row in mapping_rows]
     anchors = _lcs_pairs(formal_keys, mapping_keys)
+    preferred_delta = _delta_mode(anchors)
+    for _ in range(MAX_REALIGN_PASSES):
+        if preferred_delta is None:
+            break
+        retry = _lcs_pairs(formal_keys, mapping_keys, preferred_delta)
+        # The DP guard makes a shorter retry impossible; refuse it anyway rather
+        # than trade matched rows for a tidier offset.
+        if retry == anchors or len(retry) < len(anchors):
+            break
+        anchors = retry
+        next_delta = _delta_mode(anchors)
+        if next_delta == preferred_delta:
+            break
+        preferred_delta = next_delta
     matches = {i: (j, "exact") for i, j in anchors}
-    for i, j in _gap_pairs(formal_rows, mapping_rows, anchors):
+    for i, j in _gap_pairs(formal_rows, mapping_rows, anchors, preferred_delta):
         matches.setdefault(i, (j, "normalized"))
     return matches
 
