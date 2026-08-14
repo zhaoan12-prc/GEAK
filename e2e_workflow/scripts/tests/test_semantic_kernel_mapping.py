@@ -471,3 +471,63 @@ class SemanticKernelMappingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeviceTruncatedRepresentativeTest(unittest.TestCase):
+    """A truncated layer instance must never become a Pattern representative.
+
+    boundary_complete only asserts contiguity, which a one-event fragment
+    satisfies. When a graph-off profiler window closes mid-sweep the tail
+    layers keep their module spans but lose their kernels, and the resulting
+    candidate population is bimodal -- so the duration medoid lands on a
+    fragment and the representative's table binds nothing downstream.
+    """
+
+    def _instances(self):
+        # 29 complete layers (76 events, ~937us) + 28 truncated (1 event).
+        values = []
+        for layer_id in range(3, 32):
+            values.append({"pattern_id": "P1", "phase": "decode",
+                           "layer_id": layer_id, "event_count": 76,
+                           "duration_us": 937.6, "boundary_complete": True})
+        for layer_id in range(32, 60):
+            # 96.4us is the fragment closest to the all-candidate median.
+            duration = 96.4 if layer_id == 58 else 8.7
+            values.append({"pattern_id": "P1", "phase": "decode",
+                           "layer_id": layer_id, "event_count": 1,
+                           "duration_us": duration,
+                           "boundary_complete": True})
+        return values
+
+    def test_fragments_are_excluded_and_logged(self):
+        usable, dropped = mapping._device_truncated(self._instances())
+        self.assertEqual(len(usable), 29)
+        self.assertEqual(
+            sorted(item["layer_id"] for item in dropped), list(range(32, 60)))
+        self.assertTrue(all(item["event_count"] == 76 for item in usable))
+
+    def test_a_short_but_complete_layer_is_kept(self):
+        values = [
+            {"pattern_id": "P1", "phase": "decode", "layer_id": 4,
+             "event_count": 76, "duration_us": 900.0,
+             "boundary_complete": True},
+            {"pattern_id": "P1", "phase": "decode", "layer_id": 5,
+             "event_count": 76, "duration_us": 900.0,
+             "boundary_complete": True},
+            # 39 events is half the modal layer, not a fragment.
+            {"pattern_id": "P1", "phase": "decode", "layer_id": 3,
+             "event_count": 39, "duration_us": 480.0,
+             "boundary_complete": True},
+        ]
+        usable, dropped = mapping._device_truncated(values)
+        self.assertEqual(dropped, [])
+        self.assertEqual(len(usable), 3)
+
+    def test_all_truncated_strands_nothing(self):
+        values = [
+            {"pattern_id": "P1", "phase": "decode", "layer_id": i,
+             "event_count": 1, "duration_us": 8.0, "boundary_complete": True}
+            for i in range(3, 10)]
+        usable, dropped = mapping._device_truncated(values)
+        self.assertEqual(dropped, [])
+        self.assertEqual(len(usable), len(values))

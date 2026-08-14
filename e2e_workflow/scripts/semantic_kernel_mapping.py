@@ -2,6 +2,7 @@
 """Build Pattern/Phase/Layer ordered device-event tables from one clean trace."""
 import argparse
 import bisect
+import collections
 import difflib
 import gzip
 import hashlib
@@ -1413,11 +1414,69 @@ def _boundary_rank(instance):
     return best
 
 
+def _device_truncated(values):
+    """Split (pattern, phase) instances into usable ones and device fragments.
+
+    ``boundary_complete`` only asserts that an instance's device events are
+    contiguous -- which a one-event fragment satisfies trivially. When a
+    profiler window closes mid-sweep (routine for the graph-off mapping replay:
+    in eager mode the CPU runs ahead, so the tail layers keep their python and
+    module spans but lose their kernels) an entire tail of such fragments
+    survives that check.
+
+    They must not reach medoid selection. The medoid scores duration against
+    the median, so a population that is half complete layers and half fragments
+    has a median no real layer sits near, and the layer *closest* to it is a
+    fragment -- the representative then carries a one-row table and binds
+    nothing downstream.
+
+    The modal event count is the reliable reference: layers inside one Pattern
+    are structurally identical, so the count most of them share is the complete
+    layer size. Anything under half of it is a fragment, not a short layer.
+    """
+    counts = [int(item.get("event_count") or 0) for item in values]
+    if not counts:
+        return values, []
+    frequency = collections.Counter(counts)
+    # Ties go to the larger count: a complete layer, never a fragment.
+    reference = max(frequency, key=lambda count: (frequency[count], count))
+    threshold = reference / 2.0
+    usable = [item for item in values
+              if int(item.get("event_count") or 0) >= threshold]
+    dropped = [item for item in values
+               if int(item.get("event_count") or 0) < threshold]
+    # Never strand a pattern: if every instance looks truncated there is no
+    # better evidence available, so keep them and let the quality gates speak.
+    if not usable:
+        return values, []
+    return usable, dropped
+
+
 def _representatives(pattern_doc, instances):
     by_pattern = {}
+    by_pattern_phase = {}
     for instance in instances:
         if instance["boundary_complete"]:
-            by_pattern.setdefault(instance["pattern_id"], []).append(instance)
+            by_pattern_phase.setdefault(
+                (instance["pattern_id"], instance["phase"]), []).append(
+                    instance)
+    truncated_diagnostics = []
+    for (pid, phase), values in sorted(by_pattern_phase.items()):
+        usable, dropped = _device_truncated(values)
+        if dropped:
+            truncated_diagnostics.append({
+                "pattern_id": pid,
+                "phase": phase,
+                "reference_event_count": max(
+                    int(item.get("event_count") or 0) for item in usable),
+                "dropped_layer_ids": sorted(
+                    item["layer_id"] for item in dropped),
+                "reason": (
+                    "device-truncated layer instances excluded from "
+                    "representative selection"),
+            })
+        by_pattern.setdefault(pid, []).extend(usable)
+    _representatives.last_truncated = truncated_diagnostics
     selected = {}
     for pattern in pattern_doc.get("patterns", []):
         pid = pattern["pattern_id"]
@@ -1847,6 +1906,8 @@ def build(trace_path, pattern_path, out_dir, table_phases=None):
             "schema_version": 1, "trace_sha256": _sha(trace_path),
             "module_scope_diagnostics": module_diagnostics,
             "module_scope_count": len(module_scopes),
+            "device_truncated_instances": getattr(
+                _representatives, "last_truncated", []),
             "module_interpolated_event_count": module_interpolated,
             "boundary_partition_diagnostics": partition_diagnostics,
             "prefix_demotions": prefix_demotions,

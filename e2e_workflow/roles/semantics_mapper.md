@@ -136,6 +136,17 @@ This phase is opt-in and remains non-gating.
   (`_OPERATOR_ROLE_MAPS`); otherwise name arguments positionally and claim no direction. A recorded
   direction always outranks a positional role name. Never let a role name invented by a stage
   default (`scale`, `topk_weights`, `y`) move a tensor into the output column.
+- **Identity `pass` is not coverage.** `semantic_workload_identity` compares each table's
+  `selected_bucket` only, so a mapping table holding a single device row still passes. Read
+  `two_trace_unmapped_tables` / `two_trace_table_coverage`: a table with `matched_rows=0` recovered no
+  op attribution, and its rows silently fall back to the enclosing module marker
+  (`model.layers.N...`) instead of a real operator. Report it in `notes`.
+- A graph-off mapping replay can be **device-truncated**: in eager mode the CPU runs ahead, so at
+  `stop_profile` the tail layers own python/module spans but no Kernels. Module spans covering every
+  layer therefore do *not* prove device coverage. Before trusting a mapping table, check that its
+  representative layer has a full device event count; if the pattern's representative landed in the
+  truncated tail, lengthen the mapping window or choose a representative with complete coverage
+  rather than accepting the empty table.
 
 ## Return JSON
 

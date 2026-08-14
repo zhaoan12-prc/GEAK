@@ -90,6 +90,44 @@ def _two_trace_mapping(out_dir, patterns_path, phase_1_1_json,
     return map_path, document
 
 
+def _two_trace_coverage(two_trace_document):
+    """Per-table mapping coverage, and the tables that recovered ~nothing.
+
+    The identity gate compares each table's `selected_bucket` -- phase, batch
+    size, input tokens -- and nothing else. A mapping table holding a single
+    device row has a *matching* bucket, so identity reports `pass` while that
+    table in fact binds no ops at all and every row silently keeps its weaker
+    fallback (the enclosing module marker, `model.layers.N...`).
+
+    That happens when the graph-off replay's window is device-truncated: in
+    eager mode the CPU runs ahead of the GPU, so at `stop_profile` the tail
+    layers have python/module spans but no kernels. If the mapping run's
+    representative for a pattern lands in that tail, its table is empty.
+
+    Coverage is therefore reported separately from identity. It stays
+    non-gating -- unbound rows keep valid, weaker evidence -- but a table at
+    0.0 is the signal to lengthen the mapping window or to pick a
+    representative with complete device coverage.
+    """
+    tables = (two_trace_document or {}).get("tables") or []
+    coverage = []
+    for table in tables:
+        formal = int(table.get("formal_rows", 0) or 0)
+        mapping = int(table.get("mapping_rows", 0) or 0)
+        matched = int(table.get("matched_rows", 0) or 0)
+        coverage.append({
+            "table": table.get("table"),
+            "formal_rows": formal,
+            "mapping_rows": mapping,
+            "matched_rows": matched,
+            "matched_fraction": round(matched / formal, 4) if formal else 0.0,
+        })
+    starved = sorted(
+        item["table"] for item in coverage
+        if item["formal_rows"] and not item["matched_rows"])
+    return coverage, starved
+
+
 def run(config_path, trace_path, shape_log_path, out_dir,
         config_key="", runtime_sources=None, capture_setup_path="",
         capture_result_path="", capture_result_paths=None,
@@ -263,6 +301,9 @@ def run(config_path, trace_path, shape_log_path, out_dir,
             "shape_merge": merged_probe,
         })
 
+    two_trace_coverage, two_trace_unmapped = _two_trace_coverage(
+        two_trace_document)
+
     merged_dir = os.path.join(out_dir, "semantics_1_2")
     merged = semantic_evidence_ledger.merge(
         phase_1_1_json, probe_tables, merged_dir)
@@ -305,6 +346,12 @@ def run(config_path, trace_path, shape_log_path, out_dir,
         "two_trace_skipped_tables": (
             (two_trace_document or {}).get(
                 "workload_identity", {}).get("skipped_table_keys", [])),
+        # Identity `pass` does not mean the mapping run actually covered every
+        # table; see _two_trace_coverage. A table listed here recovered no op
+        # attribution at all, so its rows fall back to the enclosing module
+        # marker rather than a real operator.
+        "two_trace_table_coverage": two_trace_coverage,
+        "two_trace_unmapped_tables": two_trace_unmapped,
         "boundary_evidence": boundary_evidence,
         "module_scope_count": module_scope_count,
         "inputs": {

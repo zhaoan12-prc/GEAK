@@ -262,3 +262,31 @@ class RunSemantics12Test(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TwoTraceCoverageTest(unittest.TestCase):
+    """Identity `pass` must not be read as "the mapping run covered everything".
+
+    The identity gate only compares each table's selected_bucket, so a mapping
+    table holding a single device row -- the signature of a device-truncated
+    graph-off window -- passes identity while binding no ops at all.
+    """
+
+    def test_table_that_bound_nothing_is_reported(self):
+        document = {"tables": [
+            {"table": "P0|decode", "formal_rows": 30,
+             "mapping_rows": 33, "matched_rows": 25},
+            {"table": "P1|decode", "formal_rows": 34,
+             "mapping_rows": 1, "matched_rows": 0},
+        ]}
+        coverage, unmapped = runner._two_trace_coverage(document)
+        self.assertEqual(unmapped, ["P1|decode"])
+        by_table = {item["table"]: item for item in coverage}
+        self.assertAlmostEqual(
+            by_table["P0|decode"]["matched_fraction"], 25 / 30, places=4)
+        self.assertEqual(by_table["P1|decode"]["matched_fraction"], 0.0)
+
+    def test_no_two_trace_run_reports_nothing(self):
+        coverage, unmapped = runner._two_trace_coverage(None)
+        self.assertEqual(coverage, [])
+        self.assertEqual(unmapped, [])
