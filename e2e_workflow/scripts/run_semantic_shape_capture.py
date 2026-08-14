@@ -236,7 +236,7 @@ bash %s
         ",".join(setup.get("callable_targets", [])), trace_dir,
         setup["model"], setup["tensor_parallel_size"],
         workload["concurrency"], workload["input_length"],
-        workload["output_length"], workload.get("random_range_ratio", 0.8),
+        workload["output_length"], workload.get("random_range_ratio", 1.0),
         setup["port"], repository, benchmark)
     started = time.time()
     try:
