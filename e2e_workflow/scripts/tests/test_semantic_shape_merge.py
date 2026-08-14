@@ -315,5 +315,129 @@ class SemanticShapeMergeTest(unittest.TestCase):
             reason_code, "runtime_copy_without_unique_tensor")
 
 
+class ArgumentDirectionEvidenceTest(unittest.TestCase):
+    """An input/output split may only be shown when it is actually evidenced.
+
+    A shape row recovered from a cpu_op's `Input Dims` carries every positional
+    argument as io="input" -- the profiler cannot mark out-params. Applying the
+    probe role table (which assumes argument 0 is the input) to such a row
+    inverts AITER-style out-param kernels: the destination buffer gets shown as
+    the input and the real input as an output.
+    """
+
+    def _two_trace_quant_row(self):
+        # aiter::dynamic_per_token_scaled_quant(out_fp8, input_bf16, scale_fp32)
+        return {
+            "stage": "quant",
+            "parent_operator": {
+                "canonical_op": "aiter::dynamic_per_token_scaled_quant"},
+            "semantic_evidence": {"level": "P", "probe_scope": "kernel"},
+            "shape": {"source": "two_trace_kernel_dims", "logger_schema": {
+                "tensors": [
+                    {"io": "input", "arg_name": "args[0]",
+                     "dtype": "c10::Float8_e4m3fnuz", "shape": [4, 7168]},
+                    {"io": "input", "arg_name": "args[1]",
+                     "dtype": "c10::BFloat16", "shape": [224, 128]},
+                    {"io": "input", "arg_name": "args[2]",
+                     "dtype": "float", "shape": [4, 56]},
+                ]}},
+        }
+
+    def test_probe_roles_are_not_applied_without_io_evidence(self):
+        # The destination buffer must not be rendered as the input `x`.
+        text = merge._shape_text(self._two_trace_quant_row())
+        self.assertEqual(
+            text,
+            "P(kernel): x=BF16[224×128]<br><br>"
+            "y=FP8[4×7168]<br>scale=FP32[4×56]")
+
+    def test_matches_the_clean_trace_rendering_of_the_same_operator(self):
+        # Same operator, same argument order: the K and P paths must agree.
+        trace_row = {
+            "stage": "quant",
+            "parent_operator": {
+                "canonical_op": "aiter::dynamic_per_token_scaled_quant"},
+            "semantic_evidence": {"level": "K"},
+            "shape": {
+                "input_types": [
+                    "c10::Float8_e4m3fnuz", "c10::BFloat16", "float"],
+                "input_dims": [[4, 7168], [224, 128], [4, 56]],
+            },
+        }
+        self.assertEqual(
+            merge._shape_text(trace_row).split(":", 1)[1],
+            merge._shape_text(self._two_trace_quant_row()).split(":", 1)[1])
+
+    def test_unknown_operator_claims_no_direction(self):
+        # No io evidence and no calling convention: name positionally and do
+        # not fabricate an output section.
+        row = {
+            "stage": "moe",
+            "parent_operator": {"canonical_op": "aiter::moe_sorting_fwd"},
+            "semantic_evidence": {"level": "P", "probe_scope": "wrapper"},
+            "shape": {"logger_schema": {"tensors": [
+                {"io": "input", "arg_name": "args[0]",
+                 "dtype": "int", "shape": [8193, 9]},
+                {"io": "input", "arg_name": "args[1]",
+                 "dtype": "float", "shape": [8193, 9]},
+            ]}},
+        }
+        text = merge._shape_text(row)
+        self.assertEqual(
+            text, "P(wrapper): arg0=INT32[8193×9]<br>arg1=FP32[8193×9]")
+        self.assertNotIn("<br><br>", text)
+
+    def test_probe_roles_still_used_when_the_probe_labelled_io(self):
+        # A real shape_logger probe does carry io, and must keep using it.
+        row = {
+            "stage": "gemm",
+            "semantic_evidence": {"level": "P", "probe_scope": "kernel"},
+            "shape": {"logger_schema": {"tensors": [
+                {"io": "input", "tensor_path": "args[0]",
+                 "dtype": "float8_e4m3fnuz", "shape": [7238, 7168]},
+                {"io": "output", "tensor_path": "output",
+                 "dtype": "bfloat16", "shape": [7238, 2112]},
+            ]}},
+        }
+        self.assertEqual(
+            merge._shape_text(row),
+            "P(kernel): x=FP8[7238×7168]<br><br>y=BF16[7238×2112]")
+
+    def test_recorded_io_wins_over_the_role_name(self):
+        # `scale` is an output-sounding role name, but this probe recorded the
+        # argument as an input. The recorded direction must win.
+        row = {
+            "stage": "quant",
+            "semantic_evidence": {"level": "P", "probe_scope": "wrapper"},
+            "shape": {"logger_schema": {"tensors": [
+                {"io": "input", "arg_name": "args[0]",
+                 "dtype": "bfloat16", "shape": [4, 16, 576]},
+                {"io": "input", "arg_name": "args[1]",
+                 "dtype": "bfloat16", "shape": [4, 1, 576]},
+                {"io": "output", "arg_name": "output",
+                 "dtype": "bfloat16", "shape": [4, 16, 512]},
+            ]}},
+        }
+        text = merge._shape_text(row)
+        inputs, outputs = text.split("<br><br>")
+        self.assertIn("BF16[4×1×576]", inputs)
+        self.assertNotIn("BF16[4×1×576]", outputs)
+        self.assertIn("BF16[4×16×512]", outputs)
+
+    def test_clean_trace_unknown_operator_also_claims_no_direction(self):
+        row = {
+            "stage": "moe",
+            "parent_operator": {"canonical_op": "aiter::ck_moe_stage1"},
+            "semantic_evidence": {"level": "K"},
+            "shape": {
+                "input_types": ["c10::BFloat16", "float"],
+                "input_dims": [[4, 7168], [4, 9]],
+            },
+        }
+        text = merge._shape_text(row)
+        self.assertEqual(text, "K: arg0=BF16[4×7168]<br>arg1=FP32[4×9]")
+        self.assertNotIn("<br><br>", text)
+
+
 if __name__ == "__main__":
     unittest.main()

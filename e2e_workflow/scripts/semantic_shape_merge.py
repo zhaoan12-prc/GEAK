@@ -388,45 +388,66 @@ def _dtype_label(value):
     return text.upper()
 
 
-def _trace_role(row, index):
+# Per-operator argument roles. These encode the real calling convention,
+# including the AITER/HIP habit of passing destination buffers as leading
+# positional arguments -- which is exactly what a positional guess gets wrong.
+# A token match here is the only evidence that an argument's input/output role
+# is actually *known* rather than assumed.
+_OPERATOR_ROLE_MAPS = (
+    ("dynamic_per_token_scaled_quant", (
+        "y", "x", "scale")),
+    ("add_rmsnorm", (
+        "y", "residual", "x", "residual_out", "weight")),
+    ("::rmsnorm", ("y", "x", "weight")),
+    ("::copy_", ("dst", "src")),
+    ("rope_cached_positions", (
+        "q", "k", "q_out", "k_out", "q_cache", "k_cache",
+        "positions")),
+    ("fmha", ("q", "k", "v", "cu_seqlens_q", "cu_seqlens_k")),
+    ("mha_batch_prefill", (
+        "q", "k", "v", "cu_seqlens_q", "cu_seqlens_k",
+        "block_table")),
+    ("store_cache", (
+        "k", "v", "k_cache_out", "v_cache_out", "slot_mapping")),
+    ("qr_all_reduce", ("workspace", "x", "y")),
+    ("silu_and_mul", ("y", "x")),
+    ("::sigmoid", ("x",)),
+    ("::mul", ("x", "other")),
+    ("::gt", ("x", "other")),
+    ("::fill_", ("dst",)),
+    ("::mm", ("x", "weight")),
+    ("grouped_topk", (
+        "logits", "bias", "topk_weights", "topk_ids")),
+    ("fmoe", (
+        "x", "y", "w13", "w2", "sorted_ids", "sorted_weights",
+        "sorted_expert_ids", "num_valid_ids", "workspace",
+        "x_scale", "w13_scale", "w2_scale")),
+    ("_index_put_impl_", ("cache", "indices", "x")),
+    ("::arange", ("start", "end", "step", "y")),
+)
+
+
+def _operator_roles(row):
+    """Roles for this row's operator, or None when the operator is unknown.
+
+    None means "no calling-convention knowledge". Callers must not invent an
+    input/output split in that case.
+    """
     op = str(
-        row.get("parent_operator", {}).get("canonical_op", "")).lower()
+        (row.get("parent_operator") or {}).get("canonical_op", "")).lower()
+    if not op:
+        return None
+    for token, roles in _OPERATOR_ROLE_MAPS:
+        if token in op:
+            return roles
+    return None
+
+
+def _trace_role(row, index):
     stage = str(row.get("stage") or "").lower()
-    role_maps = (
-        ("dynamic_per_token_scaled_quant", (
-            "y", "x", "scale")),
-        ("add_rmsnorm", (
-            "y", "residual", "x", "residual_out", "weight")),
-        ("::rmsnorm", ("y", "x", "weight")),
-        ("::copy_", ("dst", "src")),
-        ("rope_cached_positions", (
-            "q", "k", "q_out", "k_out", "q_cache", "k_cache",
-            "positions")),
-        ("fmha", ("q", "k", "v", "cu_seqlens_q", "cu_seqlens_k")),
-        ("mha_batch_prefill", (
-            "q", "k", "v", "cu_seqlens_q", "cu_seqlens_k",
-            "block_table")),
-        ("store_cache", (
-            "k", "v", "k_cache_out", "v_cache_out", "slot_mapping")),
-        ("qr_all_reduce", ("workspace", "x", "y")),
-        ("silu_and_mul", ("y", "x")),
-        ("::sigmoid", ("x",)),
-        ("::mul", ("x", "other")),
-        ("::gt", ("x", "other")),
-        ("::fill_", ("dst",)),
-        ("::mm", ("x", "weight")),
-        ("grouped_topk", (
-            "logits", "bias", "topk_weights", "topk_ids")),
-        ("fmoe", (
-            "x", "y", "w13", "w2", "sorted_ids", "sorted_weights",
-            "sorted_expert_ids", "num_valid_ids", "workspace",
-            "x_scale", "w13_scale", "w2_scale")),
-        ("_index_put_impl_", ("cache", "indices", "x")),
-        ("::arange", ("start", "end", "step", "y")),
-    )
-    for token, roles in role_maps:
-        if token in op and index < len(roles):
-            return roles[index]
+    roles = _operator_roles(row)
+    if roles is not None and index < len(roles):
+        return roles[index]
     defaults = {
         "gemm": ("x", "weight", "bias", "x_scale", "weight_scale"),
         "quant": ("y", "x", "scale"),
@@ -514,9 +535,38 @@ def _is_output_role(role):
             "topk_weights", "topk_ids", "scale"))
 
 
+def _schema_declares_io(tensors):
+    """True when the probe actually labelled an output.
+
+    Shape rows recovered from a cpu_op's ``Input Dims`` carry every positional
+    argument as ``io="input"`` -- the profiler cannot say which one is an
+    out-param. Such a schema carries no io evidence, so the probe role table
+    (which assumes argument 0 is the input) must not be applied to it.
+    """
+    return any(
+        str(tensor.get("io") or "").lower() == "output"
+        for tensor in tensors)
+
+
+def _positional_role(tensor, index):
+    """Name an argument without claiming to know its direction."""
+    return _path_name(tensor) or "arg%d" % index
+
+
 def _semantic_shape_text(prefix, tensors):
-    inputs = [text for role, text in tensors if not _is_output_role(role)]
-    outputs = [text for role, text in tensors if _is_output_role(role)]
+    """Render tensors, splitting inputs from outputs.
+
+    Items are ``(role, text)`` -- direction inferred from the role name -- or
+    ``(role, text, is_output)`` when the direction is actually recorded. A
+    recorded direction always wins: a probe that labelled an argument an input
+    must not be overridden because a positional role table happened to name it
+    `scale` or `topk_weights`.
+    """
+    def is_output(item):
+        return item[2] if len(item) > 2 else _is_output_role(item[0])
+
+    inputs = [item[1] for item in tensors if not is_output(item)]
+    outputs = [item[1] for item in tensors if is_output(item)]
     values = inputs + outputs
     if not values:
         return prefix + ": scalar/no tensor shape"
@@ -535,11 +585,15 @@ def _shape_text(row):
     if level == "K":
         dims = shape.get("input_dims") or []
         types = shape.get("input_types") or []
+        # `Input Dims` is a positional argument list, not an input list. Only a
+        # known calling convention can say which entries are destinations.
+        known = _operator_roles(row) is not None
         tensors = []
         for index, dim in enumerate(dims):
             if not isinstance(dim, list) or not dim:
                 continue
-            role = _trace_role(row, index)
+            role = (_trace_role(row, index) if known
+                    else "arg%d" % index)
             dtype = types[index] if index < len(types) else "Tensor"
             tensors.append((role, "%s=%s[%s]" % (
                 role, _dtype_label(dtype),
@@ -552,17 +606,36 @@ def _shape_text(row):
         output_index = 0
         layer_wrapper = (
             evidence.get("wrapper_scope") == "phase_layer_wrapper")
+        # Pick the role resolver by what the evidence actually supports:
+        #   layer wrapper  -> wrapper I/O, io labels are real
+        #   schema declares an output -> a probe labelled io, trust _probe_role
+        #   operator known -> positional args, but the calling convention is
+        #                     known, so the K-path operator roles apply
+        #   otherwise      -> name positionally and claim no direction
+        schema_io = _schema_declares_io(tensors)
+        operator_known = _operator_roles(row) is not None
         for index, tensor in enumerate(tensors[:12]):
             dims = tensor.get("effective_shape") or tensor.get("shape") or []
-            role = (
-                _layer_wrapper_role(tensor, index, output_index)
-                if layer_wrapper else
-                _probe_role(row, tensor, index, output_index))
-            if str(tensor.get("io") or "").lower() == "output":
+            if layer_wrapper:
+                role = _layer_wrapper_role(tensor, index, output_index)
+            elif schema_io:
+                role = _probe_role(row, tensor, index, output_index)
+            elif operator_known:
+                role = _trace_role(row, index)
+            else:
+                role = _positional_role(tensor, index)
+            tensor_is_output = (
+                str(tensor.get("io") or "").lower() == "output")
+            if tensor_is_output:
                 output_index += 1
-            values.append((role, "%s=%s[%s]" % (
+            entry = (role, "%s=%s[%s]" % (
                 role, _dtype_label(tensor.get("dtype")),
-                "×".join(str(value) for value in dims))))
+                "×".join(str(value) for value in dims)))
+            # layer_wrapper and schema_io rows have a recorded direction; the
+            # other two resolvers do not, so they fall back to the role name.
+            if layer_wrapper or schema_io:
+                entry += (tensor_is_output,)
+            values.append(entry)
         if len(tensors) > 12:
             values.append((
                 "metadata", "metadata=+%d tensors" % (len(tensors) - 12)))

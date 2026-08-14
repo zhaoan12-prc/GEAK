@@ -129,6 +129,13 @@ This phase is opt-in and remains non-gating.
   Prefill/Decode.
 - Trace-native Input Dims/Types are `kernel_exact`. Parent context is not a child Kernel exact shape.
   Missing details go to `SHAPE_CAPTURE_PLAN.json`; never infer dimensions from names or grid size.
+- A tensor's **direction is evidence, not a guess**. `Input Dims` is a positional *argument* list, not
+  an input list: AITER/HIP kernels routinely pass destination buffers as leading arguments, and the
+  profiler cannot mark an out-param. Present an input/output split only when the direction is
+  recorded (`io` from a probe) or the operator's calling convention is known
+  (`_OPERATOR_ROLE_MAPS`); otherwise name arguments positionally and claim no direction. A recorded
+  direction always outranks a positional role name. Never let a role name invented by a stage
+  default (`scale`, `topk_weights`, `y`) move a tensor into the output column.
 
 ## Return JSON
 
