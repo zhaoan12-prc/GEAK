@@ -562,12 +562,22 @@ class StructurallyForeignRepresentativeTest(unittest.TestCase):
     """A dense layer holding MoE rows must not represent a dense Pattern."""
 
     def _pattern_doc(self):
+        # A dense Pattern never exists alone: it is the prefix of a model
+        # whose remaining layers are sparse, and "foreign" is defined
+        # relative to that other Pattern.
         return {
-            "patterns": [{
-                "pattern_id": "P0",
-                "layer_ids": [0, 1, 2],
-                "structural_signature": {"is_moe": False},
-            }],
+            "patterns": [
+                {
+                    "pattern_id": "P0",
+                    "layer_ids": [0, 1, 2],
+                    "structural_signature": {"is_moe": False},
+                },
+                {
+                    "pattern_id": "P1",
+                    "layer_ids": [3, 4],
+                    "structural_signature": {"is_moe": True},
+                },
+            ],
         }
 
     @staticmethod
@@ -612,9 +622,11 @@ class StructurallyForeignRepresentativeTest(unittest.TestCase):
         self.assertEqual(foreign[0]["foreign_stages"]["2"], ["moe", "topk"])
 
     def test_a_sparse_pattern_keeps_its_moe_layers(self):
-        doc = {"patterns": [{
-            "pattern_id": "P1", "layer_ids": [3, 4],
-            "structural_signature": {"is_moe": True}}]}
+        doc = {"patterns": [
+            {"pattern_id": "P0", "layer_ids": [0],
+             "structural_signature": {"is_moe": False}},
+            {"pattern_id": "P1", "layer_ids": [3, 4],
+             "structural_signature": {"is_moe": True}}]}
         values = [
             {"pattern_id": "P1", "phase": "decode", "layer_id": layer_id,
              "event_count": 34, "duration_us": 400.0,
@@ -624,6 +636,106 @@ class StructurallyForeignRepresentativeTest(unittest.TestCase):
         selected = mapping._representatives(doc, values)
         self.assertIn(selected["P1"]["layer_id"], (3, 4))
         self.assertEqual(mapping._representatives.last_structurally_foreign, [])
+
+    def test_foreign_stages_come_from_the_other_patterns_signature(self):
+        """The rule is relative, not a hard-coded moe/topk list.
+
+        Qwen3.5 splits its Patterns by attention type and not by FFN: both
+        are MoE, so moe/topk are foreign to neither, while attn/kv_cache/rope
+        and linear_attn are each foreign to the other side.
+        """
+        doc = {"patterns": [
+            {"pattern_id": "P_LINEAR", "layer_ids": [0, 1, 2],
+             "structural_signature": {
+                 "is_moe": True,
+                 "attention_type": "gated_delta_net_linear_attention",
+                 "model_native_attention_name": "Qwen3_5GatedDeltaNet"}},
+            {"pattern_id": "P_FULL", "layer_ids": [3],
+             "structural_signature": {
+                 "is_moe": True,
+                 "attention_type": "full_grouped_query_attention",
+                 "model_native_attention_name": "RadixAttention"}},
+        ]}
+        foreign = mapping._foreign_stages_by_pattern(doc)
+        linear_defining, linear_all = foreign["P_LINEAR"]
+        full_defining, full_all = foreign["P_FULL"]
+        # only the operator the signature names is evidence
+        self.assertEqual(linear_defining, {"attn"})
+        self.assertEqual(linear_all, {"attn", "kv_cache", "rope"})
+        self.assertEqual(full_defining, {"linear_attn"})
+        self.assertEqual(full_all, {"linear_attn"})
+        # both are MoE, so the FFN stages are foreign to neither
+        self.assertNotIn("moe", linear_all)
+        self.assertNotIn("topk", full_all)
+
+        values = [
+            {"pattern_id": "P_LINEAR", "phase": "decode", "layer_id": 0,
+             "event_count": 24, "duration_us": 300.0,
+             "boundary_complete": True,
+             "stages": ["gemm", "linear_attn", "moe"], **self._anchors(0)},
+            {"pattern_id": "P_LINEAR", "phase": "decode", "layer_id": 1,
+             "event_count": 24, "duration_us": 300.0,
+             "boundary_complete": True,
+             "stages": ["gemm", "linear_attn", "moe"], **self._anchors(1)},
+            # layer 2 sits next to the full-attention layer and absorbed its
+            # attention work
+            {"pattern_id": "P_LINEAR", "phase": "decode", "layer_id": 2,
+             "event_count": 27, "duration_us": 300.0,
+             "boundary_complete": True,
+             "stages": ["attn", "gemm", "kv_cache", "linear_attn", "moe"],
+             **self._anchors(2)},
+        ]
+        selected = mapping._representatives(doc, values)
+        self.assertIn(selected["P_LINEAR"]["layer_id"], (0, 1))
+        report = mapping._representatives.last_structurally_foreign
+        self.assertEqual(report[0]["excluded_layer_ids"], [2])
+        self.assertEqual(report[0]["foreign_stages"]["2"], ["attn", "kv_cache"])
+
+    def test_an_accompanying_stage_alone_does_not_disqualify_a_layer(self):
+        """kv_cache without attn is not evidence of an absorbed layer.
+
+        A generic torch kernel (index_elementwise_kernel) classifies as
+        kv_cache, so a linear-attention layer can carry one while having
+        nothing of the full-attention Pattern in it. Acting on that would
+        drop a perfectly good representative.
+        """
+        doc = {"patterns": [
+            {"pattern_id": "P_LINEAR", "layer_ids": [0, 1],
+             "structural_signature": {
+                 "is_moe": True,
+                 "attention_type": "gated_delta_net_linear_attention"}},
+            {"pattern_id": "P_FULL", "layer_ids": [3],
+             "structural_signature": {
+                 "is_moe": True,
+                 "attention_type": "full_grouped_query_attention"}},
+        ]}
+        values = [
+            {"pattern_id": "P_LINEAR", "phase": "prefill", "layer_id": 0,
+             "event_count": 40, "duration_us": 300.0,
+             "boundary_complete": True,
+             "stages": ["gemm", "linear_attn", "moe"], **self._anchors(0)},
+            # one accompanying stage only, no foreign defining operator
+            {"pattern_id": "P_LINEAR", "phase": "prefill", "layer_id": 1,
+             "event_count": 40, "duration_us": 300.0,
+             "boundary_complete": True,
+             "stages": ["gemm", "kv_cache", "linear_attn", "moe"],
+             **self._anchors(1)},
+        ]
+        selected = mapping._representatives(doc, values)
+        self.assertIn(selected["P_LINEAR"]["layer_id"], (0, 1))
+        report = mapping._representatives.last_structurally_foreign
+        # reported, but not acted on
+        self.assertEqual(report[0]["excluded_layer_ids"], [])
+        self.assertEqual(report[0]["observed_only_layer_ids"], [1])
+        self.assertEqual(report[0]["foreign_stages"]["1"], ["kv_cache"])
+
+    def test_a_single_pattern_model_has_no_foreign_stages(self):
+        """With one Pattern there is no boundary, so nothing is foreign."""
+        doc = {"patterns": [{
+            "pattern_id": "P0", "layer_ids": [0, 1],
+            "structural_signature": {"is_moe": True}}]}
+        self.assertEqual(
+            mapping._foreign_stages_by_pattern(doc)["P0"], (set(), set()))
 
     def test_every_layer_foreign_excludes_nothing(self):
         doc = self._pattern_doc()

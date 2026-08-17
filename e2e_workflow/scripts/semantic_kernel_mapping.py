@@ -1468,33 +1468,101 @@ def _device_truncated(values):
     return usable, dropped
 
 
-_SPARSE_ONLY_STAGES = ("moe", "topk")
+def _signature_stages(signature):
+    """Stages a Pattern's structural signature says its layers execute.
 
+    Returned as (defining, accompanying). A *defining* stage is the operator
+    the signature actually names -- the experts of a MoE FFN, the attention
+    operator of an attention type. An *accompanying* stage merely tends to
+    come with it: a router top-k, a KV-cache write, a rotary embedding.
 
-def _structurally_foreign_layers(pattern, instances):
-    """Layers whose device window carries stages this Pattern cannot execute.
+    The split matters because only a defining stage is evidence. Accompanying
+    stages are carried by generically-named kernels -- an
+    ``index_elementwise_kernel`` classifies as ``kv_cache`` -- which appear in
+    layers that have nothing to do with the other Pattern.
 
-    A dense Pattern (``is_moe`` false) owns no router and no experts, so a
-    dense layer instance holding ``moe``/``topk`` rows is not a typical member
-    of its Pattern -- it sits on a Pattern boundary and its window has absorbed
-    the neighbouring sparse layer's work, which real runtimes produce when the
-    two layers' device execution overlaps on separate streams.
-
-    Such an instance is a bad medoid: its shape targets name operators that its
-    own modules never launch, so they can never be bound to a probe marker.
-    Prefer a clean layer of the same Pattern when one exists. The event
-    assignment is untouched -- this only decides which layer gets published.
+    Stages every decoder layer shares (norm, gemm, quant, elementwise,
+    communication) say nothing about which Pattern a window belongs to and are
+    deliberately absent from both sets.
     """
-    signature = pattern.get("structural_signature") or {}
-    if signature.get("is_moe", None) is not False:
-        return {}
+    signature = signature or {}
+    defining, accompanying = set(), set()
+    if signature.get("is_moe"):
+        defining.add("moe")
+        accompanying.add("topk")
+    attention = " ".join(str(signature.get(key) or "") for key in (
+        "attention_type", "model_native_attention_name",
+        "runtime_attention_module_class")).lower()
+    if "linear" in attention or "delta" in attention or "mamba" in attention:
+        defining.add("linear_attn")
+    else:
+        defining.add("attn")
+        accompanying.update(("kv_cache", "rope"))
+    return defining, accompanying
+
+
+def _foreign_stages_by_pattern(pattern_doc):
+    """Per Pattern, the stages that belong to a *different* Pattern.
+
+    Derived from the Agent-defined structural signatures, never from the
+    trace: a stage is foreign to Pattern P when some other Pattern's
+    signature implies it and P's does not. One rule covers every model -- a
+    dense/MoE split contributes moe, an attention-type split contributes attn
+    against linear_attn -- instead of hard-coding whichever split was looked
+    at first.
+
+    Returns ``{pattern_id: (defining, all)}``. Only the defining set is
+    evidence strong enough to act on; the wider set is reported.
+    """
+    own = {}
+    for pattern in pattern_doc.get("patterns", []):
+        own[pattern["pattern_id"]] = _signature_stages(
+            pattern.get("structural_signature"))
     foreign = {}
+    for pattern_id, (defining, accompanying) in own.items():
+        mine = defining | accompanying
+        others_defining, others_all = set(), set()
+        for other_id, (other_defining, other_accompanying) in own.items():
+            if other_id == pattern_id:
+                continue
+            others_defining |= other_defining
+            others_all |= other_defining | other_accompanying
+        foreign[pattern_id] = (others_defining - mine, others_all - mine)
+    return foreign
+
+
+def _structurally_foreign_layers(foreign_stages, instances):
+    """Layers whose window carries stages that belong to another Pattern.
+
+    A layer sitting on a Pattern boundary can absorb the neighbouring
+    Pattern's work when the two layers' device execution overlaps on separate
+    streams -- DSR1's last dense layer carries the first MoE layer's router
+    and expert kernels, in the graph-off donor with real module spans as much
+    as in the Clean Trace.
+
+    Such an instance is a bad medoid: those rows' operators are launched by a
+    *different* layer's modules, so the probe -- which hooks the
+    representative layer -- can never bind them and they are guaranteed U.
+    Prefer a clean layer of the same Pattern when one exists. The event
+    assignment is untouched; this only decides which layer gets published,
+    and it is reported rather than applied silently.
+    """
+    defining, reportable = foreign_stages
+    if not reportable:
+        return {}, {}
+    excluded, observed = {}, {}
     for instance in instances:
-        extra = sorted(
-            set(instance.get("stages") or []) & set(_SPARSE_ONLY_STAGES))
-        if extra:
-            foreign.setdefault(instance["layer_id"], set()).update(extra)
-    return {layer_id: sorted(stages) for layer_id, stages in foreign.items()}
+        stages = set(instance.get("stages") or [])
+        seen = sorted(stages & reportable)
+        if not seen:
+            continue
+        observed.setdefault(instance["layer_id"], set()).update(seen)
+        if stages & defining:
+            excluded.setdefault(instance["layer_id"], set()).update(seen)
+    return ({layer_id: sorted(values)
+             for layer_id, values in excluded.items()},
+            {layer_id: sorted(values)
+             for layer_id, values in observed.items()})
 
 
 def _representatives(pattern_doc, instances):
@@ -1523,6 +1591,7 @@ def _representatives(pattern_doc, instances):
         by_pattern.setdefault(pid, []).extend(usable)
     _representatives.last_truncated = truncated_diagnostics
     foreign_diagnostics = []
+    foreign_by_pattern = _foreign_stages_by_pattern(pattern_doc)
     selected = {}
     for pattern in pattern_doc.get("patterns", []):
         pid = pattern["pattern_id"]
@@ -1530,34 +1599,41 @@ def _representatives(pattern_doc, instances):
         phases = sorted({item["phase"] for item in values})
         candidates = sorted(set(pattern.get("layer_ids", [])) &
                             set(item["layer_id"] for item in values))
-        foreign = _structurally_foreign_layers(pattern, values)
+        defining_foreign, reportable_foreign = foreign_by_pattern.get(
+            pid, (set(), set()))
+        foreign, observed = _structurally_foreign_layers(
+            (defining_foreign, reportable_foreign), values)
+        hits = sorted(layer_id for layer_id in candidates if layer_id in foreign)
         clean = [layer_id for layer_id in candidates if layer_id not in foreign]
-        if foreign and clean:
+        noted = sorted(
+            layer_id for layer_id in candidates
+            if layer_id in observed and layer_id not in foreign)
+        if hits or noted:
+            excluded = hits if (hits and clean) else []
             foreign_diagnostics.append({
                 "pattern_id": pid,
-                "excluded_layer_ids": sorted(
-                    layer_id for layer_id in candidates if layer_id in foreign),
+                "excluded_layer_ids": excluded,
                 "foreign_stages": {
-                    str(layer_id): foreign[layer_id]
-                    for layer_id in sorted(candidates)
-                    if layer_id in foreign},
+                    str(layer_id): observed[layer_id]
+                    for layer_id in sorted(set(hits) | set(noted))},
+                "foreign_defining_stages": sorted(defining_foreign),
+                "foreign_reportable_stages": sorted(reportable_foreign),
+                # A layer carrying only an accompanying stage keeps its
+                # candidacy: a generically-named kernel classified into a
+                # foreign stage is not evidence that the window absorbed
+                # another Pattern's layer.
+                "observed_only_layer_ids": noted,
                 "reason": (
-                    "layer window carries stages this Pattern's structural "
-                    "signature excludes (is_moe=false); excluded from "
-                    "representative selection, event assignment unchanged"),
+                    "layer window carries a stage another Pattern's "
+                    "structural signature defines and this one does not; "
+                    "excluded from representative selection, event "
+                    "assignment unchanged" if excluded else
+                    "foreign stages observed but none of them is another "
+                    "Pattern's defining operator, or no clean layer exists; "
+                    "nothing was excluded"),
             })
-            candidates = clean
-        elif foreign:
-            foreign_diagnostics.append({
-                "pattern_id": pid,
-                "excluded_layer_ids": [],
-                "foreign_stages": {
-                    str(layer_id): stages
-                    for layer_id, stages in sorted(foreign.items())},
-                "reason": (
-                    "every layer of this Pattern carries foreign stages; no "
-                    "clean representative exists, so none was excluded"),
-            })
+            if excluded:
+                candidates = clean
         if phases:
             candidates = [layer_id for layer_id in candidates
                           if all(any(item["phase"] == phase and item["layer_id"] == layer_id
@@ -1815,9 +1891,17 @@ def _quality(
     phase_status = "pass" if spans else "partial"
     representative_integrity = _representative_integrity(
         rows, tables, representatives)
+    # A Pattern-boundary layer whose window absorbed the neighbouring
+    # Pattern's work is a real finding about the layer cut, not a detail. The
+    # representative moved to a clean layer so the published table is honest,
+    # but the run must not read `pass` as though nothing was noticed.
+    foreign_instances = [
+        item for item in getattr(
+            _representatives, "last_structurally_foreign", [])
+        if item.get("excluded_layer_ids")]
     status = "fail" if (
         pattern_missing or representative_integrity["status"] == "fail") else (
-        "partial" if phase_status == "partial" or
+        "partial" if phase_status == "partial" or foreign_instances or
         pattern_doc.get("quality", {}).get("status") == "partial" else "pass")
     return {
         "schema_version": 1,
@@ -1854,6 +1938,17 @@ def _quality(
                 "steps": step_audits,
             },
             "representative_layer_integrity": representative_integrity,
+            "pattern_boundary_purity": {
+                "status": "partial" if foreign_instances else "pass",
+                "gating": False,
+                "scope": "representative_selection_only",
+                "reason": (
+                    "" if not foreign_instances else
+                    "a Pattern-boundary layer's window carries another "
+                    "Pattern's stages; a clean layer was published instead "
+                    "and the event assignment was left unchanged"),
+                "patterns": foreign_instances,
+            },
         },
     }
 
