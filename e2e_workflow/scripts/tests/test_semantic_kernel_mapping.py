@@ -532,6 +532,112 @@ class DeviceTruncatedRepresentativeTest(unittest.TestCase):
         self.assertEqual(dropped, [])
         self.assertEqual(len(usable), len(values))
 
+    def test_no_mode_uses_the_median_not_the_largest_layer(self):
+        """With no repeated count the largest layer is not a reference.
+
+        A small Pattern (a 3-layer dense prefix) has three distinct counts.
+        The largest belongs to layer 0, whose window also carries the
+        pre-layer model prologue, so using it doubles the threshold and
+        throws away the genuinely complete layers as "fragments".
+        """
+        values = [
+            # layer 0 absorbed the prologue, layer 2 the next layer's MoE
+            {"pattern_id": "P0", "phase": "decode", "layer_id": 0,
+             "event_count": 61, "duration_us": 1068.5,
+             "boundary_complete": True},
+            {"pattern_id": "P0", "phase": "decode", "layer_id": 1,
+             "event_count": 29, "duration_us": 516.0,
+             "boundary_complete": True},
+            {"pattern_id": "P0", "phase": "decode", "layer_id": 2,
+             "event_count": 36, "duration_us": 427.1,
+             "boundary_complete": True},
+        ]
+        usable, dropped = mapping._device_truncated(values)
+        self.assertEqual(dropped, [])
+        self.assertEqual(
+            sorted(item["layer_id"] for item in usable), [0, 1, 2])
+
+
+class StructurallyForeignRepresentativeTest(unittest.TestCase):
+    """A dense layer holding MoE rows must not represent a dense Pattern."""
+
+    def _pattern_doc(self):
+        return {
+            "patterns": [{
+                "pattern_id": "P0",
+                "layer_ids": [0, 1, 2],
+                "structural_signature": {"is_moe": False},
+            }],
+        }
+
+    @staticmethod
+    def _anchors(layer_id):
+        """The instance fields representative selection reads back."""
+        return {
+            "body_start_event": "event-%d" % (layer_id * 100),
+            "body_end_event": "event-%d" % (layer_id * 100 + 9),
+            "first_device_seq_index": layer_id * 100,
+            "last_device_seq_index": layer_id * 100 + 9,
+            "occurrence": 1,
+        }
+
+    def _instances(self):
+        return [
+            # layer 0 absorbed the pre-layer prologue: twice the events
+            {"pattern_id": "P0", "phase": "decode", "layer_id": 0,
+             "event_count": 61, "duration_us": 1068.5,
+             "boundary_complete": True, "stages": ["gemm", "norm"],
+             **self._anchors(0)},
+            {"pattern_id": "P0", "phase": "decode", "layer_id": 1,
+             "event_count": 29, "duration_us": 516.0,
+             "boundary_complete": True, "stages": ["gemm", "norm"],
+             **self._anchors(1)},
+            # layer 2 sits on the dense->sparse boundary and its window has
+            # absorbed the next layer's router and experts
+            {"pattern_id": "P0", "phase": "decode", "layer_id": 2,
+             "event_count": 36, "duration_us": 427.1,
+             "boundary_complete": True,
+             "stages": ["gemm", "moe", "norm", "topk"],
+             **self._anchors(2)},
+        ]
+
+    def test_boundary_layer_is_excluded_and_reported(self):
+        selected = mapping._representatives(
+            self._pattern_doc(), self._instances())
+        self.assertEqual(selected["P0"]["layer_id"], 1)
+        foreign = mapping._representatives.last_structurally_foreign
+        self.assertEqual(len(foreign), 1)
+        self.assertEqual(foreign[0]["pattern_id"], "P0")
+        self.assertEqual(foreign[0]["excluded_layer_ids"], [2])
+        self.assertEqual(foreign[0]["foreign_stages"]["2"], ["moe", "topk"])
+
+    def test_a_sparse_pattern_keeps_its_moe_layers(self):
+        doc = {"patterns": [{
+            "pattern_id": "P1", "layer_ids": [3, 4],
+            "structural_signature": {"is_moe": True}}]}
+        values = [
+            {"pattern_id": "P1", "phase": "decode", "layer_id": layer_id,
+             "event_count": 34, "duration_us": 400.0,
+             "boundary_complete": True, "stages": ["gemm", "moe", "topk"],
+             **self._anchors(layer_id)}
+            for layer_id in (3, 4)]
+        selected = mapping._representatives(doc, values)
+        self.assertIn(selected["P1"]["layer_id"], (3, 4))
+        self.assertEqual(mapping._representatives.last_structurally_foreign, [])
+
+    def test_every_layer_foreign_excludes_nothing(self):
+        doc = self._pattern_doc()
+        values = [
+            {"pattern_id": "P0", "phase": "decode", "layer_id": layer_id,
+             "event_count": 36, "duration_us": 427.1,
+             "boundary_complete": True, "stages": ["gemm", "moe"],
+             **self._anchors(layer_id)}
+            for layer_id in (0, 1, 2)]
+        selected = mapping._representatives(doc, values)
+        self.assertIn(selected["P0"]["layer_id"], (0, 1, 2))
+        foreign = mapping._representatives.last_structurally_foreign
+        self.assertEqual(foreign[0]["excluded_layer_ids"], [])
+
 
 class PhaseCoverageTest(unittest.TestCase):
     """`--table-phases all` on a stage-split trace must not look complete."""

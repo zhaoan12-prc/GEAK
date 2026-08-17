@@ -1261,6 +1261,8 @@ def _layer_instances(rows):
             "last_device_seq_index": max(positions),
             "event_count": len(group),
             "duration_us": round(duration, 6),
+            "stages": sorted({
+                str(row.get("stage")) for row in group if row.get("stage")}),
             "sequence_signature": hashlib.sha256(
                 json.dumps(signature).encode()).hexdigest()[:16],
             "boundary_complete": boundary_complete,
@@ -1438,8 +1440,21 @@ def _device_truncated(values):
     if not counts:
         return values, []
     frequency = collections.Counter(counts)
-    # Ties go to the larger count: a complete layer, never a fragment.
-    reference = max(frequency, key=lambda count: (frequency[count], count))
+    modal_count, modal_frequency = max(
+        frequency.items(), key=lambda item: (item[1], item[0]))
+    if modal_frequency > 1:
+        # A count several layers share is the complete layer size. Ties go to
+        # the larger count: a complete layer, never a fragment.
+        reference = modal_count
+    else:
+        # No count repeats, so there is no mode and the largest value is not
+        # evidence of anything -- in a small Pattern it is usually the one
+        # layer whose window absorbed work from outside the layer stack (the
+        # model's first layer carries the pre-layer prologue). Taking it as
+        # the reference doubles the threshold and discards the genuinely
+        # complete layers as "fragments". The median is the robust choice: it
+        # survives one oversized and one undersized member.
+        reference = statistics.median(counts)
     threshold = reference / 2.0
     usable = [item for item in values
               if int(item.get("event_count") or 0) >= threshold]
@@ -1450,6 +1465,35 @@ def _device_truncated(values):
     if not usable:
         return values, []
     return usable, dropped
+
+
+_SPARSE_ONLY_STAGES = ("moe", "topk")
+
+
+def _structurally_foreign_layers(pattern, instances):
+    """Layers whose device window carries stages this Pattern cannot execute.
+
+    A dense Pattern (``is_moe`` false) owns no router and no experts, so a
+    dense layer instance holding ``moe``/``topk`` rows is not a typical member
+    of its Pattern -- it sits on a Pattern boundary and its window has absorbed
+    the neighbouring sparse layer's work, which real runtimes produce when the
+    two layers' device execution overlaps on separate streams.
+
+    Such an instance is a bad medoid: its shape targets name operators that its
+    own modules never launch, so they can never be bound to a probe marker.
+    Prefer a clean layer of the same Pattern when one exists. The event
+    assignment is untouched -- this only decides which layer gets published.
+    """
+    signature = pattern.get("structural_signature") or {}
+    if signature.get("is_moe", None) is not False:
+        return {}
+    foreign = {}
+    for instance in instances:
+        extra = sorted(
+            set(instance.get("stages") or []) & set(_SPARSE_ONLY_STAGES))
+        if extra:
+            foreign.setdefault(instance["layer_id"], set()).update(extra)
+    return {layer_id: sorted(stages) for layer_id, stages in foreign.items()}
 
 
 def _representatives(pattern_doc, instances):
@@ -1477,6 +1521,7 @@ def _representatives(pattern_doc, instances):
             })
         by_pattern.setdefault(pid, []).extend(usable)
     _representatives.last_truncated = truncated_diagnostics
+    foreign_diagnostics = []
     selected = {}
     for pattern in pattern_doc.get("patterns", []):
         pid = pattern["pattern_id"]
@@ -1484,6 +1529,34 @@ def _representatives(pattern_doc, instances):
         phases = sorted({item["phase"] for item in values})
         candidates = sorted(set(pattern.get("layer_ids", [])) &
                             set(item["layer_id"] for item in values))
+        foreign = _structurally_foreign_layers(pattern, values)
+        clean = [layer_id for layer_id in candidates if layer_id not in foreign]
+        if foreign and clean:
+            foreign_diagnostics.append({
+                "pattern_id": pid,
+                "excluded_layer_ids": sorted(
+                    layer_id for layer_id in candidates if layer_id in foreign),
+                "foreign_stages": {
+                    str(layer_id): foreign[layer_id]
+                    for layer_id in sorted(candidates)
+                    if layer_id in foreign},
+                "reason": (
+                    "layer window carries stages this Pattern's structural "
+                    "signature excludes (is_moe=false); excluded from "
+                    "representative selection, event assignment unchanged"),
+            })
+            candidates = clean
+        elif foreign:
+            foreign_diagnostics.append({
+                "pattern_id": pid,
+                "excluded_layer_ids": [],
+                "foreign_stages": {
+                    str(layer_id): stages
+                    for layer_id, stages in sorted(foreign.items())},
+                "reason": (
+                    "every layer of this Pattern carries foreign stages; no "
+                    "clean representative exists, so none was excluded"),
+            })
         if phases:
             candidates = [layer_id for layer_id in candidates
                           if all(any(item["phase"] == phase and item["layer_id"] == layer_id
@@ -1502,6 +1575,20 @@ def _representatives(pattern_doc, instances):
                 list(layer_phase_medians[(phase, layer_id)]
                      for layer_id in candidates
                      if (phase, layer_id) in layer_phase_medians)) if candidates else 0
+        # Duration alone cannot separate an even number of candidates: the
+        # median of two values is their midpoint, so both deviate identically
+        # and the tie falls to the lowest layer id. That silently favours
+        # layer 0, whose window also absorbs the pre-layer model prologue and
+        # is therefore the least typical member of its Pattern. Break the tie
+        # with a true medoid on event count -- the candidate closest to every
+        # other instance of the same Pattern, which is well defined for any
+        # number of candidates.
+        counts_by_layer = {}
+        for item in values:
+            counts_by_layer.setdefault(item["layer_id"], []).append(
+                int(item.get("event_count") or 0))
+        population = [count for counts in counts_by_layer.values()
+                      for count in counts]
         scored = []
         for layer_id in candidates:
             deviations = []
@@ -1509,10 +1596,19 @@ def _representatives(pattern_doc, instances):
                 duration = layer_phase_medians.get((phase, layer_id))
                 median = medians[phase]
                 if duration is not None and median:
-                    deviations.append(abs(duration / median - 1.0))
+                    # Rounded so a mathematical tie is an actual tie: with two
+                    # candidates the median is their midpoint and both deviate
+                    # equally, but the two quotients differ in the last bit,
+                    # which would decide the representative by float noise
+                    # before the count medoid below is ever consulted.
+                    deviations.append(round(abs(duration / median - 1.0), 9))
+            own = counts_by_layer.get(layer_id) or [0]
+            count_cost = sum(
+                abs(statistics.median(own) - other) for other in population)
             if deviations:
-                scored.append((max(deviations), sum(deviations), layer_id))
-        selected_layer = min(scored)[2] if scored else None
+                scored.append(
+                    (max(deviations), sum(deviations), count_cost, layer_id))
+        selected_layer = min(scored)[3] if scored else None
         selected_instances = {}
         if selected_layer is not None:
             for phase in phases:
@@ -1540,6 +1636,7 @@ def _representatives(pattern_doc, instances):
             "selected_instances": selected_instances,
             "selection_confidence": "high" if phases and phases != ["unresolved"] else "low",
         }
+    _representatives.last_structurally_foreign = foreign_diagnostics
     return selected
 
 
@@ -2006,6 +2103,8 @@ def build(trace_path, pattern_path, out_dir, table_phases=None,
             "boundary_transfer": boundary_transfer,
             "device_truncated_instances": getattr(
                 _representatives, "last_truncated", []),
+            "structurally_foreign_instances": getattr(
+                _representatives, "last_structurally_foreign", []),
             "module_interpolated_event_count": module_interpolated,
             "boundary_partition_diagnostics": partition_diagnostics,
             "prefix_demotions": prefix_demotions,
