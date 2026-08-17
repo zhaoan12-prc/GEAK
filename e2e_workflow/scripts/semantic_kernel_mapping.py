@@ -1909,6 +1909,36 @@ def _apply_boundary_map(rows, boundary_map_path, patterns):
     return applied, document
 
 
+_ALL_TABLE_PHASES = ("prefill", "decode")
+
+
+def _phase_coverage(rows, tables, table_phases):
+    """Requested vs emitted phases, so a half-covered run is self-evident."""
+    requested = (sorted(table_phases) if table_phases
+                 else list(_ALL_TABLE_PHASES))
+    in_trace = sorted({
+        str(row.get("phase") or "").lower() for row in rows
+        if str(row.get("phase") or "").lower() in _ALL_TABLE_PHASES})
+    emitted = sorted({
+        str(table.get("phase") or "").lower() for table in tables})
+    missing = [phase for phase in requested if phase not in emitted]
+    return {
+        "requested_phases": requested,
+        "requested_all": not table_phases,
+        "phases_present_in_trace": in_trace,
+        "emitted_phases": emitted,
+        "missing_phases": missing,
+        "complete": not missing,
+        "note": (
+            "" if not missing else
+            "phase(s) %s were requested but this trace carries none of their "
+            "events. With profile_by_stage=True each stage is a separate "
+            "rank file; run the other stage file too (decode also needs "
+            "--layer-boundary-map from semantic_decode_boundary_transfer)."
+            % ", ".join(missing)),
+    }
+
+
 def build(trace_path, pattern_path, out_dir, table_phases=None,
           boundary_map_path=""):
     with open(pattern_path) as fh:
@@ -1945,6 +1975,15 @@ def build(trace_path, pattern_path, out_dir, table_phases=None,
     quality = _quality(
         pattern_doc, rows, instances, representatives, spans, out_of_scope,
         partition_diagnostics, tables)
+    # `--table-phases all` can only emit the phases this trace actually holds.
+    # The official capture runs with profile_by_stage=True, which writes prefill
+    # and decode to *separate* per-rank files, so "all" on one of them silently
+    # yields a single-phase table set that looks complete. Record what was asked
+    # for against what the trace carried so a missing phase is visible instead of
+    # having to be noticed. A trace holding one phase is normal here; the caller
+    # must run the other stage file (decode additionally needs
+    # --layer-boundary-map, since a graph-replayed stage has no module span).
+    quality["phase_coverage"] = _phase_coverage(rows, tables, table_phases)
     capture_plan = _shape_capture_plan(tables, pattern_doc, trace_path)
     os.makedirs(out_dir, exist_ok=True)
     paths = {

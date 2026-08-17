@@ -531,3 +531,32 @@ class DeviceTruncatedRepresentativeTest(unittest.TestCase):
         usable, dropped = mapping._device_truncated(values)
         self.assertEqual(dropped, [])
         self.assertEqual(len(usable), len(values))
+
+
+class PhaseCoverageTest(unittest.TestCase):
+    """`--table-phases all` on a stage-split trace must not look complete."""
+
+    def test_single_phase_trace_reports_the_missing_phase(self):
+        rows = [{"phase": "prefill"}, {"phase": "prefill"}]
+        tables = [{"phase": "prefill"}]
+        coverage = mapping._phase_coverage(rows, tables, None)
+        self.assertTrue(coverage["requested_all"])
+        self.assertEqual(coverage["emitted_phases"], ["prefill"])
+        self.assertEqual(coverage["missing_phases"], ["decode"])
+        self.assertFalse(coverage["complete"])
+        self.assertIn("--layer-boundary-map", coverage["note"])
+
+    def test_both_phases_present_is_complete(self):
+        rows = [{"phase": "prefill"}, {"phase": "decode"}]
+        tables = [{"phase": "prefill"}, {"phase": "decode"}]
+        coverage = mapping._phase_coverage(rows, tables, None)
+        self.assertEqual(coverage["missing_phases"], [])
+        self.assertTrue(coverage["complete"])
+        self.assertEqual(coverage["note"], "")
+
+    def test_explicitly_requesting_one_phase_is_complete(self):
+        rows = [{"phase": "decode"}]
+        tables = [{"phase": "decode"}]
+        coverage = mapping._phase_coverage(rows, tables, ["decode"])
+        self.assertFalse(coverage["requested_all"])
+        self.assertTrue(coverage["complete"])
