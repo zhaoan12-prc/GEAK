@@ -205,6 +205,51 @@ class ShapeMergeLauncherProbeTest(unittest.TestCase):
                              "shape_logger_terminal_launcher")
             self.assertEqual(row["shape"]["source"], "runtime_probe_kernel")
 
+    def test_signature_names_replace_positional_labels(self):
+        """The probe records parameter names; the ledger must use them."""
+        table = self._table([self._row("event-1", 0, 1)])
+        records = self._launcher_record(
+            "model.layers.1.mlp.down_proj", "call-1", 32)
+        records[0]["arg_names"] = ["x", "weight"]
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self._rows(self._run(tmp, table, records))[0]
+            schema = row["semantic_evidence"]["schema"]
+            names = [t["arg_name"] for t in schema["tensors"]]
+            self.assertIn("x", names)
+            self.assertIn("weight", names)
+            self.assertNotIn("args[0]", names)
+            # Naming the weight operand is what lets the M/N/K interface form.
+            linear = schema.get("linear_interface")
+            self.assertIsNotNone(linear)
+            self.assertEqual(linear["K"]["value"], 16)
+            self.assertEqual(linear["N"]["value"], 32)
+
+    def test_declared_convention_names_a_pre_existing_shape_log(self):
+        """Shape logs captured before arg_names existed still get names."""
+        table = self._table([self._row("event-1", 0, 1)])
+        records = self._launcher_record(
+            "model.layers.1.mlp.down_proj", "call-1", 32)
+        records[0].pop("arg_names", None)
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self._rows(self._run(tmp, table, records))[0]
+            names = [t["arg_name"]
+                     for t in row["semantic_evidence"]["schema"]["tensors"]]
+            self.assertIn("x", names)
+            self.assertIn("weight", names)
+
+    def test_a_recorded_name_outranks_the_declared_convention(self):
+        table = self._table([self._row("event-1", 0, 1)])
+        records = self._launcher_record(
+            "model.layers.1.mlp.down_proj", "call-1", 32)
+        records[0]["arg_names"] = ["lhs", "rhs"]
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self._rows(self._run(tmp, table, records))[0]
+            names = [t["arg_name"]
+                     for t in row["semantic_evidence"]["schema"]["tensors"]]
+            self.assertIn("lhs", names)
+            self.assertIn("rhs", names)
+            self.assertNotIn("x", names)
+
     def test_short_symbols_never_match(self):
         """A module path must not pair with a launcher by accident."""
         self.assertFalse(merge._symbols_match("mlp", "gemm_a8w8_blockscale"))

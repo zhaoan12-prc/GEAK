@@ -6,6 +6,7 @@ loads the model.  It records metadata only and wraps each selected module call
 in a profiler record_function marker so launched kernels can be proven to be
 contained by the wrapper that supplied the Shape.
 """
+import inspect
 import json
 import functools
 import importlib
@@ -20,6 +21,34 @@ _TRUE = ("1", "true", "True", "TRUE", "yes", "on")
 _LOGGER = None
 _INSTALLED_CLASSES = set()
 _PATCHED_CALLABLES = set()
+# target -> inspect.Signature of the wrapped launcher, or None when it has no
+# introspectable signature (many native/JIT callables do not).
+_CALLABLE_SIGNATURES = {}
+
+
+def _positional_names(target, args):
+    """Parameter names for this call's positional arguments.
+
+    Without this the probe can only report ``args[0]``, ``args[1]`` ... which
+    is precisely the argument semantics a GEMM row is missing: nothing in the
+    record says which operand is the activation and which is the weight.  The
+    names come from the wrapped callable's own signature, so they are recorded
+    calling convention rather than a positional guess.
+    """
+    signature = _CALLABLE_SIGNATURES.get(target)
+    if signature is None:
+        return []
+    positional = [
+        parameter for parameter in signature.parameters.values()
+        if parameter.kind in (
+            parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)]
+    names = []
+    for index in range(len(args)):
+        if index < len(positional):
+            names.append(positional[index].name)
+        else:
+            names.append("args[%d]" % index)
+    return names
 
 
 def _flag(name, default="0"):
@@ -402,6 +431,7 @@ class SemanticRuntimeLogger(object):
             "kwargs": _metadata(kwargs, aliases),
             "parameters": _metadata({}, aliases),
             "output": _metadata(output, aliases),
+            "arg_names": _positional_names(entry["target"], args),
         }
         with self._lock:
             self._fh.write(json.dumps(
@@ -439,6 +469,10 @@ def _install_callable_probes():
         if not callable(original):
             raise RuntimeError(
                 "GEAK callable target is not callable: %s" % target)
+        try:
+            _CALLABLE_SIGNATURES[target] = inspect.signature(original)
+        except (TypeError, ValueError):
+            _CALLABLE_SIGNATURES[target] = None
 
         @functools.wraps(original)
         def wrapped(*args, __original=original, __target=target, **kwargs):

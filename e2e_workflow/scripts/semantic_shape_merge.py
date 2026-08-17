@@ -173,6 +173,7 @@ def _groups(records):
                     record.get("parameters"), "weight", "parameters"))
             group["tensors"].extend(
                 _metadata_tensors(record.get("output"), "output", "output"))
+            _name_launcher_arguments(group, record)
         else:
             group["tensors"].append({
                 "io": record.get("io", "raw_arg"),
@@ -194,6 +195,69 @@ def _normalize(value):
 
 
 LAUNCHER_MARKER = "::launcher:"
+
+# Calling conventions for wrapped launchers, keyed by a token in the callable
+# name. ``names`` is only a fallback for shape logs captured before the probe
+# recorded signature names; a recorded name always wins. ``io`` states which
+# arguments are weights, which a positional list cannot express and which
+# _tensor_schema needs before it can report A[M,K] x W[N,K] -> O[M,N].
+_LAUNCHER_ARGUMENT_CONVENTIONS = (
+    ("gemm_a8w8_blockscale", {
+        "names": ("x", "weight", "x_scale", "w_scale"),
+        "io": {"weight": "weight"},
+    }),
+    ("gemm_a8w8", {
+        "names": ("x", "weight", "x_scale", "w_scale"),
+        "io": {"weight": "weight"},
+    }),
+)
+
+
+def _launcher_convention(symbol):
+    lowered = str(symbol or "").lower()
+    for token, convention in _LAUNCHER_ARGUMENT_CONVENTIONS:
+        if token in lowered:
+            return convention
+    return None
+
+
+def _name_launcher_arguments(group, record):
+    """Replace positional ``args[i]`` labels with real parameter names.
+
+    A launcher probe records a positional argument list, so without this the
+    ledger reports args[0]/args[1]/args[2] and nothing states which operand is
+    the activation, which is the weight, and which are the block scales. The
+    names come from the wrapped callable's signature (recorded by the probe as
+    ``arg_names``), falling back to a declared convention for shape logs
+    captured before that existed.
+    """
+    symbol = _launcher_symbol(group)
+    if not symbol:
+        return
+    recorded = record.get("arg_names") or []
+    convention = _launcher_convention(symbol) or {}
+    fallback = convention.get("names") or ()
+    io_roles = convention.get("io") or {}
+    for tensor in group["tensors"]:
+        match = re.match(r"^args\[(\d+)\]$", str(tensor.get("tensor_path")))
+        if not match:
+            continue
+        index = int(match.group(1))
+        name = ""
+        if index < len(recorded):
+            name = str(recorded[index])
+        elif index < len(fallback):
+            name = str(fallback[index])
+        if not name or name.startswith("args["):
+            continue
+        tensor["arg_name"] = name
+        tensor["tensor_path"] = name
+        tensor["parameter_name"] = name
+        if name in io_roles:
+            # Direction is unchanged -- a weight is still an input. This only
+            # records that the operand is a parameter rather than activation.
+            tensor["io"] = io_roles[name]
+            tensor["tensor_role"] = io_roles[name]
 
 
 def _launcher_symbol(group):
