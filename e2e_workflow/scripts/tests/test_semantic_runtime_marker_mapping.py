@@ -456,6 +456,120 @@ class RuntimeMarkerMappingTest(unittest.TestCase):
             self.assertEqual(
                 mapped["candidate_op_instance_id"], "geak-op-1")
 
+    def test_a_launcher_called_twice_does_not_truncate_the_forward(self):
+        """A repeated op_path inside one forward must not end the pass.
+
+        The probe names a launcher after its enclosing module, so a fused
+        allreduce+rmsnorm that runs once after attention and once after the
+        MLP emits two markers with the identical path. Cutting at the repeat
+        drops the whole second half of the layer -- here, the MoE kernel.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = os.path.join(tmp, "plan.json")
+            trace_path = os.path.join(tmp, "trace.json")
+            out_path = os.path.join(tmp, "mapped.json")
+
+            def target(pos, kernel):
+                return {
+                    "phase": "decode", "representative_layer_id": 7,
+                    "selected_bucket": {
+                        "phase": "decode", "batch_size": 4,
+                        "input_tokens": 0},
+                    "pos": pos, "row_id": "event-%d" % pos,
+                    "raw_name": kernel,
+                }
+
+            with open(plan_path, "w") as fh:
+                json.dump({"capture_targets": [
+                    target(0, "attn_kernel"),
+                    target(1, "moe_kernel"),
+                ]}, fh)
+
+            def marker(op, path):
+                return ("GEAK_SEMANTICS|op=%s|phase=DECODE|bs=4|toks=4"
+                        "|layer=7|path=%s" % (op, path))
+
+            fused = "model.layers.7::launcher:pkg:CustomAllreduce.fused_ar_rms"
+            events = [
+                # the layer root spans the whole forward
+                {"cat": "user_annotation", "name": marker("root", "model.layers.7"),
+                 "pid": 1, "tid": 2, "ts": 100, "dur": 100},
+                {"cat": "user_annotation", "name": marker("attn", "model.layers.7.attn"),
+                 "pid": 1, "tid": 2, "ts": 110, "dur": 10},
+                {"cat": "hip_runtime", "name": "hipModuleLaunchKernel",
+                 "pid": 1, "tid": 2, "ts": 112, "dur": 2,
+                 "args": {"kernel": "attn_kernel", "correlation": 1}},
+                # first fused allreduce
+                {"cat": "user_annotation", "name": marker("ar1", fused),
+                 "pid": 1, "tid": 2, "ts": 125, "dur": 5},
+                # second fused allreduce -- SAME op_path, still this forward
+                {"cat": "user_annotation", "name": marker("ar2", fused),
+                 "pid": 1, "tid": 2, "ts": 140, "dur": 5},
+                {"cat": "user_annotation", "name": marker("moe", "model.layers.7.mlp"),
+                 "pid": 1, "tid": 2, "ts": 160, "dur": 20},
+                {"cat": "hip_runtime", "name": "hipModuleLaunchKernel",
+                 "pid": 1, "tid": 2, "ts": 165, "dur": 2,
+                 "args": {"kernel": "moe_kernel", "correlation": 2}},
+            ]
+            with open(trace_path, "w") as fh:
+                json.dump({"traceEvents": events}, fh)
+
+            result = mapping.map_plan(plan_path, trace_path, out_path)
+            self.assertEqual(result["matched_target_count"], 2)
+            self.assertEqual(result["unmatched_target_count"], 0)
+            self.assertEqual(
+                result["selected_forward_marker_counts"]["decode|7|4|0"], 5)
+            with open(out_path) as fh:
+                mapped = json.load(fh)["capture_targets"]
+            self.assertEqual(
+                [item["candidate_op_instance_id"] for item in mapped],
+                ["attn", "moe"])
+
+    def test_layer_root_delimits_forwards_when_present(self):
+        """Two roots -> two forwards; only the first one is selected."""
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = os.path.join(tmp, "plan.json")
+            trace_path = os.path.join(tmp, "trace.json")
+            out_path = os.path.join(tmp, "mapped.json")
+            with open(plan_path, "w") as fh:
+                json.dump({"capture_targets": [{
+                    "phase": "decode", "representative_layer_id": 3,
+                    "selected_bucket": {
+                        "phase": "decode", "batch_size": 4,
+                        "input_tokens": 0},
+                    "pos": 0, "row_id": "event-0",
+                    "raw_name": "decode_kernel",
+                }]}, fh)
+
+            def marker(op, path):
+                return ("GEAK_SEMANTICS|op=%s|phase=DECODE|bs=4|toks=4"
+                        "|layer=3|path=%s" % (op, path))
+
+            events = []
+            for forward, base in enumerate((100, 400)):
+                events.extend([
+                    {"cat": "user_annotation",
+                     "name": marker("root-%d" % forward, "model.layers.3"),
+                     "pid": 1, "tid": 2, "ts": base, "dur": 100},
+                    {"cat": "user_annotation",
+                     "name": marker("gemm-%d" % forward, "model.layers.3.mlp"),
+                     "pid": 1, "tid": 2, "ts": base + 10, "dur": 10},
+                    {"cat": "hip_runtime", "name": "hipModuleLaunchKernel",
+                     "pid": 1, "tid": 2, "ts": base + 12, "dur": 2,
+                     "args": {"kernel": "decode_kernel",
+                              "correlation": forward + 1}},
+                ])
+            with open(trace_path, "w") as fh:
+                json.dump({"traceEvents": events}, fh)
+
+            result = mapping.map_plan(plan_path, trace_path, out_path)
+            self.assertEqual(result["matched_target_count"], 1)
+            self.assertEqual(
+                result["selected_forward_marker_counts"]["decode|3|4|0"], 2)
+            with open(out_path) as fh:
+                mapped = json.load(fh)["capture_targets"][0]
+            self.assertEqual(mapped["candidate_op_instance_id"], "gemm-0")
+
 
 if __name__ == "__main__":
     unittest.main()

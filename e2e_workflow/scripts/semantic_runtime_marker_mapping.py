@@ -123,6 +123,49 @@ def _runtime_entries(events):
     return markers, entries
 
 
+def _unbound_cause(kernel_key, candidate_count, target_count,
+                   replay_launches, contained_launches):
+    """Name the reason a clean row's kernel found no matching probe launch.
+
+    The three causes need different remedies, and lumping them together makes
+    a run look uniformly bad when part of it is not fixable at all:
+
+    ``absent_from_mapping_replay``
+        the graph-off replay never launched this kernel. Graph-on and
+        graph-off decode legitimately select different implementations
+        (a Tensile GEMM vs a batched prequant GEMM, a CUDA-graph-only
+        reduce, an allocator buffer fill), so no probe can ever reach it.
+    ``launched_outside_every_marker``
+        the replay did launch it, but under no GEAK wrapper -- the launching
+        module is not hooked, or it belongs to a layer the probe did not
+        instrument. A wider probe scope fixes this one.
+    ``launch_count_differs``
+        both sides ran it, but not the same number of times inside the
+        selected forward, so no unambiguous 1:1 pairing exists.
+    """
+    if not replay_launches.get(kernel_key):
+        return {
+            "code": "absent_from_mapping_replay",
+            "clean_row_count": target_count,
+            "replay_launch_count": 0,
+            "marker_contained_launch_count": 0,
+        }
+    if not contained_launches.get(kernel_key):
+        return {
+            "code": "launched_outside_every_marker",
+            "clean_row_count": target_count,
+            "replay_launch_count": replay_launches[kernel_key],
+            "marker_contained_launch_count": 0,
+        }
+    return {
+        "code": "launch_count_differs",
+        "clean_row_count": target_count,
+        "replay_launch_count": replay_launches[kernel_key],
+        "marker_contained_launch_count": contained_launches[kernel_key],
+        "selected_forward_candidate_count": candidate_count,
+    }
+
+
 def _target_bucket(target):
     bucket = target.get("selected_bucket") or {}
     if not bucket:
@@ -148,18 +191,45 @@ def _marker_matches_bucket(marker, bucket):
     return True
 
 
+def _layer_root_markers(candidates, layer_id):
+    """Markers whose scope is the DecoderLayer itself, not one of its parts.
+
+    The probe hooks the decoder layer module as well as its children, so the
+    layer's own ``model.layers.<id>`` marker opens once per forward and its
+    ``[ts, end]`` range strictly contains every other marker of that forward.
+    That makes it the only trustworthy forward delimiter available here.
+    """
+    root_path = re.compile(r"(?:^|\.)layers\.%d$" % layer_id)
+    return [marker for marker in candidates
+            if root_path.search(str(marker.get("op_path") or ""))]
+
+
 def _first_forward_marker_ids(markers, bucket):
     """Select one complete wrapper-marker pass for a clean-trace bucket.
 
     Shape replays may execute the same decode bucket many times.  Matching all
     of them against the single representative clean layer makes every repeated
-    kernel ambiguous.  Within one layer forward, registered module paths occur
-    once; the first repeated path therefore starts the next forward.
+    kernel ambiguous, so exactly one forward has to be picked.
+
+    The delimiter is the layer's own module marker: it opens once per forward
+    and its time range contains the whole forward, so every marker inside that
+    range belongs to it no matter how often a wrapper repeats.
+
+    A repeated ``op_path`` must NOT be used as the delimiter. A launcher can
+    legitimately run several times in one forward -- a fused allreduce+rmsnorm
+    runs once after attention and once after the MLP, and both markers carry
+    the identical path ``model.layers.<id>::launcher:<target>`` because the
+    probe names a launcher after its enclosing module. Cutting there silences
+    the entire second half of every layer (the whole MoE block, in a MoE
+    model), and because the resulting id set is non-empty rather than empty,
+    the shape-log fallbacks below never fire: those rows just become U.
+    That heuristic survives only as a fallback for captures with no layer-root
+    marker, e.g. a runtime whose decoder class name the hook filter misses.
     """
     candidates = sorted(
         (marker for marker in markers
          if _marker_matches_bucket(marker, bucket)),
-        key=lambda marker: marker["index"])
+        key=lambda marker: (marker["ts"], -marker["end"], marker["index"]))
     if not candidates:
         phase, layer_id, batch_size, input_tokens = bucket
         compatible = [
@@ -181,16 +251,29 @@ def _first_forward_marker_ids(markers, bucket):
                 (marker for marker in compatible
                  if (marker["batch_size"], marker["input_tokens"])
                  == selected_bucket),
-                key=lambda marker: marker["index"])
-    selected = []
-    seen_paths = set()
-    for marker in candidates:
-        path = marker.get("op_path")
-        if selected and path and path in seen_paths:
-            break
-        selected.append(marker)
-        if path:
-            seen_paths.add(path)
+                key=lambda marker: (
+                    marker["ts"], -marker["end"], marker["index"]))
+    if not candidates:
+        return set()
+    roots = _layer_root_markers(candidates, candidates[0]["layer_id"])
+    if roots:
+        root = roots[0]
+        selected = [
+            marker for marker in candidates
+            if marker["pid"] == root["pid"] and marker["tid"] == root["tid"]
+            and marker["ts"] >= root["ts"] and marker["end"] <= root["end"]]
+    else:
+        # No layer-root marker in this capture: fall back to the weaker
+        # repeated-path heuristic rather than selecting every forward.
+        selected = []
+        seen_paths = set()
+        for marker in candidates:
+            path = marker.get("op_path")
+            if selected and path and path in seen_paths:
+                break
+            selected.append(marker)
+            if path:
+                seen_paths.add(path)
     return {
         marker["op_instance_id"] for marker in selected
         if marker.get("op_instance_id")
@@ -538,6 +621,18 @@ def map_plan(
     markers, entries = _runtime_entries(events)
     marker_launch_counts = collections.Counter(
         entry["marker"]["op_instance_id"] for entry in entries)
+    # Every kernel the replay launched, whether or not a GEAK marker contained
+    # it. Without this an unbound row cannot say WHY it is unbound, and the
+    # three causes need different fixes: a kernel the graph-off replay never
+    # runs is unfixable by probing, one that ran outside every marker needs a
+    # wider probe, and a count mismatch needs a longer/again-delimited window.
+    replay_kernel_launches = collections.Counter(
+        _kernel_key((event.get("args") or {}).get("kernel"))
+        for event in events
+        if event.get("cat") in RUNTIME_CATEGORIES
+        and (event.get("args") or {}).get("kernel"))
+    contained_kernel_launches = collections.Counter(
+        entry["kernel_key"] for entry in entries)
 
     grouped_targets = {}
     for target in plan.get("capture_targets", []):
@@ -572,10 +667,14 @@ def map_plan(
                  or entry["marker"]["op_instance_id"] in marker_ids)
         ]
         if len(candidates) != len(targets):
+            unbound_cause = _unbound_cause(
+                kernel_key, len(candidates), len(targets),
+                replay_kernel_launches, contained_kernel_launches)
             for target in targets:
                 target["runtime_marker_mapping_status"] = (
                     "ambiguous_count" if candidates else "not_found")
                 target["runtime_marker_candidate_count"] = len(candidates)
+                target["runtime_marker_unbound_cause"] = unbound_cause
                 if candidates:
                     ambiguous_candidates[id(target)] = candidates
             if candidates:
@@ -684,6 +783,14 @@ def map_plan(
             layer_fallback_matched),
         "ambiguous_target_count": ambiguous,
         "unmatched_target_count": unmatched,
+        # Why the still-unbound targets are unbound, so a reader can tell a
+        # remediable probe gap from a graph-on/graph-off kernel divergence
+        # that no probe can close.
+        "unbound_cause_counts": dict(collections.Counter(
+            (target.get("runtime_marker_unbound_cause") or {}).get("code")
+            for target in plan.get("capture_targets", [])
+            if target.get("runtime_marker_mapping_status")
+            in ("not_found", "ambiguous_count"))),
         "phase_coverage_complete": not missing_marker_buckets,
         "missing_marker_buckets": missing_marker_buckets,
         "selected_forward_marker_counts": {
