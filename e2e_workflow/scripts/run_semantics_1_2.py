@@ -132,7 +132,8 @@ def run(config_path, trace_path, shape_log_path, out_dir,
         config_key="", runtime_sources=None, capture_setup_path="",
         capture_result_path="", capture_result_paths=None,
         structural_patterns_path="", mapping_traces=None,
-        formal_workload_path="", mapping_setup_path=""):
+        formal_workload_path="", mapping_setup_path="",
+        layer_boundary_map=""):
     os.makedirs(out_dir, exist_ok=True)
     runtime_sources = list(runtime_sources or [])
     if not structural_patterns_path:
@@ -163,8 +164,15 @@ def run(config_path, trace_path, shape_log_path, out_dir,
         structural_patterns_input, config_path, runtime_sources,
         patterns_path)
 
+    # A CUDA-graph-replayed stage (typically decode) emits no DecoderLayer span
+    # of its own. ``semantic_decode_boundary_transfer`` recovers those
+    # boundaries from a workload-identical graph-off run; pass its
+    # DECODE_BOUNDARY_TRANSFER.json here so the gate below can see
+    # ``transferred_boundary_rows`` instead of always reading zero. Boundaries
+    # only -- device order and duration stay this trace's own.
     semantic = semantic_kernel_mapping.build(
-        trace_path, patterns_path, out_dir)
+        trace_path, patterns_path, out_dir,
+        boundary_map_path=layer_boundary_map)
 
     # --- Layer-boundary evidence gate (module spans) -------------------------
     # semantic_kernel_mapping resolves per-layer boundaries from python_function
@@ -326,11 +334,17 @@ def run(config_path, trace_path, shape_log_path, out_dir,
         capture.get("runtime_marker_mapping", {}).get(
             "phase_coverage_complete", False)
         for capture in capture_results)
+    # `transferred_module_span` is accepted alongside `module_span` for the same
+    # reason the boundary gate above accepts it: a boundary carried over from a
+    # workload-identical graph-off run is still module-span derived and passed
+    # its own completeness/monotonicity checks. Requiring the literal
+    # "module_span" here would make every CUDA-graph-replayed stage (i.e. every
+    # decode Clean Trace) unconditionally fail, contradicting that gate.
     status = "pass" if (
         semantic["status"] != "fail"
         and merged["status"] == "pass"
         and capture_phase_coverage_complete
-        and boundary_evidence == "module_span"
+        and boundary_evidence in ("module_span", "transferred_module_span")
     ) else "fail"
     result = {
         "schema_version": 1,
@@ -430,6 +444,13 @@ def main():
         help=("JSON describing the Clean Trace run's workload. Required "
               "whenever two-trace mapping is active: it is checked field by "
               "field against the mapping run and the run fails on mismatch."))
+    parser.add_argument(
+        "--layer-boundary-map", default="",
+        help=("DECODE_BOUNDARY_TRANSFER.json from "
+              "semantic_decode_boundary_transfer, supplying layer boundaries "
+              "for a CUDA-graph-replayed stage that emits no module span of "
+              "its own. Required to run a decode Clean Trace through 1.2; "
+              "boundaries only, timing stays this trace's own."))
     parser.add_argument("--result-json", default="")
     args = parser.parse_args()
     result = run(
@@ -439,7 +460,8 @@ def main():
         structural_patterns_path=args.structural_patterns,
         mapping_traces=args.mapping_trace,
         formal_workload_path=args.formal_workload,
-        mapping_setup_path=args.mapping_setup)
+        mapping_setup_path=args.mapping_setup,
+        layer_boundary_map=args.layer_boundary_map)
     if args.result_json:
         with open(args.result_json, "w") as fh:
             json.dump(result, fh, indent=2)
