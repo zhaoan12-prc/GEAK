@@ -454,27 +454,59 @@ def _callable_targets():
         if item.strip()]
 
 
+def _resolve_target(target):
+    """Resolve a probe target to (holder, attribute name, original callable).
+
+    Three forms are accepted, because a launcher is not always a plain module
+    function:
+
+    ``module:attr``
+        the common case, e.g. a Triton launcher.
+    ``module:Class.attr``
+        a launcher that is a method (``CustomAllreduce.fused_ar_rms``) or an
+        autograd Function's entry point
+        (``ChunkGatedDeltaRuleFunction.apply``). A single getattr cannot reach
+        either.
+    ``torch.ops.<ns>:<op>``
+        a native custom op such as ``aiter::moe_sorting_fwd``.
+        ``importlib.import_module`` cannot reach it at all: torch.ops
+        namespaces are lazily-populated objects, not modules.
+    """
+    module_name, separator, attr_path = target.partition(":")
+    if not separator or not attr_path:
+        raise RuntimeError(
+            "invalid GEAK callable target %r; expected module:attr, "
+            "module:Class.attr, or torch.ops.<ns>:<op>" % target)
+    if module_name == "torch.ops" or module_name.startswith("torch.ops."):
+        import torch
+        holder = torch.ops
+        for part in module_name.split(".")[2:]:
+            holder = getattr(holder, part)
+    else:
+        holder = importlib.import_module(module_name)
+    parts = attr_path.split(".")
+    for part in parts[:-1]:
+        holder = getattr(holder, part)
+    return holder, parts[-1], getattr(holder, parts[-1])
+
+
 def _install_callable_probes():
     logger = get_logger()
     for target in _callable_targets():
         if target in _PATCHED_CALLABLES:
             continue
-        module_name, separator, attr_name = target.partition(":")
-        if not separator:
-            raise RuntimeError(
-                "invalid GEAK callable target %r; expected module:attr" %
-                target)
-        module = importlib.import_module(module_name)
-        original = getattr(module, attr_name)
+        module, attr_name, original = _resolve_target(target)
         if not callable(original):
             raise RuntimeError(
                 "GEAK callable target is not callable: %s" % target)
         try:
             _CALLABLE_SIGNATURES[target] = inspect.signature(original)
         except (TypeError, ValueError):
+            # Native ops and many C-implemented callables have no
+            # introspectable signature; the probe still records shapes, just
+            # with positional argument labels.
             _CALLABLE_SIGNATURES[target] = None
 
-        @functools.wraps(original)
         def wrapped(*args, __original=original, __target=target, **kwargs):
             entry = logger.begin_callable(__target)
             output = None
@@ -483,6 +515,14 @@ def _install_callable_probes():
                 return output
             finally:
                 logger.end_callable(entry, args, kwargs, output)
+
+        # functools.wraps is best effort here: a native OpOverloadPacket or a
+        # C-implemented method may carry none of the attributes it copies, and
+        # failing to look like the original must not stop the probe.
+        try:
+            functools.update_wrapper(wrapped, original)
+        except (AttributeError, TypeError):
+            pass
 
         setattr(module, attr_name, wrapped)
         _PATCHED_CALLABLES.add(target)
