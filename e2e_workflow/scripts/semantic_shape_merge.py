@@ -193,6 +193,120 @@ def _normalize(value):
     return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
 
+LAUNCHER_MARKER = "::launcher:"
+
+
+def _launcher_symbol(group):
+    """Terminal callable name of a targeted-launcher probe group, else "".
+
+    ``semantic_runtime_capture.begin_callable`` records a launcher probe with
+    ``op_path = "<enclosing module path>::launcher:<module>:<attr>"``.  Module
+    forward hooks carry no marker, so this also distinguishes the two kinds of
+    record.
+    """
+    path = str(group.get("op_path") or "")
+    marker = path.find(LAUNCHER_MARKER)
+    if marker < 0:
+        return ""
+    return path[marker + len(LAUNCHER_MARKER):].rpartition(":")[2].strip()
+
+
+def _operator_symbol(text):
+    """Terminal function name of a capture-plan operator string.
+
+    Handles both python-stack frames such as
+    ``aiter/ops/triton/gemm/basic/gemm_a8w8_blockscale.py(19):
+    gemm_a8w8_blockscale`` and native op names such as
+    ``aiter::moe_sorting_fwd``.
+    """
+    return str(text or "").strip().rpartition(":")[2].strip()
+
+
+def _symbols_match(plan_symbol, launcher_symbol):
+    """Compare a plan operator symbol with a probe's launcher symbol.
+
+    Substring either way, because the binding a caller invokes is frequently an
+    alias of the defining name (``gemm_a8w8_blockscale`` imported into
+    ``fp8_utils`` as ``triton_gemm_a8w8_blockscale``).
+    """
+    left = _normalize(plan_symbol)
+    right = _normalize(launcher_symbol)
+    if not left or not right:
+        return False
+    return left in right or right in left
+
+
+def _plan_operator(target, row):
+    """The operator string the capture plan (or the row) attributes this to."""
+    explicit = target.get("candidate_op_path") or target.get(
+        "candidate_wrapper")
+    if not explicit and target.get("parent_operator") != "unresolved":
+        explicit = target.get("parent_operator")
+    if not explicit:
+        parent = row.get("parent_operator")
+        explicit = (
+            parent.get("canonical_op") if isinstance(parent, dict) else parent)
+    return explicit or ""
+
+
+def _launcher_bindings(rows, groups, target_by_row, table):
+    """Bind rows to targeted-launcher probe records, 1:1 and in captured order.
+
+    A launcher probe wrapped the real kernel launcher and recorded that call's
+    own operands, so it is strictly stronger evidence than the enclosing
+    module's tensors -- for a blockscale GEMM it carries the true FP8 A/B and
+    hence M/N/K, where the module hook only sees the layer's bf16 hidden state.
+
+    Binding is deliberately conservative: within one
+    ``(phase, representative layer, callable symbol)`` bucket the number of
+    candidate rows must equal the number of probe records, and they are then
+    paired in captured order.  Any other count is left unbound so the existing
+    ordered wrapper alignment still applies unchanged.  This keeps the mapping
+    deterministic and auditable rather than guessing which launch is which.
+    """
+    phase = str(table["phase"]).lower()
+    layer_id = int(table["representative_layer_id"])
+    launchers = [
+        group for group in groups
+        if int(group.get("rank", 0) or 0) == 0
+        and group.get("phase") == phase
+        and group.get("layer_id") == layer_id
+        and _launcher_symbol(group)]
+    if not launchers:
+        return {}
+
+    # The replay captures several forward passes, so the same launcher fires
+    # once per pass from the same enclosing module. The representative-layer
+    # table holds one row per launch, not per pass, so collapse to the first
+    # record of each enclosing module and keep capture order.
+    by_symbol = {}
+    for group in launchers:
+        symbol = _launcher_symbol(group)
+        enclosing = str(group.get("op_path") or "").split(LAUNCHER_MARKER)[0]
+        seen = by_symbol.setdefault(symbol, {})
+        seen.setdefault(enclosing, group)
+    by_symbol = {
+        symbol: list(seen.values()) for symbol, seen in by_symbol.items()}
+
+    bound = {}
+    for symbol, symbol_groups in by_symbol.items():
+        matched = [
+            row for row in rows
+            # A kernel_exact row is already resolved from the Clean Trace and
+            # never consults probe groups, so counting it here would only
+            # skew the 1:1 check and block an otherwise valid binding.
+            if row.get("shape", {}).get("source") != "kernel_exact"
+            and _symbols_match(
+                _operator_symbol(
+                    _plan_operator(
+                        target_by_row.get(row["row_id"], {}), row)),
+                symbol)]
+        if matched and len(matched) == len(symbol_groups):
+            for row, group in zip(matched, symbol_groups):
+                bound[row["row_id"]] = group
+    return bound
+
+
 def _candidate_groups(row, target, groups, table, two_trace_entry=None):
     phase = str(table["phase"]).lower()
     layer_id = int(table["representative_layer_id"])
@@ -988,6 +1102,11 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir,
                 "source": "unavailable", "bucket_match": "unavailable",
                 "input": None, "output": None,
             }
+        # Targeted-launcher probes are resolved once per table: the binding is
+        # a cross-row decision (counts must line up within a symbol bucket),
+        # so it cannot be made from inside the per-row branch below.
+        launcher_bindings = _launcher_bindings(
+            table.get("rows", []), groups, target_by_row, table)
         for row in table.get("rows", []):
             original = json.loads(json.dumps(row))
             two_trace_entry = two_trace_entries.get(row["row_id"])
@@ -1059,16 +1178,32 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir,
                     [] if runtime_internal
                     else _candidate_groups(
                         row, target, groups, table, two_trace_entry))
+                # A launcher probe observed this very launch, so it outranks
+                # any wrapper candidate matched by name/order below.
+                launcher_group = (
+                    None if runtime_internal
+                    else launcher_bindings.get(row["row_id"]))
+                if launcher_group is not None:
+                    candidates = [launcher_group]
                 alignment_source = False
                 if len(candidates) == 1:
                     group = candidates[0]
                     bucket_status = _bucket_status(table, group)
                     cardinality = target.get(
                         "mapping_cardinality", "unresolved")
+                    # A direct launcher probe IS the kernel-scope route: it
+                    # wrapped the launcher and logged its operands. Requiring
+                    # candidate_terminal_launcher (which semantic_source_mapping
+                    # leaves unset when it reports not_found) or cardinality
+                    # 1:1 (which a legitimately multi-launch wrapper never
+                    # reaches) would discard that evidence and fall back to the
+                    # enclosing module's shapes.
                     kernel_exact = (
-                        cardinality == "1:1"
-                        and bool(target.get("candidate_terminal_launcher"))
-                        and not alignment_source)
+                        not alignment_source
+                        and (launcher_group is not None
+                             or (cardinality == "1:1"
+                                 and bool(target.get(
+                                     "candidate_terminal_launcher")))))
                     level = "P"
                     probe_scope = "kernel" if kernel_exact else "wrapper"
                     evidence = {
