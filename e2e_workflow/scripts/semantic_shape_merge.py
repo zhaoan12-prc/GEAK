@@ -861,8 +861,29 @@ def _shape_text(row):
     return "U(%s): %s" % (reason_code, reason)
 
 
+_UNBOUND_CAUSE_REASONS = {
+    "absent_from_mapping_replay": (
+        "kernel_absent_from_mapping_replay",
+        "the graph-off mapping replay never launched this kernel, so no probe "
+        "can observe it: the graph-on and graph-off runs selected different "
+        "implementations for this operation"),
+    "launched_outside_every_marker": (
+        "kernel_launched_outside_probe_scope",
+        "the mapping replay launched this kernel outside every GEAK wrapper "
+        "marker, so the launching module was not instrumented"),
+    "launch_count_differs": (
+        "probe_launch_count_differs",
+        "the mapping replay launched this kernel a different number of times "
+        "than the clean trace inside the selected forward"),
+}
+
+
 def _unavailable_reason(row, target, candidate_count):
     kernel = str(row.get("short_name") or row.get("raw_name") or "")
+    # A cause recorded by the marker mapper is measured, not inferred, so it
+    # outranks the name-shape guesses below -- except for rows that carry no
+    # model tensor at all, which are handled first.
+    cause = (target.get("runtime_marker_unbound_cause") or {}).get("code")
     if "__amd_rocclr_fillBufferAligned" in kernel:
         return (
             "runtime_internal_buffer_operation",
@@ -879,6 +900,8 @@ def _unavailable_reason(row, target, candidate_count):
         return (
             "multiple_wrapper_candidates",
             "multiple matching wrapper instances prevent unique shape attribution")
+    if cause in _UNBOUND_CAUSE_REASONS:
+        return _UNBOUND_CAUSE_REASONS[cause]
     status = target.get("runtime_marker_mapping_status")
     if status == "not_found":
         return (
@@ -1467,10 +1490,20 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir,
             1 for audit in audits
             if audit.get("parent_recovered_by") == "two_trace_mapping"),
     }
+    # Same definition the evidence ledger uses: every row is classified and
+    # every U row carries a machine-readable reason_code.
+    unexplained = [
+        audit for audit in audits
+        if audit["evidence"]["level"] == "U"
+        and not audit["evidence"].get("reason_code")]
+    classification_complete = (
+        sum(counts.values()) == len(audits) and not unexplained)
     verification = {
         "schema_version": 1,
         "status": "pass" if unchanged else "fail",
         "clean_trace_identity_unchanged": unchanged,
+        "classification_complete": classification_complete,
+        "unexplained_u_count": len(unexplained),
         "evidence_counts": counts,
         "row_count": len(audits),
         "shape_log_group_count": len(groups),
@@ -1487,16 +1520,29 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir,
             key: audit[key] for key in (
                 "phase", "pattern_id", "representative_layer_id",
                 "pos", "row_id", "kernel")}
+        # Both fields are required: `reason` is for a human reading the
+        # table, `reason_code` is what validate_kpu_model_pair gates on.
+        # Emitting only the prose made every U row fail that gate.
+        item["reason_code"] = audit["evidence"].get("reason_code")
         item["reason"] = audit["evidence"].get("reason")
         unavailable.append(item)
+    unavailable_reason_counts = {}
+    for item in unavailable:
+        code = item.get("reason_code") or "unspecified"
+        unavailable_reason_counts[code] = (
+            unavailable_reason_counts.get(code, 0) + 1)
     coverage = {
         "schema_version": 1,
         "scope": "representative_layers_only",
+        "status": verification["status"],
+        "classification_complete": verification.get(
+            "classification_complete", False),
         "row_count": len(audits),
         "evidence_counts": counts,
         "covered_count": sum(
             count for level, count in counts.items() if level != "U"),
         "unavailable": unavailable,
+        "unavailable_reason_counts": unavailable_reason_counts,
     }
     with open(coverage_out, "w") as fh:
         json.dump(coverage, fh, indent=2)
