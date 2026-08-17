@@ -158,8 +158,13 @@ def capture(setup_path, capture_plan_path, out_dir,
         plan = json.load(fh)
     if not phases:
         phases = _required_phases(plan)
+    # benchmark_repository is required rather than defaulted: the replay must
+    # run the *same* official benchmark checkout the Clean Trace came from, and
+    # a wrong-but-plausible default silently produces a workload that only
+    # looks identical. There is no repository path that is correct for every
+    # host, so refuse to guess.
     required = ("container", "model", "benchmark", "port",
-                "tensor_parallel_size", "workload")
+                "tensor_parallel_size", "workload", "benchmark_repository")
     missing = [name for name in required if setup.get(name) is None]
     if missing:
         raise ValueError(
@@ -188,9 +193,7 @@ def capture(setup_path, capture_plan_path, out_dir,
     _stop_service(container, setup["port"])
     _deploy(container, model_runner, runtime_module)
     workload = setup["workload"]
-    repository = setup.get(
-        "benchmark_repository",
-        "/mnt/raid0/zhaoan12/repo/InferenceX")
+    repository = setup["benchmark_repository"]
     benchmark = setup["benchmark"]
     if disable_cuda_graph:
         benchmark_source = os.path.join(repository, benchmark)
