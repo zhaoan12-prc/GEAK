@@ -231,7 +231,10 @@ def _symbols_match(plan_symbol, launcher_symbol):
     """
     left = _normalize(plan_symbol)
     right = _normalize(launcher_symbol)
-    if not left or not right:
+    # Substring matching on a very short name would pair unrelated operators,
+    # and several of the candidate fields hold module paths rather than
+    # function names, so require a distinctive symbol on both sides.
+    if len(left) < 6 or len(right) < 6:
         return False
     return left in right or right in left
 
@@ -247,6 +250,30 @@ def _plan_operator(target, row):
         explicit = (
             parent.get("canonical_op") if isinstance(parent, dict) else parent)
     return explicit or ""
+
+
+def _callable_operators(target, row):
+    """Every string that might name the callable this row launched.
+
+    Matching a launcher probe needs a *function* name.  Several of these
+    fields hold a module path instead -- ``semantic_runtime_marker_mapping``
+    fills ``candidate_wrapper`` with the enclosing ``model.layers.N`` marker --
+    so all plausible sources are offered and the symbol comparison decides.
+    """
+    parent = row.get("parent_operator")
+    if not isinstance(parent, dict):
+        parent = {"canonical_op": parent}
+    ordered = [
+        target.get("candidate_terminal_launcher"),
+        parent.get("python_launch_site"),
+        parent.get("canonical_op"),
+        target.get("parent_operator"),
+        target.get("candidate_op_path"),
+        target.get("candidate_wrapper"),
+    ]
+    return [
+        str(value) for value in ordered
+        if value and str(value) != "unresolved"]
 
 
 def _launcher_bindings(rows, groups, target_by_row, table):
@@ -296,11 +323,10 @@ def _launcher_bindings(rows, groups, target_by_row, table):
             # never consults probe groups, so counting it here would only
             # skew the 1:1 check and block an otherwise valid binding.
             if row.get("shape", {}).get("source") != "kernel_exact"
-            and _symbols_match(
-                _operator_symbol(
-                    _plan_operator(
-                        target_by_row.get(row["row_id"], {}), row)),
-                symbol)]
+            and any(
+                _symbols_match(_operator_symbol(operator), symbol)
+                for operator in _callable_operators(
+                    target_by_row.get(row["row_id"], {}), row))]
         if matched and len(matched) == len(symbol_groups):
             for row, group in zip(matched, symbol_groups):
                 bound[row["row_id"]] = group

@@ -178,6 +178,40 @@ class ShapeMergeLauncherProbeTest(unittest.TestCase):
                 [64, 16],
                 [t["shape"] for t in second["semantic_evidence"]["schema"]["tensors"]])
 
+    def test_module_marker_in_candidate_wrapper_still_binds(self):
+        """semantic_runtime_marker_mapping fills candidate_wrapper with the
+        enclosing ``model.layers.N`` marker, which is a module path and not a
+        callable name. The symbol match must fall back to the row's launch
+        site instead of giving up on that field."""
+        table = self._table([self._row("event-1", 0, 1)])
+        records = self._launcher_record(
+            "model.layers.1.mlp.down_proj", "call-1", 32)
+        plan = {"capture_targets": [{
+            "row_id": "event-1",
+            "candidate_op_path": None,
+            "candidate_wrapper": "model.layers.1",
+            "candidate_terminal_launcher": None,
+            "mapping_cardinality": "unresolved",
+            "parent_operator": "model.layers.1",
+        }]}
+        with tempfile.TemporaryDirectory() as tmp:
+            result = merge.merge(
+                self._write(tmp, "table.json", table),
+                self._write(tmp, "plan.json", plan),
+                self._write(tmp, "shape.jsonl", records, jsonl=True),
+                os.path.join(tmp, "out"))
+            row = self._rows(result)[0]
+            self.assertEqual(row["semantic_evidence"]["source"],
+                             "shape_logger_terminal_launcher")
+            self.assertEqual(row["shape"]["source"], "runtime_probe_kernel")
+
+    def test_short_symbols_never_match(self):
+        """A module path must not pair with a launcher by accident."""
+        self.assertFalse(merge._symbols_match("mlp", "gemm_a8w8_blockscale"))
+        self.assertFalse(merge._symbols_match("model.layers.1", "topk"))
+        self.assertTrue(merge._symbols_match(
+            "gemm_a8w8_blockscale", "triton_gemm_a8w8_blockscale"))
+
     def test_ambiguous_counts_do_not_bind(self):
         """Two rows but one probe record: binding would be a guess."""
         table = self._table(
