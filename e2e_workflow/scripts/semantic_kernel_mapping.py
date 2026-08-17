@@ -1867,13 +1867,70 @@ def _markdown(tables, quality):
     return "\n".join(lines) + "\n"
 
 
-def build(trace_path, pattern_path, out_dir, table_phases=None):
+def _apply_boundary_map(rows, boundary_map_path, patterns):
+    """Adopt layer boundaries recovered from a workload-identical graph-off run.
+
+    A CUDA-graph-replayed stage emits no DecoderLayer span, so its rows reach
+    here unresolved. ``semantic_decode_boundary_transfer`` recovers which layer
+    each launch belongs to from the graph-off replay; only that assignment is
+    adopted here. Device order and duration are untouched, so timing remains
+    the Clean Trace's own.
+
+    The evidence name keeps the ``python_module_span`` prefix on purpose: the
+    boundary really is module-span derived, just from the other run, and the
+    prefix is what lets _stage_sequence_partition take its module-guided path
+    instead of the forced alignment it uses for a module-less step.
+    """
+    with open(boundary_map_path) as fh:
+        document = json.load(fh)
+    if document.get("status") != "pass":
+        raise ValueError(
+            "boundary map %s did not pass its own checks: %s"
+            % (boundary_map_path, "; ".join(document.get("failures") or [])))
+    assignments = document.get("assignments") or {}
+    applied = 0
+    for row in rows:
+        assignment = assignments.get(row["row_id"])
+        if not assignment:
+            continue
+        if row.get("layer_id") is not None:
+            continue
+        layer_id = assignment.get("layer_id")
+        if layer_id is None:
+            continue
+        pattern = patterns.get(layer_id) or {}
+        row["layer_id"] = layer_id
+        row["layer_instance_id"] = "%s:pass-0:layer-%d" % (
+            row.get("step_id"), layer_id)
+        row["pattern_id"] = pattern.get("pattern_id")
+        row["assignment"] = "layer_body"
+        row["layer_evidence"] = "python_module_span_transferred_graph_off"
+        applied += 1
+    return applied, document
+
+
+def build(trace_path, pattern_path, out_dir, table_phases=None,
+          boundary_map_path=""):
     with open(pattern_path) as fh:
         pattern_doc = json.load(fh)
     events = _load_events(trace_path)
     patterns = _pattern_index(pattern_doc)
     rows, spans, out_of_scope, module_scopes, module_diagnostics = _event_rows(
         events, pattern_doc)
+    transferred_rows = 0
+    boundary_transfer = None
+    if boundary_map_path:
+        transferred_rows, boundary_document = _apply_boundary_map(
+            rows, boundary_map_path, patterns)
+        boundary_transfer = {
+            "path": os.path.abspath(boundary_map_path),
+            "phase": boundary_document.get("phase"),
+            "donor": boundary_document.get("donor"),
+            "alignment": boundary_document.get("alignment"),
+            "checks": boundary_document.get("checks"),
+            "applied_rows": transferred_rows,
+            "evidence_note": boundary_document.get("evidence_note"),
+        }
     module_interpolated = _complete_module_ranges(rows, module_scopes, patterns)
     partition_diagnostics, pattern_templates = _stage_sequence_partition(
         rows, pattern_doc)
@@ -1906,6 +1963,8 @@ def build(trace_path, pattern_path, out_dir, table_phases=None):
             "schema_version": 1, "trace_sha256": _sha(trace_path),
             "module_scope_diagnostics": module_diagnostics,
             "module_scope_count": len(module_scopes),
+            "transferred_boundary_rows": transferred_rows,
+            "boundary_transfer": boundary_transfer,
             "device_truncated_instances": getattr(
                 _representatives, "last_truncated", []),
             "module_interpolated_event_count": module_interpolated,
@@ -1937,11 +1996,18 @@ def main():
     parser.add_argument("--result-json", default="")
     parser.add_argument("--table-phases", default="all",
                         help="comma-separated representative-table phases; default all, ordered prefill then decode")
+    parser.add_argument(
+        "--layer-boundary-map", default="",
+        help=("DECODE_BOUNDARY_TRANSFER.json from "
+              "semantic_decode_boundary_transfer, supplying layer boundaries "
+              "for a CUDA-graph-replayed stage that emits no module span. "
+              "Boundaries only; timing stays this trace's own."))
     args = parser.parse_args()
     requested_phases = set(
         value.strip() for value in args.table_phases.split(",") if value.strip())
     table_phases = None if "all" in requested_phases else requested_phases or None
-    result = build(args.trace, args.patterns, args.out_dir, table_phases)
+    result = build(args.trace, args.patterns, args.out_dir, table_phases,
+                   args.layer_boundary_map)
     if args.result_json:
         with open(args.result_json, "w") as fh:
             json.dump(result, fh, indent=2)

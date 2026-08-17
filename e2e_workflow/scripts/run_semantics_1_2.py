@@ -174,14 +174,23 @@ def run(config_path, trace_path, shape_log_path, out_dir,
     # loudly instead of silently emitting unreliable boundaries; allow an
     # explicit opt-in to proceed degraded.
     with open(semantic["layer_instance_audit_json"]) as fh:
-        module_scope_count = int(
-            json.load(fh).get("module_scope_count", 0) or 0)
+        layer_audit = json.load(fh)
+    module_scope_count = int(layer_audit.get("module_scope_count", 0) or 0)
+    # A CUDA-graph-replayed stage emits no module span of its own, but
+    # semantic_decode_boundary_transfer can carry the boundary over from a
+    # workload-identical graph-off run. That boundary is still module-span
+    # derived and passes its own completeness/monotonicity checks, so it
+    # satisfies this gate; only timing stays this trace's own.
+    transferred_boundary_rows = int(
+        layer_audit.get("transferred_boundary_rows", 0) or 0)
     allow_no_module_spans = os.environ.get(
         "GEAK_SEMANTICS_ALLOW_NO_MODULE_SPANS", "0") in ("1", "true", "True")
     boundary_evidence = (
         "module_span" if module_scope_count > 0
+        else "transferred_module_span" if transferred_boundary_rows > 0
         else "degraded_no_module_span")
-    if module_scope_count == 0 and not allow_no_module_spans:
+    if (module_scope_count == 0 and transferred_boundary_rows == 0
+            and not allow_no_module_spans):
         # Non-gating sidecar: do NOT crash or re-capture. Return an explicit
         # failed status so the caller (e2e_workflow) skips Semantics 1.2 +
         # semantic/fusion and falls back to the native optimization flow.
