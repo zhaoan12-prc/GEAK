@@ -147,7 +147,30 @@ def map_plan(plan_path, runtime_sources, out_path):
     }
     with open(out_path, "w") as fh:
         json.dump(plan, fh, indent=2)
-    return plan["source_mapping_summary"]
+
+    # Every target unresolved almost always means the launcher sources were
+    # never supplied -- map_plan only searches the runtime sources it is given,
+    # and a model file alone contains none of the kernel-name tokens. Left
+    # silent, the probe degrades to module-scope containment and every shape
+    # comes back as positional `argN`/`wrapper_input_N` against the enclosing
+    # module's tensors, which reads like real evidence but is not the kernel's.
+    # Each target's `parent_operator` already names the launcher file to add.
+    summary = plan["source_mapping_summary"]
+    if (summary["target_count"] > 0
+            and summary["with_source_candidate"] == 0
+            and os.environ.get(
+                "GEAK_SEMANTICS_ALLOW_UNMAPPED_SOURCES", "0")
+            not in ("1", "true", "True")):
+        raise ValueError(
+            "no source candidate found for any of the %d capture targets: the "
+            "supplied runtime sources contain none of their kernel-name "
+            "tokens, so a probe would only record module-scope containment. "
+            "Add the launcher files named in each target's `parent_operator` "
+            "to --runtime-source (e.g. the aiter/sglang file the kernel is "
+            "launched from), or set "
+            "GEAK_SEMANTICS_ALLOW_UNMAPPED_SOURCES=1 to accept module-scope "
+            "shape evidence." % summary["target_count"])
+    return summary
 
 
 def main():
