@@ -13,6 +13,7 @@ import re
 import statistics
 
 import parse_profile
+import semantic_phase_tables
 
 
 DEVICE_CATEGORIES = ("kernel", "gpu_memcpy", "gpu_memset")
@@ -2126,26 +2127,135 @@ def build(trace_path, pattern_path, out_dir, table_phases=None,
     return {"schema_version": 1, "status": quality["status"], **paths}
 
 
+_STAGE_FILE_PHASES = {
+    "EXTEND": "prefill",
+    "PREFILL": "prefill",
+    "PROMPT": "prefill",
+    "DECODE": "decode",
+    "GENERATION": "decode",
+}
+
+
+def _stage_label(trace_path, table_phases, index):
+    """Name a stage from its rank-0 stage file, falling back to its phases.
+
+    The label becomes a directory name, so two stages must never produce the
+    same one -- the second build would overwrite the first's audit set.
+    """
+    match = re.search(
+        r"-TP-\d+-([A-Za-z_]+)\.trace\.json(\.gz)?$",
+        os.path.basename(str(trace_path)))
+    if match:
+        stage = match.group(1).upper()
+        return _STAGE_FILE_PHASES.get(stage, stage.lower())
+    if table_phases:
+        return ",".join(sorted(table_phases))
+    return "stage-%02d" % index
+
+
+def build_stages(traces, pattern_path, out_dir, stage_table_phases=None,
+                 boundary_maps=None):
+    """Analyse each stage trace, then publish one combined table.
+
+    The official capture splits prefill and decode into separate rank-0 files,
+    so one Semantics run per stage is unavoidable. Each stage gets its own
+    sub-directory under ``stages/`` -- its full audit set is preserved and
+    nothing is overwritten -- and ``out_dir`` holds the single combined table
+    that is the actual deliverable.
+    """
+    traces = list(traces)
+    boundary_maps = list(boundary_maps or [])
+    stage_table_phases = list(stage_table_phases or [])
+    boundary_maps += [""] * (len(traces) - len(boundary_maps))
+    stage_table_phases += [None] * (len(traces) - len(stage_table_phases))
+
+    stage_results = []
+    stage_paths = []
+    used_labels = set()
+    for index, trace_path in enumerate(traces):
+        label = _stage_label(trace_path, stage_table_phases[index], index)
+        if label in used_labels:
+            raise ValueError(
+                "two stage traces resolve to the same label %r; each stage "
+                "needs its own output directory" % label)
+        used_labels.add(label)
+        stage_dir = os.path.join(out_dir, "stages", label)
+        result = build(
+            trace_path, pattern_path, stage_dir,
+            stage_table_phases[index], boundary_maps[index])
+        result["stage"] = label
+        stage_results.append(result)
+        stage_paths.append((label, result["semantic_table_json"]))
+
+    statuses = [result["status"] for result in stage_results]
+    status = ("fail" if "fail" in statuses
+              else "partial" if "partial" in statuses else "pass")
+    combined = semantic_phase_tables.combine(
+        stage_paths,
+        os.path.join(out_dir, "pattern_layer_kernel_table.json"),
+        os.path.join(out_dir, "ORDERED_UNIQUE_LAYER_TABLES.md"),
+        kind="1_1",
+        quality_status=" + ".join(
+            "%s (%s)" % (result["status"], result["stage"])
+            for result in stage_results))
+    return {
+        "schema_version": 1,
+        "status": status,
+        "stages": stage_results,
+        "semantic_table_json": combined["semantic_table_json"],
+        "semantic_table_md": combined["semantic_table_md"],
+        "table_phases": combined["table_phases"],
+        "row_count": combined["row_count"],
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--trace", required=True)
+    parser.add_argument(
+        "--trace", required=True, action="append",
+        help=("rank-0 stage trace. Repeat once per stage (the official "
+              "capture writes prefill and decode to separate files); the "
+              "stages are then published as one combined table."))
     parser.add_argument("--patterns", required=True)
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--result-json", default="")
-    parser.add_argument("--table-phases", default="all",
-                        help="comma-separated representative-table phases; default all, ordered prefill then decode")
     parser.add_argument(
-        "--layer-boundary-map", default="",
+        "--table-phases", action="append",
+        help=("comma-separated representative-table phases; default all, "
+              "ordered prefill then decode. Repeat to give each --trace its "
+              "own phases, in the same order."))
+    parser.add_argument(
+        "--layer-boundary-map", action="append",
         help=("DECODE_BOUNDARY_TRANSFER.json from "
               "semantic_decode_boundary_transfer, supplying layer boundaries "
               "for a CUDA-graph-replayed stage that emits no module span. "
-              "Boundaries only; timing stays this trace's own."))
+              "Boundaries only; timing stays this trace's own. Repeat to "
+              "pair one with each --trace, in the same order; pass an empty "
+              "string for a stage that needs none."))
     args = parser.parse_args()
-    requested_phases = set(
-        value.strip() for value in args.table_phases.split(",") if value.strip())
-    table_phases = None if "all" in requested_phases else requested_phases or None
-    result = build(args.trace, args.patterns, args.out_dir, table_phases,
-                   args.layer_boundary_map)
+
+    def _phases(value):
+        requested = set(
+            item.strip() for item in str(value).split(",") if item.strip())
+        return None if "all" in requested else requested or None
+
+    def _pad(values, default):
+        values = list(values or [])
+        values += [default] * (len(args.trace) - len(values))
+        return values
+
+    phase_values = _pad(args.table_phases, "all")
+    boundary_values = _pad(args.layer_boundary_map, "")
+
+    if len(args.trace) == 1:
+        result = build(
+            args.trace[0], args.patterns, args.out_dir,
+            _phases(phase_values[0]), boundary_values[0])
+    else:
+        result = build_stages(
+            args.trace, args.patterns, args.out_dir,
+            [_phases(value) for value in phase_values],
+            boundary_values)
     if args.result_json:
         with open(args.result_json, "w") as fh:
             json.dump(result, fh, indent=2)

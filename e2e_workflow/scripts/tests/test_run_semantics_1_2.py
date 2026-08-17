@@ -290,3 +290,112 @@ class TwoTraceCoverageTest(unittest.TestCase):
         coverage, unmapped = runner._two_trace_coverage(None)
         self.assertEqual(coverage, [])
         self.assertEqual(unmapped, [])
+
+
+class RunStagesTest(unittest.TestCase):
+    """One run per stage, one combined prefill+decode deliverable."""
+
+    def _stage_result(self, out_dir, phase, boundary):
+        """What run() returns, plus the published table it wrote."""
+        table = os.path.join(out_dir, "pattern_layer_kernel_table.json")
+        os.makedirs(out_dir, exist_ok=True)
+        with open(table, "w") as fh:
+            json.dump({
+                "schema_version": 2,
+                "trace_path": "/%s.gz" % phase,
+                "trace_sha256": "sha-%s" % phase,
+                "table_phases": [phase],
+                "tables": [{
+                    "phase": phase, "pattern_id": "P0",
+                    "pattern_display_name": "P0",
+                    "pattern_layer_ids": [0, 1], "pattern_layer_count": 2,
+                    "representative_layer_id": 1,
+                    "selected_bucket": {"phase": phase},
+                    "event_count": 2, "layer_total_us": 1.0,
+                    "rows": [{"row_id": "event-0", "pos": 0, "stage": "gemm",
+                              "short_name": "k0", "duration_us": 1.0,
+                              "layer_total_pct": 1.0, "shape": {},
+                              "semantic_evidence": {"level": "K"}}],
+                }],
+            }, fh)
+        return {
+            "status": "pass",
+            "boundary_evidence": boundary,
+            "published_semantic_table_json": table,
+            "published_semantic_table_md": table + ".md",
+        }
+
+    def test_stages_are_isolated_and_published_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            traces = [
+                os.path.join(tmp, "x-TP-0-EXTEND.trace.json.gz"),
+                os.path.join(tmp, "x-TP-0-DECODE.trace.json.gz"),
+            ]
+            seen = []
+
+            def fake_run(config_path, trace_path, shape_log, out_dir, **kw):
+                phase = "prefill" if "EXTEND" in trace_path else "decode"
+                seen.append((phase, out_dir, kw.get("capture_setup_path"),
+                             kw.get("layer_boundary_map")))
+                return self._stage_result(
+                    out_dir, phase,
+                    "module_span" if phase == "prefill"
+                    else "transferred_module_span")
+
+            with mock.patch.object(runner, "run", side_effect=fake_run):
+                result = runner.run_stages(
+                    "config.json", traces, os.path.join(tmp, "out"),
+                    capture_setups=["setup_prefill.json", "setup_decode.json"],
+                    layer_boundary_maps=["", "boundary.json"])
+
+            # each stage got its own directory, setup and boundary map
+            self.assertEqual([item[0] for item in seen], ["prefill", "decode"])
+            self.assertTrue(seen[0][1].endswith(os.path.join("stages", "prefill")))
+            self.assertTrue(seen[1][1].endswith(os.path.join("stages", "decode")))
+            self.assertEqual(seen[0][2], "setup_prefill.json")
+            self.assertEqual(seen[1][2], "setup_decode.json")
+            self.assertEqual(seen[0][3], "")
+            self.assertEqual(seen[1][3], "boundary.json")
+
+            # one combined deliverable, prefill first
+            self.assertEqual(result["status"], "pass")
+            self.assertEqual(result["table_phases"], ["prefill", "decode"])
+            with open(result["published_semantic_table_json"]) as fh:
+                combined = json.load(fh)
+            self.assertEqual(
+                [table["phase"] for table in combined["tables"]],
+                ["prefill", "decode"])
+            # boundary evidence differs per stage and must stay per stage
+            self.assertEqual(result["boundary_evidence"], {
+                "prefill": "module_span",
+                "decode": "transferred_module_span"})
+
+    def test_a_failing_stage_fails_the_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            traces = [
+                os.path.join(tmp, "x-TP-0-EXTEND.trace.json.gz"),
+                os.path.join(tmp, "x-TP-0-DECODE.trace.json.gz"),
+            ]
+
+            def fake_run(config_path, trace_path, shape_log, out_dir, **kw):
+                phase = "prefill" if "EXTEND" in trace_path else "decode"
+                stage = self._stage_result(out_dir, phase, "module_span")
+                if phase == "decode":
+                    stage["status"] = "fail"
+                return stage
+
+            with mock.patch.object(runner, "run", side_effect=fake_run):
+                result = runner.run_stages(
+                    "config.json", traces, os.path.join(tmp, "out"))
+            self.assertEqual(result["status"], "fail")
+
+    def test_capture_results_must_be_one_per_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            traces = [
+                os.path.join(tmp, "x-TP-0-EXTEND.trace.json.gz"),
+                os.path.join(tmp, "x-TP-0-DECODE.trace.json.gz"),
+            ]
+            with self.assertRaises(ValueError):
+                runner.run_stages(
+                    "config.json", traces, os.path.join(tmp, "out"),
+                    capture_result_paths=["only_one.json"])

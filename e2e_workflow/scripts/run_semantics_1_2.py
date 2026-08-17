@@ -8,6 +8,7 @@ import shutil
 
 import semantic_kernel_mapping
 import semantic_evidence_ledger
+import semantic_phase_tables
 import semantic_runtime_marker_mapping
 import semantic_shape_merge
 import semantic_source_mapping
@@ -416,13 +417,107 @@ def run(config_path, trace_path, shape_log_path, out_dir,
     return result
 
 
+def run_stages(config_path, traces, out_dir, capture_setups=None,
+               layer_boundary_maps=None, **kwargs):
+    """Run one Semantics 1.2 pass per stage, publish one combined table.
+
+    The official capture writes prefill and decode to separate rank-0 files
+    and only the prefill file carries DecoderLayer module spans, so the two
+    stages cannot share a run: they need different traces, different capture
+    setups (the probe must aim at each stage's own representative layers, which
+    differ) and, for decode, a transferred layer boundary.
+
+    They should still produce ONE deliverable. Each stage keeps its complete
+    audit set under ``stages/<phase>/`` and ``out_dir`` holds the single
+    combined prefill+decode table.
+    """
+    traces = list(traces)
+    capture_setups = list(capture_setups or [])
+    layer_boundary_maps = list(layer_boundary_maps or [])
+    capture_setups += [""] * (len(traces) - len(capture_setups))
+    layer_boundary_maps += [""] * (len(traces) - len(layer_boundary_maps))
+
+    # A capture belongs to exactly one stage: its probe aimed at that stage's
+    # representative layers. Handing every stage the whole list would bind one
+    # stage's shapes onto another's rows, so pair them positionally and refuse
+    # anything ambiguous rather than guess.
+    capture_results = list(kwargs.pop("capture_result_paths", None) or [])
+    if capture_results and len(capture_results) != len(traces):
+        raise ValueError(
+            "multi-stage run got %d --capture-result for %d --trace: pass one "
+            "per stage in the same order, or analyse the stages one at a time"
+            % (len(capture_results), len(traces)))
+    per_stage_results = (
+        [[path] for path in capture_results] if capture_results
+        else [[] for _ in traces])
+
+    stage_results = []
+    stage_paths = []
+    used_labels = set()
+    for index, trace_path in enumerate(traces):
+        label = semantic_kernel_mapping._stage_label(trace_path, None, index)
+        if label in used_labels:
+            raise ValueError(
+                "two stage traces resolve to the same label %r; each stage "
+                "needs its own output directory" % label)
+        used_labels.add(label)
+        stage_result = run(
+            config_path, trace_path, kwargs.get("shape_log_path", ""),
+            os.path.join(out_dir, "stages", label),
+            capture_setup_path=capture_setups[index],
+            layer_boundary_map=layer_boundary_maps[index],
+            capture_result_paths=per_stage_results[index],
+            **{key: value for key, value in kwargs.items()
+               if key != "shape_log_path"})
+        stage_result["stage"] = label
+        stage_results.append(stage_result)
+        stage_paths.append(
+            (label, stage_result["published_semantic_table_json"]))
+
+    combined = semantic_phase_tables.combine(
+        stage_paths,
+        os.path.join(out_dir, "pattern_layer_kernel_table.json"),
+        os.path.join(out_dir, "ORDERED_UNIQUE_LAYER_TABLES.md"),
+        kind="1_2")
+    result = {
+        "schema_version": 1,
+        "pipeline": "geak_semantics_1_2",
+        "status": (
+            "pass" if all(item["status"] == "pass" for item in stage_results)
+            else "fail"),
+        "stages": stage_results,
+        # Per stage, because they genuinely differ: a prefill Clean Trace has
+        # its own module spans, a decode one only has a transferred boundary.
+        "boundary_evidence": {
+            item["stage"]: item["boundary_evidence"]
+            for item in stage_results},
+        "table_phases": combined["table_phases"],
+        "published_semantic_table_json": combined["semantic_table_json"],
+        "published_semantic_table_md": combined["semantic_table_md"],
+        "row_count": combined["row_count"],
+    }
+    result_path = os.path.join(out_dir, "SEMANTICS_1_2_RUN.json")
+    result["result_json"] = result_path
+    with open(result_path, "w") as fh:
+        json.dump(result, fh, indent=2)
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--config-key", default="")
-    parser.add_argument("--trace", required=True)
+    parser.add_argument(
+        "--trace", required=True, action="append",
+        help=("rank-0 Clean Trace stage file. Repeat once per stage "
+              "(prefill and decode are separate files) to publish both "
+              "phases as one combined table."))
     parser.add_argument("--shape-log", default="")
-    parser.add_argument("--capture-setup", default="")
+    parser.add_argument(
+        "--capture-setup", action="append",
+        help=("shape-capture setup. Repeat to pair one with each --trace, in "
+              "the same order: each stage's probe must aim at that stage's "
+              "own representative layers, which differ between phases."))
     parser.add_argument("--capture-result", action="append", default=[])
     parser.add_argument("--runtime-source", action="append", default=[])
     parser.add_argument("--structural-patterns", required=True)
@@ -445,23 +540,43 @@ def main():
               "whenever two-trace mapping is active: it is checked field by "
               "field against the mapping run and the run fails on mismatch."))
     parser.add_argument(
-        "--layer-boundary-map", default="",
+        "--layer-boundary-map", action="append",
         help=("DECODE_BOUNDARY_TRANSFER.json from "
               "semantic_decode_boundary_transfer, supplying layer boundaries "
               "for a CUDA-graph-replayed stage that emits no module span of "
               "its own. Required to run a decode Clean Trace through 1.2; "
-              "boundaries only, timing stays this trace's own."))
+              "boundaries only, timing stays this trace's own. Repeat to "
+              "pair one with each --trace, in the same order; pass an empty "
+              "string for a stage that needs none."))
     parser.add_argument("--result-json", default="")
     args = parser.parse_args()
-    result = run(
-        args.config, args.trace, args.shape_log, args.out_dir,
-        args.config_key, args.runtime_source,
-        args.capture_setup, capture_result_paths=args.capture_result,
+
+    def _pad(values):
+        values = list(values or [])
+        return values + [""] * (len(args.trace) - len(values))
+
+    capture_setups = _pad(args.capture_setup)
+    boundary_maps = _pad(args.layer_boundary_map)
+    shared = dict(
+        config_key=args.config_key,
+        runtime_sources=args.runtime_source,
+        capture_result_paths=args.capture_result,
         structural_patterns_path=args.structural_patterns,
         mapping_traces=args.mapping_trace,
         formal_workload_path=args.formal_workload,
         mapping_setup_path=args.mapping_setup,
-        layer_boundary_map=args.layer_boundary_map)
+    )
+    if len(args.trace) == 1:
+        result = run(
+            args.config, args.trace[0], args.shape_log, args.out_dir,
+            capture_setup_path=capture_setups[0],
+            layer_boundary_map=boundary_maps[0], **shared)
+    else:
+        result = run_stages(
+            args.config, args.trace, args.out_dir,
+            capture_setups=capture_setups,
+            layer_boundary_maps=boundary_maps,
+            shape_log_path=args.shape_log, **shared)
     if args.result_json:
         with open(args.result_json, "w") as fh:
             json.dump(result, fh, indent=2)

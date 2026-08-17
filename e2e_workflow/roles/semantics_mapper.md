@@ -54,19 +54,31 @@ Phase 1.2 additionally receives `STRUCTURAL_PATTERNS_JSON`, `SEMANTIC_TABLE_JSON
      --out "$EVAL_DIR/profile/round_${ROUND}/semantics/STRUCTURAL_LAYER_PATTERNS.json"
 
    python3 "$SKILL_DIR/scripts/semantic_kernel_mapping.py" \
-     --trace "<analysis_rank_trace>" \
+     --trace "<rank0 EXTEND stage trace>" --table-phases prefill --layer-boundary-map "" \
+     --trace "<rank0 DECODE stage trace>" --table-phases decode \
+     --layer-boundary-map "<DECODE_BOUNDARY_TRANSFER.json>" \
      --patterns "$EVAL_DIR/profile/round_${ROUND}/semantics/STRUCTURAL_LAYER_PATTERNS.json" \
      --out-dir "$EVAL_DIR/profile/round_${ROUND}/semantics" \
-     --table-phases all \
      --result-json "$EVAL_DIR/profile/round_${ROUND}/semantics/semantics_result.json"
    ```
 
    Never call `structural_pattern_mapping.py` from this role. There is no fixed-dialect or
    config-only fallback.
 
+   **One output directory per model, one published table.** `profile_by_stage=True` — which
+   the official benchmark hard-codes — writes prefill and decode to *separate* rank-0 files,
+   so each stage must be analysed by its own pass: only the prefill file carries DecoderLayer
+   module spans, and only the decode file needs `--layer-boundary-map`. Repeat `--trace` once
+   per stage and pair `--table-phases` / `--layer-boundary-map` with it positionally. Each
+   stage keeps its full audit set under `stages/<phase>/`; `--out-dir` itself holds the single
+   combined table. Never publish the stages as two sibling output trees — the stage split is
+   an artifact of the capture, not something a reader of the deliverable should have to
+   reassemble.
+
    Phase-1 presentation contract includes both phases in execution order:
-   **Prefill tables first, then Decode tables**. Keep `--table-phases all`;
-   the deterministic script owns this ordering.
+   **Prefill tables first, then Decode tables**. The deterministic script owns this ordering;
+   `--table-phases all` on a single stage file can only ever emit that file's own phase, so
+   read `quality.phase_coverage.missing_phases` rather than assuming "all" meant both.
 
 5. Read `semantic_mapping_quality.json` and return its real status:
    - `pass`: structural coverage, measured phases, representative-layer integrity, and conservation
@@ -83,6 +95,12 @@ This phase is opt-in and remains non-gating.
 2. Validate `SHAPE_CAPTURE_SETUP` supplies the current container/image setup, model, official
    benchmark, port, TP, and optional reversible deploy/sweep scripts. Create a new attempt directory;
    never overwrite a previous shape log.
+   **One setup per stage.** A stage's probe aims at that stage's representative layers, and
+   those differ between phases — a Pattern's prefill medoid is routinely not its decode medoid.
+   Give `run_semantics_1_2.py` one `--trace`, one `--capture-setup` and one
+   `--layer-boundary-map` per stage, in the same order; it runs each stage into
+   `stages/<phase>/` and publishes one combined table. Reusing a prefill capture for decode
+   leaves `missing_marker_buckets` non-empty and the decode table fails its coverage gate.
 3. Run one Shape-only replay with `PROFILE=0`, rank 0, metadata-only logging, stdout disabled, and at
    most one matching forward per selected bucket. Prefer exact Clean Trace buckets; capture Decode
    during graph-capture/warmup eager execution before considering an enforce-eager probe.
