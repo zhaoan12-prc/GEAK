@@ -290,6 +290,18 @@ def merge(clean_table_path, probe_table_paths, out_dir):
         code = item["reason_code"]
         unavailable_reason_counts[code] = (
             unavailable_reason_counts.get(code, 0) + 1)
+    # Rows whose op is a kernel but whose dims are the enclosing decoder
+    # layer's. Carried up from the per-phase merge so the combined deliverable
+    # states the gap too -- this is the file a reader checks.
+    coarse_rows = semantic_shape_merge._coarse_shape_rows(audits)
+    coarse_shape_fallback = {
+        "status": "clean" if not coarse_rows else "degraded",
+        "count": len(coarse_rows),
+        "remedy": (
+            "add the launching callable to callable_targets in the capture "
+            "setup so the probe records its own operands"),
+        "rows": coarse_rows,
+    }
     coverage = {
         "schema_version": 1,
         "status": "pass" if classified else "fail",
@@ -308,6 +320,7 @@ def merge(clean_table_path, probe_table_paths, out_dir):
         "shape_scope_counts": shape_scope_counts,
         "probe_origin_counts": probe_origin_counts,
         "unavailable_reason_counts": unavailable_reason_counts,
+        "coarse_shape_fallback": coarse_shape_fallback,
         "probe_tables": [
             os.path.abspath(path) for path in probe_table_paths],
         "unavailable": unavailable,
@@ -322,6 +335,7 @@ def merge(clean_table_path, probe_table_paths, out_dir):
             "evidence_counts": counts,
             "row_count": len(audits),
             "unexplained_u_count": len(unexplained),
+            "coarse_shape_fallback": coarse_shape_fallback,
         }, fh, indent=2)
     return {
         "status": coverage["status"],
@@ -331,6 +345,7 @@ def merge(clean_table_path, probe_table_paths, out_dir):
         "coverage_manifest": coverage_out,
         "shape_type_verification_json": verification_out,
         "evidence_counts": counts,
+        "coarse_shape_fallback_count": len(coarse_rows),
     }
 
 

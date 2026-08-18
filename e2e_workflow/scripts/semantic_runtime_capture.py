@@ -24,6 +24,13 @@ _PATCHED_CALLABLES = set()
 # target -> inspect.Signature of the wrapped launcher, or None when it has no
 # introspectable signature (many native/JIT callables do not).
 _CALLABLE_SIGNATURES = {}
+# target -> every "<module>.<attr>" binding this probe actually rebound. A launcher
+# imported with ``from X import f`` lives in the *caller's* namespace too, and
+# patching only X leaves that alias pointing at the original -- a probe that
+# reports success and captures nothing. Recording the holders makes the
+# difference between "wrapped" and "wrapped everywhere it is reachable"
+# auditable instead of assumed.
+_PATCHED_HOLDERS = {}
 
 
 def _positional_names(target, args):
@@ -490,6 +497,16 @@ def _resolve_target(target):
     return holder, parts[-1], getattr(holder, parts[-1])
 
 
+def attr_path_of(target):
+    """The attribute part of a probe target: ``m:f`` -> ``f``, ``m:C.f`` -> ``C.f``."""
+    return target.partition(":")[2]
+
+
+def probe_install_report():
+    """target -> list of namespaces rebound, for post-run verification."""
+    return {key: list(value) for key, value in _PATCHED_HOLDERS.items()}
+
+
 def _install_callable_probes():
     logger = get_logger()
     for target in _callable_targets():
@@ -525,9 +542,36 @@ def _install_callable_probes():
             pass
 
         setattr(module, attr_name, wrapped)
+        holders = ["%s.%s" % (
+            getattr(module, "__name__", str(module)), attr_name)]
+
+        # ``module:Class.attr`` and ``torch.ops.<ns>:<op>`` are resolved
+        # dynamically at every call, so patching the one holder is complete.
+        # A bare ``module:function`` is not: ``from module import function``
+        # copies the object into the importing module's namespace, and that
+        # copy is what the call site actually looks up. Rebind every namespace
+        # still pointing at the original so the probe cannot silently miss the
+        # only call site that matters.
+        if "." not in attr_path_of(target) and inspect.ismodule(module):
+            for other in list(sys.modules.values()):
+                if other is None or other is module:
+                    continue
+                try:
+                    if getattr(other, attr_name, None) is original:
+                        setattr(other, attr_name, wrapped)
+                        holders.append("%s.%s" % (
+                            getattr(other, "__name__", str(other)),
+                            attr_name))
+                except Exception:
+                    # A module that raises on attribute access (lazy loaders,
+                    # partially-initialised packages) must not abort the sweep.
+                    continue
+
         _PATCHED_CALLABLES.add(target)
+        _PATCHED_HOLDERS[target] = holders
         sys.stderr.write(
-            "[GEAK_SEMANTICS] targeted launcher wrapped %s\n" % target)
+            "[GEAK_SEMANTICS] targeted launcher wrapped %s via %d binding(s): "
+            "%s\n" % (target, len(holders), ", ".join(holders)))
 
 
 def _register_hooks(model):

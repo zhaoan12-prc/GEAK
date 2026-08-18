@@ -488,25 +488,76 @@ def _axis(value, role, source):
     return {"axis_role": role, "value": int(value), "source": source}
 
 
+# The two workload knobs a captured dimension may be a function of, and the
+# axis role each one implies.
+DYNAMIC_KNOB_ROLES = {"input_tokens": "token", "batch_size": "batch"}
+
+
+def _axis_resolver(table, group, exact_bucket=None):
+    """Return ``logger dim -> (clean dim, axis_role, source)`` for dimensions a
+    dynamic knob explains, and nothing for every other dimension.
+
+    Substituting a captured dimension with the clean-trace value is only sound
+    when that dimension traces back to exactly one knob. Two situations destroy
+    that, and both are dropped here rather than guessed:
+
+    * a knob of 0 or 1 is not a fingerprint -- it matches every empty or
+      singleton axis in the tensor, none of which scale with it. Under prefill
+      (``batch_size=1, input_tokens=8192``) the old union test read a leading
+      ``1`` as dynamic and rewrote it to 8192, turning ``[1,8192,8,128]`` into
+      ``[8192,8192,8,128]``;
+    * two knobs sharing a value cannot be told apart from the dimension alone.
+
+    What survives is substituted like for like: a dimension matched on
+    ``batch_size`` gets the clean bucket's ``batch_size``, never its
+    ``input_tokens``.
+    """
+    if exact_bucket is None:
+        exact_bucket = _bucket_status(table, group) == "exact"
+    source = "shape_logger" if exact_bucket else "clean_trace_step"
+    clean = table.get("selected_bucket") or {}
+    by_value = {}
+    for knob, role in DYNAMIC_KNOB_ROLES.items():
+        logger = group.get(knob)
+        target = clean.get(knob)
+        if not logger or logger <= 1 or not target:
+            continue
+        by_value.setdefault(logger, []).append((target, role))
+    resolved = {}
+    for logger, matches in by_value.items():
+        if len(matches) == 1:
+            target, role = matches[0]
+            resolved[logger] = (target, role, source)
+    return resolved
+
+
+def _resolved_axes(dims, resolver, enabled=True):
+    """Label every dimension, not just the first one.
+
+    Only testing axis 0 left a token axis sitting anywhere else -- ``positions``
+    is ``[3, 8192]`` -- marked ``unresolved``.
+    """
+    axes = []
+    for value in dims:
+        match = resolver.get(value) if enabled else None
+        if match is None:
+            axes.append(_axis(value, "unresolved", "shape_logger"))
+        else:
+            axes.append(_axis(match[0], match[1], match[2]))
+    return axes
+
+
 def _tensor_schema(group, row, table, exact_bucket):
     tensors = []
     trace_dims = row.get("shape", {}).get("input_dims") or []
-    clean_bucket = table.get("selected_bucket") or {}
-    clean_dynamic = (
-        clean_bucket.get("input_tokens")
-        or clean_bucket.get("batch_size"))
-    logger_dynamic = {
-        group.get("input_tokens"), group.get("batch_size")}
+    resolver = _axis_resolver(table, group, exact_bucket)
     for tensor in group["tensors"]:
         item = dict(tensor)
-        item["axes"] = [
-            _axis(value, "unresolved", "shape_logger")
-            for value in tensor["shape"]]
-        if (item["io"] in ("input", "output") and item["axes"]
-                and item["shape"][0] in logger_dynamic and clean_dynamic):
-            item["axes"][0] = _axis(
-                clean_dynamic, "token_or_batch",
-                "shape_logger" if exact_bucket else "clean_trace_step")
+        # Weights do not scale with the workload, so a weight dimension that
+        # happens to equal a knob is a coincidence, not a dynamic axis.
+        item["axes"] = _resolved_axes(
+            tensor["shape"], resolver,
+            enabled=item["io"] in ("input", "output"))
         item["effective_shape"] = [
             axis["value"] for axis in item["axes"]]
         tensors.append(item)
@@ -522,14 +573,22 @@ def _tensor_schema(group, row, table, exact_bucket):
         if k_log == wk_log:
             m_value = inputs[0]["axes"][0]["value"]
             m_source = inputs[0]["axes"][0]["source"]
+            m_role = inputs[0]["axes"][0]["axis_role"]
             if (not exact_bucket and trace_dims and
                     isinstance(trace_dims[0], list) and
                     len(trace_dims[0]) == 2 and trace_dims[0][1] == k_log):
                 m_value = trace_dims[0][0]
                 m_source = "clean_trace"
+                m_role = "unresolved"
             linear = {
                 "interface": "A[M,K] x W[N,K] -> O[M,N]",
-                "M": _axis(m_value, "token_or_batch", m_source),
+                # M is the gemm's dynamic dimension either way; the role says
+                # which knob drives it when the axis resolver could tell, and
+                # falls back to the un-attributed statement when it could not.
+                "M": _axis(
+                    m_value,
+                    "token_or_batch" if m_role == "unresolved" else m_role,
+                    m_source),
                 "K": _axis(k_log, "reduction", "weight_metadata"),
                 "N": _axis(n_log, "output", "weight_metadata"),
                 "validated": (
@@ -553,16 +612,12 @@ def _layer_tensor(tensor, table, group):
         return None
     value = dict(tensor)
     value["logger_shape"] = list(tensor.get("shape") or [])
-    value["effective_shape"] = list(value["logger_shape"])
-    clean = table.get("selected_bucket") or {}
-    dynamic = clean.get("input_tokens") or clean.get("batch_size")
-    if (value["effective_shape"] and dynamic
-            and value["effective_shape"][0] in {
-                group.get("input_tokens"), group.get("batch_size")}):
-        value["effective_shape"][0] = dynamic
-        value["axis_0_source"] = (
-            "shape_logger" if _bucket_status(table, group) == "exact"
-            else "clean_trace_step")
+    # Same resolver as _tensor_schema. This used to be a second, subtly
+    # different copy of the axis-0 rewrite, so the two could disagree about the
+    # same dimension.
+    value["axes"] = _resolved_axes(
+        value["logger_shape"], _axis_resolver(table, group))
+    value["effective_shape"] = [axis["value"] for axis in value["axes"]]
     return value
 
 
@@ -982,6 +1037,14 @@ def _shape_text(row):
         # column; probe_scope is the op's and stays in the evidence record.
         scope = evidence.get("shape_scope") or evidence.get(
             "probe_scope", "wrapper")
+        # Name that wrapper. "P(wrapper)" beside a specific launcher in the
+        # operator column reads as if the dims were the launcher's own
+        # operands; "P(wrapper: model.layers.30)" says out loud that they are
+        # the whole decoder layer's, which is what the reader has to know
+        # before using the numbers.
+        wrapper_path = evidence.get("wrapper_op_path")
+        if scope == "wrapper" and wrapper_path:
+            scope = "wrapper: %s" % wrapper_path
         return _semantic_shape_text("P(%s)" % scope, values)
     if level == "P":
         # Attribution without shape: the Python stack names the launching call
@@ -1277,6 +1340,42 @@ def _two_trace_evidence(entry, table):
         "source_evidence": [],
         "schema": _two_trace_schema(entry),
     }
+
+
+# A wrapper path ending in a bare decoder-layer index, e.g. "model.layers.30".
+# Dimensions attributed to one of these are the entire layer's, not a kernel's.
+BARE_LAYER_RE = re.compile(r"(?:^|\.)layers\.\d+$")
+
+
+def _coarse_shape_rows(audits):
+    """Rows whose op resolved to a kernel but whose dims fall back to the whole
+    enclosing decoder layer.
+
+    This is the signature of a launcher the capture stage never probed: a free
+    function or bound method issues the kernel, no nn.Module hook covers the
+    call, so the innermost marker in scope is the layer itself. Such a row
+    still looks complete -- real kernel, real operator, real numbers -- which
+    is precisely why it has to be named here instead of left for the next
+    reader to catch by eye. Adding the launching callable to
+    ``callable_targets`` in the capture setup is what clears it.
+    """
+    rows = []
+    for audit in audits:
+        evidence = audit.get("evidence") or {}
+        wrapper_path = evidence.get("wrapper_op_path") or ""
+        if (evidence.get("probe_scope") != "kernel"
+                or evidence.get("shape_scope") != "wrapper"
+                or not BARE_LAYER_RE.search(wrapper_path)):
+            continue
+        item = {
+            key: audit.get(key) for key in (
+                "phase", "pattern_id", "representative_layer_id",
+                "pos", "row_id", "kernel")}
+        item["wrapper_op_path"] = wrapper_path
+        item["parent_operator"] = evidence.get("contained_by")
+        item["shape_source"] = evidence.get("shape_source")
+        rows.append(item)
+    return rows
 
 
 def merge(table_path, capture_plan_path, shape_log_path, out_dir,
@@ -1639,6 +1738,7 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir,
         and not audit["evidence"].get("reason_code")]
     classification_complete = (
         sum(counts.values()) == len(audits) and not unexplained)
+    coarse_rows = _coarse_shape_rows(audits)
     verification = {
         "schema_version": 1,
         "status": "pass" if unchanged else "fail",
@@ -1649,6 +1749,18 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir,
         "row_count": len(audits),
         "shape_log_group_count": len(groups),
         "two_trace_mapping": two_trace_stats,
+        # Not folded into `status`: a kernel whose launcher has no probe is a
+        # real gap in resolution but not a broken run, and failing the merge
+        # would block the very table that documents the gap. It is reported
+        # loudly, with the rows named, so it cannot pass unnoticed either.
+        "coarse_shape_fallback": {
+            "status": "clean" if not coarse_rows else "degraded",
+            "count": len(coarse_rows),
+            "remedy": (
+                "add the launching callable to callable_targets in the "
+                "capture setup so the probe records its own operands"),
+            "rows": coarse_rows,
+        },
         "representative_table_checks": table_checks,
     }
     with open(verify_out, "w") as fh:
@@ -1684,6 +1796,7 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir,
             count for level, count in counts.items() if level != "U"),
         "unavailable": unavailable,
         "unavailable_reason_counts": unavailable_reason_counts,
+        "coarse_shape_fallback_count": len(coarse_rows),
     }
     with open(coverage_out, "w") as fh:
         json.dump(coverage, fh, indent=2)
@@ -1694,6 +1807,7 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir,
         "kernel_semantic_evidence_jsonl": audit_out,
         "shape_type_verification_json": verify_out,
         "op_coverage_manifest": coverage_out,
+        "coarse_shape_fallback_count": len(coarse_rows),
     }
 
 

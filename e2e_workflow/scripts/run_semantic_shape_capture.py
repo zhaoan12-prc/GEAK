@@ -173,6 +173,30 @@ def _required_phases(plan):
     })
 
 
+def _fired_callable_targets(shape_log):
+    """target -> record count, from the probe's ``<parent>::launcher:<target>``
+    op_path. Counts what actually executed, not what was requested."""
+    counts = {}
+    if not shape_log or not os.path.exists(shape_log):
+        return counts
+    with open(shape_log) as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if record.get("op_type") != "targeted_python_launcher":
+                continue
+            _, separator, target = str(
+                record.get("op_path") or "").partition("::launcher:")
+            if separator and target:
+                counts[target] = counts.get(target, 0) + 1
+    return counts
+
+
 def capture(setup_path, capture_plan_path, out_dir,
             disable_cuda_graph=False, phases=None,
             forwards_per_bucket=1):
@@ -290,6 +314,23 @@ bash %s
         raise RuntimeError(
             "GEAK runtime capture produced no profiler trace: %s" %
             benchmark_log)
+    # A launcher probe that wrapped the defining module but never fired is the
+    # one failure this stage cannot afford to pass silently: the run "succeeds",
+    # every targeted row quietly falls back to its enclosing module's shapes,
+    # and the deliverable reports whole-layer tensors as if they were the
+    # kernel's operands. Declaring a target is therefore a claim that it
+    # executed, and an unfired target fails the stage.
+    fired = _fired_callable_targets(shape_log)
+    declared = list(setup.get("callable_targets", []))
+    silent = [target for target in declared if not fired.get(target)]
+    if silent:
+        raise RuntimeError(
+            "GEAK callable probes wrapped but never fired: %s. The launcher is "
+            "reachable under a different binding (``from module import name`` "
+            "copies it into the caller's namespace), was not called for the "
+            "captured layers/phases, or the target name is wrong. Check "
+            "'targeted launcher wrapped ... via N binding(s)' in %s."
+            % (", ".join(silent), benchmark_log))
     result = {
         "schema_version": 1,
         "status": "pass",
@@ -300,6 +341,9 @@ bash %s
         "container": container,
         "representative_layers": layers,
         "callable_targets": list(setup.get("callable_targets", [])),
+        # Per-target execution counts, so a later reader can tell a probe that
+        # ran once from one that ran on every layer without re-parsing the log.
+        "callable_targets_fired": fired,
         "callable_kernel_map": list(
             setup.get("callable_kernel_map", [])),
         "source_wrapper_map": list(
