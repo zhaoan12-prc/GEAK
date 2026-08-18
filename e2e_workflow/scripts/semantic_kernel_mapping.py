@@ -178,6 +178,7 @@ def _module_layer_scopes(events, spans, pattern_doc):
     pattern_by_layer = _pattern_index(pattern_doc)
     span_starts = [span[0] for span in spans]
     candidates = []
+    orphans = []
     for raw_index, event in enumerate(events):
         if not isinstance(event, dict) or event.get("cat") != "python_function":
             continue
@@ -186,17 +187,47 @@ def _module_layer_scopes(events, spans, pattern_doc):
         if not match or event.get("ts") is None or event.get("dur") is None:
             continue
         step = _step_at(event["ts"], spans, span_starts)
-        if step is None:
-            continue
-        candidates.append({
+        candidate = {
             "name": name,
             "class_local_id": int(match.group(1)),
             "ts": event["ts"],
             "end": event["ts"] + event["dur"],
             "event_index": raw_index,
-            "step_id": step[5],
-            "phase": _phase_name(step[2]),
-        })
+            "step_id": step[5] if step else None,
+            "phase": _phase_name(step[2]) if step else "",
+        }
+        if step is None:
+            orphans.append(candidate)
+            continue
+        candidates.append(candidate)
+    # A graph-off replay runs the CPU far ahead of the GPU, so its DecoderLayer
+    # spans close before the `step[...]` annotation they belong to even opens
+    # and `_step_at` rejects nearly all of them. What survives is not a pass, so
+    # `full_passes` is 0, every span is dropped, and the trace looks span-less:
+    # the partition then falls back to a repeated sequence medoid, a guess whose
+    # layer windows are rotated against the real boundaries. When the in-step
+    # spans cannot form a single pass but the trace does carry a whole number of
+    # passes once the out-of-step ones are counted, use them all: execution
+    # order alone determines the partition, and the type check below still has
+    # to agree with the configured Pattern chain. Guarded to that case, so a
+    # Clean Trace whose spans do sit inside the step window is untouched.
+    if orphans and len(candidates) // expected_count == 0 and (
+            (len(candidates) + len(orphans)) % expected_count == 0):
+        fallback_step = (
+            candidates[0]["step_id"] if candidates
+            else spans[0][5] if spans else "graph_off_replay")
+        fallback_phase = (
+            candidates[0]["phase"] if candidates
+            else _phase_name(spans[0][2]) if spans else "")
+        merged = candidates + orphans
+        candidates = []
+        for item in merged:
+            item = dict(item)
+            item["step_id"] = fallback_step
+            item["phase"] = fallback_phase
+            item["step_window"] = "graph_off_replay_outside_step_annotation"
+            candidates.append(item)
+
     by_step = {}
     for candidate in candidates:
         by_step.setdefault(candidate["step_id"], []).append(candidate)
@@ -1011,10 +1042,20 @@ def _module_guided_segments(
         if not positions:
             continue
         start = min(core_positions or positions)
-        prefix = core_prefixes.get(pattern_id) or []
-        if (prefix and start > 0
-                and runs[start - 1]["stage"] == prefix[-1]):
-            start -= 1
+        # A segment begins at the first run this layer's own module span owns.
+        # It used to be extended one run backwards whenever the run before it
+        # matched the Pattern's learned core prefix, which pulls a launch the
+        # span does not own into the layer -- in practice the fused
+        # collective that closes the previous layer. That contradicts the
+        # launch-site rule the rest of the mapping is built on, and it made
+        # this partition disagree by exactly one run with the transferred
+        # boundary, which is derived from span ownership: the same kernel then
+        # sat at the head of layer N here and at the tail of layer N-1 there,
+        # so two-trace mapping could not bind the row at either edge.
+        # Convention, stated once and applied on both sides: launches that fall
+        # between two DecoderLayer spans are the *preceding* layer's trailing
+        # work. Nothing here keys on an operator, collective or kernel name --
+        # only on which span owns the launch and on run order.
         candidates.append({
             "pass_index": pass_index,
             "layer_id": layer_id,
