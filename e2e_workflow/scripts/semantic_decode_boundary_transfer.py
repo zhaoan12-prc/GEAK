@@ -21,13 +21,14 @@ reported.
 """
 import argparse
 import bisect
-import difflib
+import collections
 import hashlib
 import json
 import os
 
 import parse_profile
 import semantic_kernel_mapping
+import semantic_two_trace_mapping
 
 
 def _sha256(path):
@@ -113,9 +114,18 @@ def _donor_rows(trace_path, expected_count):
             continue
         args = event.get("args") or {}
         parent = by_ext.get(args.get("External id"))
-        # The launch site decides the layer, so prefer the CPU op's timestamp;
-        # the device timestamp is only a fallback for an unparented launch.
-        anchor = parent["ts"] if parent else event.get("ts")
+        # The launch site decides the layer, so the anchor is the CPU op's
+        # timestamp and nothing else.  A device timestamp is not a fallback
+        # here: this donor is a graph-off replay, where the CPU runs far ahead
+        # of the GPU, so an unparented launch's device timestamp lands wherever
+        # the CPU had got to by then -- in practice inside one of the last
+        # layers' spans.  That hands the tail layers rows from the whole step
+        # and makes the per-layer first-row index non-monotonic, which the cut
+        # loop below then turns into empty layers.  An unparented launch simply
+        # carries no launch-site evidence; leave it unowned instead of
+        # attributing it by a clock comparison that means nothing across this
+        # CPU/GPU skew.  It still takes part in the alignment below.
+        anchor = parent["ts"] if parent else None
         scope = None
         if anchor is not None and scopes:
             position = bisect.bisect_right(starts, anchor) - 1
@@ -153,14 +163,16 @@ def _transfer(donor_rows, recipient_rows, expected_layers):
     """
     donor_keys = [_key(row) for row in donor_rows]
     recipient_keys = [_key(row) for row in recipient_rows]
-    matcher = difflib.SequenceMatcher(
-        None, donor_keys, recipient_keys, autojunk=False)
-
+    # A decode step's kernel stream is one short pattern repeated once per
+    # layer.  difflib's greedy longest-block recursion is not reliable on that:
+    # it can anchor on a *shifted* copy of the period and leave a whole layer
+    # unmatched on both sides, which strands that layer's cut.  The
+    # order-preserving LCS with an offset stabiliser that two-trace op mapping
+    # already uses does not have that failure mode, so share it.
+    pairs, _ = semantic_two_trace_mapping.stable_lcs(
+        donor_keys, recipient_keys)
     # donor index -> recipient index, for positions the alignment agreed on.
-    aligned = {}
-    for donor_start, recipient_start, size in matcher.get_matching_blocks():
-        for offset in range(size):
-            aligned[donor_start + offset] = recipient_start + offset
+    aligned = dict(pairs)
     aligned_donor_indices = sorted(aligned)
 
     donor_starts = {}
@@ -179,8 +191,22 @@ def _transfer(donor_rows, recipient_rows, expected_layers):
             cut_basis.append("absent_in_donor")
             continue
         position = bisect.bisect_left(aligned_donor_indices, donor_index)
+        # Translate the layer start from the *nearest* aligned row, preserving
+        # its donor-side distance.  Taking the next aligned row's recipient
+        # index outright moves the cut forward by however many rows happened to
+        # be unmatched in between, which lengthens the layer before it and can
+        # squeeze the layer after it down to nothing.
+        candidates = []
         if position < len(aligned_donor_indices):
-            cuts.append(aligned[aligned_donor_indices[position]])
+            after = aligned_donor_indices[position]
+            gap = after - donor_index
+            candidates.append((gap, aligned[after] - gap))
+        if position:
+            before = aligned_donor_indices[position - 1]
+            gap = donor_index - before
+            candidates.append((gap, aligned[before] + gap))
+        if candidates:
+            cuts.append(max(0, min(total, min(candidates)[1])))
             cut_basis.append("aligned_kernel_sequence")
         else:
             cuts.append(None)
@@ -244,6 +270,20 @@ def _checks(recipient_rows, assigned, expected_layers):
         left <= right for left, right in zip(sequence, sequence[1:]))
     distinct = sorted(set(sequence))
     contiguous = distinct == list(range(len(distinct)))
+    # Completeness is not plausibility.  Forcing the cuts strictly increasing
+    # guarantees every layer owns at least one row, so a mis-placed cut shows up
+    # not as a missing layer but as a one-row layer next to an enormous one --
+    # and the checks above all still pass.  Compare each layer against the
+    # median width so that shape cannot be reported as a clean transfer.
+    counts = collections.Counter(sequence)
+    widths = [counts.get(layer_id, 0) for layer_id in range(expected_layers)]
+    populated = sorted(width for width in widths if width)
+    median = populated[len(populated) // 2] if populated else 0
+    floor = max(1, median // 4)
+    ceiling = 4 * median if median else 0
+    degenerate = [
+        layer_id for layer_id, width in enumerate(widths)
+        if width < floor or (ceiling and width > ceiling)]
     return {
         "monotonic_layer_order": monotonic,
         "distinct_layers": len(distinct),
@@ -255,6 +295,10 @@ def _checks(recipient_rows, assigned, expected_layers):
         "assigned_fraction": (
             round(len(assigned) / float(len(recipient_rows)), 6)
             if recipient_rows else 0.0),
+        "median_layer_width": median,
+        "implausible_layer_widths": [
+            {"layer_id": layer_id, "width": widths[layer_id]}
+            for layer_id in degenerate],
     }
 
 
@@ -309,6 +353,14 @@ def transfer(donor_trace, recipient_trace, pattern_path, out_path,
                 "(minimum %.1f%%)"
                 % (100 * checks["assigned_fraction"],
                    100 * min_assigned_fraction))
+        if checks["implausible_layer_widths"]:
+            failures.append(
+                "layer widths %s are implausible against a median of %d "
+                "device rows; the cuts are complete but mis-placed"
+                % (", ".join(
+                    "L%d=%d" % (item["layer_id"], item["width"])
+                    for item in checks["implausible_layer_widths"]),
+                   checks["median_layer_width"]))
 
     document = {
         "schema_version": 1,

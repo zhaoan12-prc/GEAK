@@ -185,24 +185,25 @@ def _gap_pairs(formal_rows, mapping_rows, anchors, preferred_delta=None):
     return extra
 
 
-def align_rows(formal_rows, mapping_rows):
-    """Bind formal rows to mapping rows by name + ordered position.
+def stable_lcs(left_keys, right_keys):
+    """Order-preserving alignment of two key streams -> (pairs, delta).
 
     The first pass is the plain backtrack.  Its dominant offset then aims a
     re-run, which can only move pairs onto that offset and never shorten the
     alignment, so repeating it until the result stops changing settles on the
-    alignment whose pairs agree with each other.  Without this a mapping layer
-    instance that starts with extra kernels binds its first repeated name to the
-    wrong occurrence and leaves one row out of step with the whole table.
+    alignment whose pairs agree with each other.  Without this a layer instance
+    that starts with extra kernels binds its first repeated name to the wrong
+    occurrence and leaves one row out of step with the whole table.
+
+    Shared with the decode boundary transfer, whose donor and recipient streams
+    have the same shape: one short kernel pattern repeated once per layer.
     """
-    formal_keys = [str(row.get("raw_name") or "") for row in formal_rows]
-    mapping_keys = [str(row.get("raw_name") or "") for row in mapping_rows]
-    anchors = _lcs_pairs(formal_keys, mapping_keys)
+    anchors = _lcs_pairs(left_keys, right_keys)
     preferred_delta = _delta_mode(anchors)
     for _ in range(MAX_REALIGN_PASSES):
         if preferred_delta is None:
             break
-        retry = _lcs_pairs(formal_keys, mapping_keys, preferred_delta)
+        retry = _lcs_pairs(left_keys, right_keys, preferred_delta)
         # The DP guard makes a shorter retry impossible; refuse it anyway rather
         # than trade matched rows for a tidier offset.
         if retry == anchors or len(retry) < len(anchors):
@@ -212,6 +213,14 @@ def align_rows(formal_rows, mapping_rows):
         if next_delta == preferred_delta:
             break
         preferred_delta = next_delta
+    return anchors, preferred_delta
+
+
+def align_rows(formal_rows, mapping_rows):
+    """Bind formal rows to mapping rows by name + ordered position."""
+    formal_keys = [str(row.get("raw_name") or "") for row in formal_rows]
+    mapping_keys = [str(row.get("raw_name") or "") for row in mapping_rows]
+    anchors, preferred_delta = stable_lcs(formal_keys, mapping_keys)
     matches = {i: (j, "exact") for i, j in anchors}
     for i, j in _gap_pairs(formal_rows, mapping_rows, anchors, preferred_delta):
         matches.setdefault(i, (j, "normalized"))
