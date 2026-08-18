@@ -165,6 +165,19 @@ def merge(clean_table_path, probe_table_paths, out_dir):
                     "source": "clean_trace_external_id",
                     "evidence_origin": "trace_input_dims",
                 }
+                # A K row keeps the Clean Trace's own dims, but the operator's
+                # parameter names are a property of the operator, not of which
+                # shape evidence won. They are resolved during the probe merge,
+                # so carry them across rather than leaving a preserved row to
+                # fall back to arg0/arg1.
+                if not selected.get("source_parameter_names"):
+                    for _, rows_by_id in probe_rows:
+                        names = (rows_by_id.get(row["row_id"]) or {}).get(
+                            "source_parameter_names")
+                        if names:
+                            selected["source_parameter_names"] = copy.deepcopy(
+                                names)
+                            break
             else:
                 candidates = []
                 unavailable_attempts = []

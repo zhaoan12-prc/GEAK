@@ -620,6 +620,8 @@ _OPERATOR_ROLE_MAPS = (
     ("::gt", ("x", "other")),
     ("::fill_", ("dst",)),
     ("::mm", ("x", "weight")),
+    ("::bmm", ("x", "other")),
+    ("::neg", ("x",)),
     ("grouped_topk", (
         "logits", "bias", "topk_weights", "topk_ids")),
     ("fmoe", (
@@ -628,6 +630,42 @@ _OPERATOR_ROLE_MAPS = (
         "x_scale", "w13_scale", "w2_scale")),
     ("_index_put_impl_", ("cache", "indices", "x")),
     ("::arange", ("start", "end", "step", "y")),
+    # AITER MoE ops take their destination buffers as *leading* positional
+    # arguments, so the direction cannot be read off the position and a role
+    # name alone would put them in the wrong column. Each entry below was
+    # checked argument by argument against the recorded dtypes and extents in
+    # this run's traces, and carries the destination indices explicitly.
+    # Both shape paths index by *declared parameter position*: `Input Dims`
+    # keeps an empty slot for a scalar argument and the probe records
+    # `args[<n>]`, so these tuples list every parameter, scalars included, in
+    # signature order. Naming a scalar slot costs nothing -- it is skipped when
+    # rendered -- and keeps the tensor positions honest.
+    # aiter/ops/moe_op.py::topk_softmax
+    ("topk_softmax", (
+        "topk_weights", "topk_ids", "token_expert_indices", "logits",
+        "need_renorm", "num_shared_experts", "shared_expert_scoring_func"),
+     (0, 1, 2)),
+    # aiter/ops/moe_sorting.py::moe_sorting_fwd
+    ("moe_sorting_fwd", (
+        "topk_ids", "topk_weights", "sorted_token_ids", "sorted_weights",
+        "sorted_expert_ids", "num_valid_ids", "moe_buf", "num_experts",
+        "unit_size", "local_expert_mask", "num_local_tokens",
+        "dispatch_policy"),
+     (2, 3, 4, 5, 6)),
+    # aiter/ops/moe_op.py::ck_moe_stage1
+    ("ck_moe_stage1", (
+        "x", "w13", "w2", "sorted_token_ids", "sorted_expert_ids",
+        "num_valid_ids", "y", "topk", "kernelName", "w13_scale", "x_scale",
+        "block_m", "sorted_weights", "quant_type", "activation", "splitk",
+        "use_non_temporal_load", "dst_type"),
+     (6,)),
+    # aiter/ops/moe_op.py::ck_moe_stage2
+    ("ck_moe_stage2", (
+        "x", "w13", "w2", "sorted_token_ids", "sorted_expert_ids",
+        "num_valid_ids", "y", "topk", "kernelName", "w2_scale", "x_scale",
+        "block_m", "sorted_weights", "quant_type", "activation", "splitk",
+        "use_non_temporal_load", "dst_type", "is_shuffled"),
+     (6,)),
 )
 
 
@@ -637,14 +675,27 @@ def _operator_roles(row):
     None means "no calling-convention knowledge". Callers must not invent an
     input/output split in that case.
     """
+    roles, _ = _operator_convention(row)
+    return roles
+
+
+def _operator_convention(row):
+    """(roles, destination indices) for this row's operator, or (None, ()).
+
+    An entry may declare which positional arguments the operator *writes*.
+    That is calling-convention evidence, not a guess from the role name, and it
+    is what lets an out-param passed as argument 0 be reported as an output
+    without any role name having to imply direction.
+    """
     op = str(
         (row.get("parent_operator") or {}).get("canonical_op", "")).lower()
     if not op:
-        return None
-    for token, roles in _OPERATOR_ROLE_MAPS:
+        return None, ()
+    for entry in _OPERATOR_ROLE_MAPS:
+        token, roles = entry[0], entry[1]
         if token in op:
-            return roles
-    return None
+            return roles, (entry[2] if len(entry) > 2 else ())
+    return None, ()
 
 
 def _trace_role(row, index):
@@ -752,9 +803,69 @@ def _schema_declares_io(tensors):
         for tensor in tensors)
 
 
-def _positional_role(tensor, index):
+def _row_operator_symbol(row):
+    """The source symbol this row's operator is named after, if any.
+
+    Trace operator names are `aiter::moe_sorting_fwd`, a bare
+    `ChunkGatedDeltaRuleFunction`, or a `path.py(123): symbol` launch site --
+    all of which end in the symbol defined in the runtime source, which is what
+    `_operator_symbol` already extracts.
+    """
+    op = str((row.get("parent_operator") or {}).get("canonical_op") or "")
+    if not op or op == "unresolved":
+        return ""
+    return _operator_symbol(op)
+
+
+def _attach_source_parameter_names(row, parameter_symbols):
+    """Record this row's operator parameter names read from runtime source.
+
+    Names only. The source says what argument 3 is *called*, not whether the
+    operator writes to it, so this never sets a direction -- an entry in
+    `_OPERATOR_ROLE_MAPS` remains the only thing that can.
+    """
+    if not parameter_symbols:
+        return
+    entry = parameter_symbols.get(_row_operator_symbol(row))
+    if not entry or not entry.get("parameters"):
+        return
+    # Recorded on the row, not inside `shape`: the merge replaces a row's whole
+    # shape dict when it rebinds one (two-trace dims, probe dims), which would
+    # drop this with it.
+    row["source_parameter_names"] = {
+        "parameters": list(entry["parameters"]),
+        "source": entry.get("source"),
+        "line": entry.get("line"),
+        "evidence": "runtime_source_signature",
+    }
+
+
+def _source_parameter_role(row, index):
+    """Parameter name at this argument position, from the runtime source."""
+    names = (row.get("source_parameter_names") or {}).get("parameters") or []
+    return names[index] if index < len(names) else ""
+
+
+def _positional_role(tensor, index, row=None):
     """Name an argument without claiming to know its direction."""
+    if row is not None:
+        source_name = _source_parameter_role(row, index)
+        if source_name:
+            return source_name
     return _path_name(tensor) or "arg%d" % index
+
+
+def _argument_index(tensor, fallback):
+    """The argument position this tensor actually occupies.
+
+    A probe's tensor list can be a subset of the call's arguments, so its list
+    position is not the argument position. ``arg_name`` records the real one
+    (``args[6]``); an operator role table is indexed by that, never by where
+    the tensor happened to land in the list.
+    """
+    match = re.search(
+        r"args\[(\d+)\]$", str(tensor.get("arg_name") or ""))
+    return int(match.group(1)) if match else fallback
 
 
 def _semantic_shape_text(prefix, tensors):
@@ -791,17 +902,28 @@ def _shape_text(row):
         types = shape.get("input_types") or []
         # `Input Dims` is a positional argument list, not an input list. Only a
         # known calling convention can say which entries are destinations.
-        known = _operator_roles(row) is not None
+        roles, destinations = _operator_convention(row)
+        known = roles is not None
         tensors = []
         for index, dim in enumerate(dims):
             if not isinstance(dim, list) or not dim:
                 continue
             role = (_trace_role(row, index) if known
-                    else "arg%d" % index)
+                    else _source_parameter_role(row, index) or "arg%d" % index)
             dtype = types[index] if index < len(types) else "Tensor"
-            tensors.append((role, "%s=%s[%s]" % (
+            text = "%s=%s[%s]" % (
                 role, _dtype_label(dtype),
-                "×".join(str(value) for value in dim))))
+                "×".join(str(value) for value in dim))
+            if destinations:
+                tensors.append((role, text, index in destinations))
+            elif known:
+                tensors.append((role, text))
+            else:
+                # Named from source, or not named at all. Either way no
+                # direction is known, so state none: without this an argument
+                # the source happens to call `scale` would be moved into the
+                # output column by the role-name heuristic alone.
+                tensors.append((role, text, False))
         return _semantic_shape_text("K", tensors)
     schema = shape.get("logger_schema") or {}
     tensors = schema.get("tensors") or []
@@ -817,7 +939,8 @@ def _shape_text(row):
         #                     known, so the K-path operator roles apply
         #   otherwise      -> name positionally and claim no direction
         schema_io = _schema_declares_io(tensors)
-        operator_known = _operator_roles(row) is not None
+        operator_roles, operator_destinations = _operator_convention(row)
+        operator_known = operator_roles is not None
         for index, tensor in enumerate(tensors[:12]):
             dims = tensor.get("effective_shape") or tensor.get("shape") or []
             if layer_wrapper:
@@ -825,9 +948,10 @@ def _shape_text(row):
             elif schema_io:
                 role = _probe_role(row, tensor, index, output_index)
             elif operator_known:
-                role = _trace_role(row, index)
+                role = _trace_role(row, _argument_index(tensor, index))
             else:
-                role = _positional_role(tensor, index)
+                role = _positional_role(
+                    tensor, _argument_index(tensor, index), row)
             tensor_is_output = (
                 str(tensor.get("io") or "").lower() == "output")
             if tensor_is_output:
@@ -835,10 +959,19 @@ def _shape_text(row):
             entry = (role, "%s=%s[%s]" % (
                 role, _dtype_label(tensor.get("dtype")),
                 "×".join(str(value) for value in dims)))
-            # layer_wrapper and schema_io rows have a recorded direction; the
-            # other two resolvers do not, so they fall back to the role name.
+            # layer_wrapper and schema_io rows have a recorded direction. An
+            # operator whose entry declares its destinations has the direction
+            # from its calling convention, which outranks a positional guess
+            # for exactly the ops that pass an out-param first. Anything else
+            # falls back to the role name.
             if layer_wrapper or schema_io:
                 entry += (tensor_is_output,)
+            elif operator_known and operator_destinations:
+                entry += (
+                    _argument_index(tensor, index) in operator_destinations,)
+            elif not operator_known:
+                # Source-derived or positional name: no direction evidence.
+                entry += (False,)
             values.append(entry)
         if len(tensors) > 12:
             values.append((
@@ -1150,6 +1283,9 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir,
           two_trace_map_path=""):
     table_doc = _load(table_path)
     capture_plan = _load(capture_plan_path)
+    parameter_symbols = (
+        (capture_plan.get("operator_parameter_index") or {}).get("symbols")
+        or {})
     two_trace_entries = {}
     if two_trace_map_path:
         two_trace_entries = (
@@ -1410,6 +1546,11 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir,
                         "reason": reason,
                     }
             row["semantic_evidence"] = evidence
+            # After attribution, not before: two-trace mapping transplants the
+            # operator for exactly the rows a graph-replayed stage could not
+            # resolve, so the symbol to look up does not exist yet at the top
+            # of this loop.
+            _attach_source_parameter_names(row, parameter_symbols)
             audits.append({
                 "phase": table["phase"],
                 "pattern_id": table["pattern_id"],

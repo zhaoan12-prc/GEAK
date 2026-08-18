@@ -8,6 +8,7 @@ import unittest
 SCRIPTS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SCRIPTS)
 import semantic_shape_merge as merge
+import semantic_source_mapping as source_mapping
 
 
 class SemanticShapeMergeTest(unittest.TestCase):
@@ -373,7 +374,7 @@ class ArgumentDirectionEvidenceTest(unittest.TestCase):
         # not fabricate an output section.
         row = {
             "stage": "moe",
-            "parent_operator": {"canonical_op": "aiter::moe_sorting_fwd"},
+            "parent_operator": {"canonical_op": "aiter::some_unmapped_moe_op"},
             "semantic_evidence": {"level": "P", "probe_scope": "wrapper"},
             "shape": {"logger_schema": {"tensors": [
                 {"io": "input", "arg_name": "args[0]",
@@ -427,7 +428,7 @@ class ArgumentDirectionEvidenceTest(unittest.TestCase):
     def test_clean_trace_unknown_operator_also_claims_no_direction(self):
         row = {
             "stage": "moe",
-            "parent_operator": {"canonical_op": "aiter::ck_moe_stage1"},
+            "parent_operator": {"canonical_op": "aiter::some_unmapped_moe_op"},
             "semantic_evidence": {"level": "K"},
             "shape": {
                 "input_types": ["c10::BFloat16", "float"],
@@ -439,5 +440,152 @@ class ArgumentDirectionEvidenceTest(unittest.TestCase):
         self.assertNotIn("<br><br>", text)
 
 
+class DeclaredDestinationTest(unittest.TestCase):
+    """An operator entry may declare which arguments it writes.
+
+    That is calling-convention evidence, so it is allowed to place an argument
+    in the output column even though the profiler recorded every positional
+    argument as io="input". It is the only thing that can: the AITER MoE ops
+    take their destination buffers first, so position says nothing and a role
+    name would only be a guess.
+    """
+
+    def test_topk_softmax_leading_out_params_are_outputs(self):
+        # aiter topk_softmax(topk_weights, topk_indices, token_expert_indices,
+        # gating_output): the first three are written, the last is read.
+        row = {
+            "stage": "topk",
+            "parent_operator": {"canonical_op": "aiter::topk_softmax"},
+            "semantic_evidence": {"level": "K"},
+            "shape": {
+                "input_types": ["float", "int", "int", "c10::BFloat16"],
+                "input_dims": [[4, 10], [4, 10], [4, 10], [4, 512]],
+            },
+        }
+        inputs, outputs = merge._shape_text(row).split("<br><br>")
+        self.assertIn("logits=BF16[4×512]", inputs)
+        self.assertIn("topk_weights=FP32[4×10]", outputs)
+        self.assertIn("topk_ids=INT32[4×10]", outputs)
+        self.assertNotIn("BF16[4×512]", outputs)
+
+    def test_moe_sorting_reads_topk_ids_despite_the_role_name(self):
+        # `topk_ids` reads like an output and _is_output_role treats it as one,
+        # but moe_sorting_fwd *consumes* it. The declared destinations must
+        # keep it on the input side.
+        row = {
+            "stage": "moe",
+            "parent_operator": {"canonical_op": "aiter::moe_sorting_fwd"},
+            "semantic_evidence": {"level": "K"},
+            "shape": {
+                "input_types": ["int", "float", "int", "float", "int", "int",
+                                "c10::BFloat16"],
+                "input_dims": [[4, 11], [4, 11], [8241], [8241], [516], [2],
+                               [4, 4096]],
+            },
+        }
+        inputs, outputs = merge._shape_text(row).split("<br><br>")
+        self.assertIn("topk_ids=INT32[4×11]", inputs)
+        self.assertIn("topk_weights=FP32[4×11]", inputs)
+        self.assertIn("moe_buf=BF16[4×4096]", outputs)
+        self.assertIn("sorted_token_ids=INT32[8241]", outputs)
+
+    def test_probe_rows_use_declared_destinations_too(self):
+        # Same operator reached through the probe path, where every tensor is
+        # labelled io="input" because Input Dims cannot mark an out-param.
+        row = {
+            "stage": "moe",
+            "parent_operator": {"canonical_op": "aiter::ck_moe_stage2"},
+            "semantic_evidence": {"level": "P", "probe_scope": "kernel"},
+            "shape": {"logger_schema": {"tensors": [
+                {"io": "input", "arg_name": "args[0]",
+                 "dtype": "float8_e4m3fnuz", "shape": [4, 11, 128]},
+                {"io": "input", "arg_name": "args[6]",
+                 "dtype": "bfloat16", "shape": [4, 4096]},
+            ]}},
+        }
+        text = merge._shape_text(row)
+        self.assertEqual(
+            text, "P(kernel): x=FP8[4×11×128]<br><br>y=BF16[4×4096]")
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class SourceParameterNameTest(unittest.TestCase):
+    """Argument names may be read from the runtime source.
+
+    aiter wraps every `@compile_ops` entry point in a `(*args, **kwargs)` guard
+    with no `__wrapped__`, and an autograd Function's `apply` is a builtin, so
+    the probe cannot recover parameter names at runtime for either. The `def`
+    in the source still carries them, and that is a recorded calling
+    convention, not a guess.
+    """
+
+    def _row(self, canonical_op, parameters, dims, types):
+        row = {
+            "stage": "moe",
+            "parent_operator": {"canonical_op": canonical_op},
+            "semantic_evidence": {"level": "K"},
+            "shape": {"input_types": types, "input_dims": dims},
+        }
+        merge._attach_source_parameter_names(
+            row, {"some_unmapped_launcher": {
+                "parameters": parameters, "source": "/x.py", "line": 1}})
+        return row
+
+    def test_source_names_replace_positional_labels(self):
+        row = self._row(
+            "aiter::some_unmapped_launcher", ["query", "key", "sink"],
+            [[4, 128], [4, 128], [4]], ["c10::BFloat16", "c10::BFloat16", "int"])
+        self.assertEqual(
+            merge._shape_text(row),
+            "K: query=BF16[4×128]<br>key=BF16[4×128]<br>sink=INT32[4]")
+
+    def test_source_names_claim_no_direction(self):
+        # `scale` is in the output-role list, but a source parameter name is
+        # evidence of naming only. Nothing may be moved to the output column.
+        row = self._row(
+            "aiter::some_unmapped_launcher", ["q", "scale"],
+            [[4, 128], [4]], ["c10::BFloat16", "float"])
+        text = merge._shape_text(row)
+        self.assertNotIn("<br><br>", text)
+        self.assertEqual(text, "K: q=BF16[4×128]<br>scale=FP32[4]")
+
+    def test_unknown_symbol_stays_positional(self):
+        row = self._row(
+            "aiter::a_different_launcher", ["query", "key"],
+            [[4, 128], [4, 128]], ["c10::BFloat16", "c10::BFloat16"])
+        self.assertEqual(
+            merge._shape_text(row),
+            "K: arg0=BF16[4×128]<br>arg1=BF16[4×128]")
+
+
+class ParameterIndexTest(unittest.TestCase):
+    def _index(self, text):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "runtime.py")
+            with open(path, "w") as fh:
+                fh.write(text)
+            return source_mapping.parameter_index([path])
+
+    def test_reads_a_plain_launcher(self):
+        index = self._index("def launch(x, w, y):\n    return None\n")
+        self.assertEqual(
+            index["symbols"]["launch"]["parameters"], ["x", "w", "y"])
+
+    def test_class_is_indexed_by_its_forward_without_ctx(self):
+        index = self._index(
+            "class GatedFn:\n"
+            "    @staticmethod\n"
+            "    def forward(ctx, q, k, v):\n"
+            "        return q\n")
+        self.assertEqual(
+            index["symbols"]["GatedFn"]["parameters"], ["q", "k", "v"])
+
+    def test_conflicting_definitions_are_dropped(self):
+        index = self._index(
+            "def launch(x, w):\n    return None\n\n"
+            "class Other:\n    def launch(self, a, b, c):\n        return a\n")
+        self.assertNotIn("launch", index["symbols"])
+        self.assertIn("launch", index["ambiguous_symbols"])

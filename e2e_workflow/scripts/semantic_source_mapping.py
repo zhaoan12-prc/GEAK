@@ -77,6 +77,88 @@ def _enclosing(ranges, line):
     return min(values, key=lambda item: item[1] - item[0]) if values else None
 
 
+_SELF_PARAMETERS = ("self", "cls", "ctx")
+
+
+def _positional_parameters(node):
+    """Positional parameter names of a def, minus the receiver.
+
+    ``self``/``cls`` shift a method's arguments by one, and an autograd
+    Function's ``forward`` takes ``ctx`` first while callers reach it through
+    ``apply(*args)`` -- in both cases the recorded argument stream starts at
+    the parameter after the receiver.
+    """
+    arguments = node.args
+    names = [item.arg for item in
+             list(getattr(arguments, "posonlyargs", []) or []) + arguments.args]
+    if names and names[0] in _SELF_PARAMETERS:
+        names = names[1:]
+    return names
+
+
+def parameter_index(paths):
+    """symbol -> positional parameter names, read from the runtime source.
+
+    A launcher's parameter names are the operator's calling convention, and the
+    source is where they survive: aiter wraps every `@compile_ops` entry point
+    in a `(*args, **kwargs)` guard that has no `__wrapped__`, so
+    `inspect.signature` cannot recover them at runtime, and an autograd
+    Function's `apply` is a builtin with no signature at all. The `def` in the
+    file still carries them.
+
+    A class is indexed by its own name too, mapped to its `forward` parameters,
+    because that is what a `Function.apply` row is named after in a trace.
+
+    A symbol defined more than once with *different* parameters is dropped:
+    two candidate conventions is no convention, and naming arguments from the
+    wrong one would be worse than leaving them positional.
+    """
+    index = {}
+    conflicts = set()
+
+    def record(name, names, path, lineno):
+        if not name or not names:
+            return
+        existing = index.get(name)
+        if existing is None:
+            index[name] = {
+                "parameters": names,
+                "source": path,
+                "line": int(lineno),
+            }
+        elif existing["parameters"] != names:
+            conflicts.add(name)
+
+    for path in _source_files(paths):
+        try:
+            with open(path, errors="replace") as fh:
+                tree = ast.parse(fh.read())
+        except (OSError, SyntaxError, ValueError):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                record(node.name, _positional_parameters(node),
+                       path, node.lineno)
+            elif isinstance(node, ast.ClassDef):
+                for child in node.body:
+                    if (isinstance(
+                            child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                            and child.name == "forward"):
+                        record(node.name, _positional_parameters(child),
+                               path, child.lineno)
+                        break
+    for name in conflicts:
+        index.pop(name, None)
+    return {
+        "schema_version": 1,
+        "producer": "semantic_source_mapping.parameter_index",
+        "evidence": "positional parameter names parsed from the runtime source",
+        "sources": _source_files(paths),
+        "ambiguous_symbols": sorted(conflicts),
+        "symbols": index,
+    }
+
+
 def _index(paths):
     index = {}
     for path in _source_files(paths):
@@ -95,6 +177,11 @@ def _index(paths):
 def map_plan(plan_path, runtime_sources, out_path):
     with open(plan_path) as fh:
         plan = json.load(fh)
+    # Carried on the plan so the shape merge can name a row's arguments from
+    # the same runtime source this mapping was built against, instead of
+    # falling back to arg0/arg1 for every operator without a hand-written
+    # entry.
+    plan["operator_parameter_index"] = parameter_index(runtime_sources)
     source_index = _index(runtime_sources)
     for target in plan.get("capture_targets", []):
         evidence = []
