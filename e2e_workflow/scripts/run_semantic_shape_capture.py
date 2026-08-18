@@ -107,6 +107,35 @@ def _rank0_stage_traces(trace_dir):
     return stages
 
 
+_PHASE_STAGE = {
+    "prefill": "EXTEND",
+    "extend": "EXTEND",
+    "decode": "DECODE",
+}
+
+
+def _phase_stage_trace(stages, phases):
+    """Rank-0 stage file for the phase this capture actually probed.
+
+    ``profile_by_stage`` writes one rank-0 file per stage and decode is always
+    written last, so picking the newest file (``_latest_trace``) hands a prefill
+    capture the DECODE window. The marker mapper then looks for prefill kernels
+    in a decode trace, finds none, reports every prefill target as
+    ``absent_from_mapping_replay`` and falls back to the enclosing
+    ``model.layers.N`` wrapper -- so a GEMM row shows the DecoderLayer's own
+    forward I/O instead of the GEMM's operands. Select by phase instead.
+    """
+    wanted = []
+    for phase in phases or []:
+        stage = _PHASE_STAGE.get(str(phase).strip().lower())
+        if stage and stage not in wanted:
+            wanted.append(stage)
+    for stage in wanted:
+        if stages.get(stage):
+            return stages[stage]
+    return ""
+
+
 def _latest_trace(trace_dir):
     candidates = glob.glob(
         os.path.join(trace_dir, "**", "*.trace.json*"), recursive=True)
@@ -248,7 +277,11 @@ bash %s
     finally:
         # Stop only the service started on this replay's dedicated port.
         _stop_service(container, setup["port"])
-    trace = _latest_trace(trace_dir)
+    stage_traces = _rank0_stage_traces(trace_dir)
+    # Phase-matched first; only fall back to "newest" when the phase has no
+    # stage file of its own (single-stage capture, or an unknown phase name).
+    trace = (_phase_stage_trace(stage_traces, phases)
+             or _latest_trace(trace_dir))
     if not os.path.exists(shape_log) or os.path.getsize(shape_log) == 0:
         raise RuntimeError(
             "GEAK runtime capture produced no shape metadata: %s" %
@@ -276,7 +309,10 @@ bash %s
         # Rank-0 per-stage windows of this replay. When the replay ran with
         # disable_cuda_graph, these are exactly the graph-off "mapping" traces
         # that two-trace op mapping consumes.
-        "rank0_stage_traces": _rank0_stage_traces(trace_dir),
+        "rank0_stage_traces": stage_traces,
+        "capture_trace_stage": next(
+            (stage for stage, path in stage_traces.items() if path == trace),
+            ""),
         "benchmark_log": benchmark_log,
         "elapsed_seconds": round(time.time() - started, 3),
     }
