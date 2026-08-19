@@ -1,3 +1,4 @@
+import inspect
 import json
 import os
 import sys
@@ -610,6 +611,65 @@ class StructurallyForeignRepresentativeTest(unittest.TestCase):
              "stages": ["gemm", "moe", "norm", "topk"],
              **self._anchors(2)},
         ]
+
+    def test_guided_segments_accept_transferred_module_span_evidence(self):
+        """A transferred boundary must reach the module-guided partition.
+
+        A CUDA-graph-replayed decode stage has no module span of its own, so
+        `_apply_boundary_map` stamps its rows with
+        `python_module_span_transferred_graph_off` from a workload-identical
+        graph-off run. The caller's unlock gate accepts that with a
+        `startswith("python_module_span")` test; if this function matched only
+        the exact `python_module_span_external_id` string it would find nothing,
+        return [], and the step would silently fall through to template
+        alignment -- which merges layers at the head and starves the tail while
+        still being reported as module-derived.
+        """
+        patterns = {
+            0: {"pattern_id": "P_DENSE"},
+            1: {"pattern_id": "P_MOE"},
+        }
+        stages = ["norm", "gemm", "attn", "norm", "gemm", "moe"]
+        step_rows = []
+        for index, stage in enumerate(stages):
+            layer_id = 0 if index < 3 else 1
+            step_rows.append({
+                "row_id": "event-%d" % index,
+                "device_seq_index": index,
+                "stage": stage,
+                "layer_id": layer_id,
+                "layer_instance_id": "step-1:pass-0:layer-%d" % layer_id,
+                "layer_evidence": "python_module_span_transferred_graph_off",
+            })
+        runs = mapping._stage_runs(step_rows)
+        segments = mapping._module_guided_segments(
+            step_rows, runs, patterns, {}, {}, 2)
+
+        self.assertTrue(
+            segments,
+            "transferred module-span evidence must produce guided segments; "
+            "an empty result silently degrades decode to template alignment")
+        self.assertEqual([item["layer_id"] for item in segments], [0, 1])
+        self.assertEqual([item["pattern_id"] for item in segments],
+                         ["P_DENSE", "P_MOE"])
+        # the segments must partition every run exactly once, in order
+        self.assertEqual(segments[0]["start"], 0)
+        self.assertEqual(segments[-1]["end"], len(runs))
+        for earlier, later in zip(segments, segments[1:]):
+            self.assertEqual(earlier["end"], later["start"])
+
+    def test_fallback_alignment_is_not_reported_as_module_derived(self):
+        """Template alignment must not borrow the module-span method name.
+
+        Labelling the fallback `module_span_sequence_medoid` just because module
+        instances exist is what let a dropped boundary map look like a
+        module-derived partition in the published artifact.
+        """
+        source = inspect.getsource(
+            mapping._stage_sequence_partition)
+        fallback = source.split("_bootstrap_missing_templates", 1)[1]
+        self.assertNotIn("\"module_span_sequence_medoid\"", fallback)
+        self.assertIn("forced_best_alignment", fallback)
 
     def test_boundary_layer_is_excluded_and_reported(self):
         selected = mapping._representatives(

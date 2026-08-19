@@ -1021,8 +1021,18 @@ def _module_guided_segments(
     groups = {}
     for row in step_rows:
         instance_id = row.get("layer_instance_id")
-        if (instance_id and
-                row.get("layer_evidence") == "python_module_span_external_id"):
+        # Accept every module-span-derived evidence, not just this trace's own
+        # `python_module_span_external_id`. A CUDA-graph-replayed stage carries
+        # `python_module_span_transferred_graph_off`, stamped by
+        # _apply_boundary_map from a workload-identical graph-off run -- still a
+        # module span, just recorded in the other trace. The caller's unlock
+        # gate already counts it with the same `startswith` test, so matching
+        # only the exact `_external_id` string here left the gate open while
+        # this function found nothing: the transferred boundaries were dropped
+        # and the step silently fell through to template alignment, which
+        # merges layers at the head and starves the tail.
+        if (instance_id and str(row.get("layer_evidence") or "").startswith(
+                "python_module_span")):
             groups.setdefault(instance_id, []).append(row)
     candidates = []
     for instance_id, group in groups.items():
@@ -1187,10 +1197,14 @@ def _stage_sequence_partition(rows, pattern_doc):
             cuts = _refine_cuts_with_stable_transition_context(
                 runs, cuts, chain)
         stability = _transition_stability(cuts, runs, chain)
+        # Reaching here means _module_guided_segments did NOT produce the
+        # partition -- these cuts come from template alignment. Naming that
+        # `module_span_sequence_medoid` just because module instances exist
+        # would present a fallback as module-derived evidence and hide the
+        # degradation, which is exactly how a dropped boundary map stayed
+        # invisible. Report what actually ran.
         method = (
-            "module_span_sequence_medoid"
-            if len(module_instances) >= layer_count
-            else "repeated_sequence_medoid"
+            "repeated_sequence_medoid"
             if mean_ratio >= 0.45 and stability >= 0.5
             else "forced_best_alignment")
         for row in step_rows:
