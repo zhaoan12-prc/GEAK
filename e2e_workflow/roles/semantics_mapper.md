@@ -42,27 +42,25 @@ Phase 1.2 additionally receives `STRUCTURAL_PATTERNS_JSON`, `SEMANTIC_TABLE_JSON
      `structural_signature`, sorted `layer_ids`, identical `representative_candidates`, config
      evidence entries (`config_path`, exact `value`, `claim`), and runtime source citations
      (`path`, `line_start`, `line_end`, `symbol`, `claim`).
-4. Create `$EVAL_DIR/profile/round_${ROUND}/semantics/` and validate the Agent artifact.
-   Deterministic code may validate evidence, schema, identical-signature merging, mutual exclusion,
-   and full coverage; it must never invent or reclassify a Pattern:
+4. Create `$EVAL_DIR/profile/round_${ROUND}/semantics/`, then hand the completed Agent artifact to
+   the deterministic harness. This is the **only command for this phase**: do not invoke its component
+   scripts separately, repeatedly inspect unchanged artifacts, or start another analysis loop after it
+   returns. Deterministic code may validate evidence, schema, identical-signature merging, mutual
+   exclusion, and full coverage; it must never invent or reclassify a Pattern:
 
    ```bash
-   python3 "$SKILL_DIR/scripts/validate_structural_patterns.py" \
-     --input "$EVAL_DIR/profile/round_${ROUND}/semantics/STRUCTURAL_LAYER_PATTERNS.agent.json" \
+   python3 "$SKILL_DIR/scripts/semantic_mapping_harness.py" build-table \
+     --patterns "$EVAL_DIR/profile/round_${ROUND}/semantics/STRUCTURAL_LAYER_PATTERNS.agent.json" \
      --config "$MODEL_PATH/config.json" \
      --runtime-source "<current imported runtime source>" \
-     --out "$EVAL_DIR/profile/round_${ROUND}/semantics/STRUCTURAL_LAYER_PATTERNS.json"
-
-   python3 "$SKILL_DIR/scripts/semantic_kernel_mapping.py" \
      --trace "<analysis_rank_trace>" \
-     --patterns "$EVAL_DIR/profile/round_${ROUND}/semantics/STRUCTURAL_LAYER_PATTERNS.json" \
      --out-dir "$EVAL_DIR/profile/round_${ROUND}/semantics" \
      --table-phases all \
      --result-json "$EVAL_DIR/profile/round_${ROUND}/semantics/semantics_result.json"
    ```
 
-   Never call `structural_pattern_mapping.py` from this role. There is no fixed-dialect or
-   config-only fallback.
+   There is no fixed-dialect or config-only Pattern fallback. The former development-only Pattern
+   generator was removed; do not recreate a parallel path around the Agent artifact plus validator.
 
    Phase-1 presentation contract includes both phases in execution order:
    **Prefill tables first, then Decode tables**. Keep `--table-phases all`;
@@ -81,24 +79,28 @@ This phase is opt-in and remains non-gating.
 1. Read `SHAPE_CAPTURE_PLAN_JSON`; its representative layers and selected buckets are the only
    allowed layer/bucket filters. Never copy filters from a historical run.
 2. Validate `SHAPE_CAPTURE_SETUP` supplies the current container/image setup, model, official
-   benchmark, port, TP, and optional reversible deploy/sweep scripts. Create a new attempt directory;
-   never overwrite a previous shape log.
-3. Run one Shape-only replay with `PROFILE=0`, rank 0, metadata-only logging, stdout disabled, and at
-   most one matching forward per selected bucket. Prefer exact Clean Trace buckets; capture Decode
-   during graph-capture/warmup eager execution before considering an enforce-eager probe.
+   benchmark, port, TP, and optional reversible deploy/sweep scripts. The deterministic harness creates
+   a new attempt directory and must never overwrite a previous shape log.
+3. The harness runs one Shape-only replay with `PROFILE=0`, rank 0 metadata-only logging and at most one
+   matching forward per selected bucket. It MUST NOT generate a second profiler trace: the baseline
+   Clean Trace remains the only timing/kernel-order source. Prefer exact Clean Trace buckets; capture
+   Decode during graph-capture/warmup eager execution before considering an enforce-eager probe. Do not
+   launch or supervise the replay manually from the Agent. During a long model load, read
+   `capture/CAPTURE_PROGRESS.json` at most once per external status poll; do not start a duplicate replay.
 4. Filter at the logging source to representative layers and unresolved/candidate OPs plus their
    necessary parent wrappers. Do not record Tensor values or synchronize the device.
 5. Inspect the actual imported runtime source for every unresolved target. Populate candidate
    `op_path`, wrapper, terminal launcher, source file/line, and mapping cardinality before merging.
    A wrapper launching multiple internal Kernels is `contained_kernel`, not multiple fabricated exact
    OPs. Native AITER GEMM may use wrapper input plus real weight/scale metadata for a P-context M/K/N.
-6. Run:
+6. Run exactly one deterministic command for replay plus completion. Do not run its capture or merge
+   components separately, and do not re-run source discovery or Clean Trace mapping in this phase:
 
    ```bash
-   python3 "$SKILL_DIR/scripts/semantic_shape_merge.py" \
+   python3 "$SKILL_DIR/scripts/semantic_mapping_harness.py" capture-complete \
      --table "$SEMANTIC_TABLE_JSON" \
      --capture-plan "$SHAPE_CAPTURE_PLAN_JSON" \
-     --shape-log "<new shape log>" \
+     --setup "$SHAPE_CAPTURE_SETUP" \
      --out-dir "$EVAL_DIR/profile/round_${ROUND}/semantics_1_2" \
      --result-json "$EVAL_DIR/profile/round_${ROUND}/semantics_1_2/shape_merge_result.json"
    ```

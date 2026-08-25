@@ -48,6 +48,19 @@ class RunSemanticShapeCaptureTest(unittest.TestCase):
         self.assertIn("pkill -TERM", command)
         self.assertIn("pkill -KILL", command)
 
+    def test_progress_write_is_atomic_and_replaces_stage(self):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "progress.json")
+            capture._write_progress(path, "running", count=1)
+            capture._write_progress(path, "complete", count=2)
+            with open(path) as fh:
+                result = json.load(fh)
+            self.assertEqual(result["stage"], "complete")
+            self.assertEqual(result["count"], 2)
+            self.assertFalse(os.path.exists(path + ".tmp"))
+
 
 if __name__ == "__main__":
     unittest.main()

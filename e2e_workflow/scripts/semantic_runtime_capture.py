@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""GEAK Semantics 1.2 runtime metadata and profiler-marker injection.
+"""GEAK Semantics runtime metadata capture.
 
 This module is copied into the serving runtime and installed after ModelRunner
-loads the model.  It records metadata only and wraps each selected module call
-in a profiler record_function marker so launched kernels can be proven to be
-contained by the wrapper that supplied the Shape.
+loads the model. It records representative-layer OP interface metadata. Optional
+record_function markers remain available for debugging, but the normal replay
+does not require torch.profiler; kernel order/timing always comes from the clean
+baseline trace.
 """
 import json
 import functools

@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Launch the real GEAK Semantics 1.2 metadata+marker replay."""
+"""Launch one GEAK Semantics metadata-only replay.
+
+The baseline Clean Trace is the sole source of kernel order and timing.  This
+replay only records representative-layer OP interfaces (shape/dtype/layout), so
+it deliberately does not start torch.profiler or produce a second trace.
+"""
 import argparse
 import base64
-import glob
 import json
 import os
 import subprocess
@@ -84,16 +88,14 @@ if sentinel not in text:
             encoded)
 
 
-def _latest_trace(trace_dir):
-    candidates = glob.glob(
-        os.path.join(trace_dir, "**", "*.trace.json*"), recursive=True)
-    if not candidates:
-        return ""
-    rank_zero = [
-        path for path in candidates if "-TP-0.trace.json" in path]
-    if rank_zero:
-        candidates = rank_zero
-    return max(candidates, key=os.path.getmtime)
+def _write_progress(path, stage, **fields):
+    """Publish coarse progress so the caller never has to infer a stall."""
+    payload = {"stage": stage, "updated_at": time.time()}
+    payload.update(fields)
+    temporary = path + ".tmp"
+    with open(temporary, "w") as fh:
+        json.dump(payload, fh, indent=2)
+    os.replace(temporary, path)
 
 
 def _with_disable_cuda_graph(benchmark_text):
@@ -148,14 +150,14 @@ def capture(setup_path, capture_plan_path, out_dir,
         raise ValueError("capture plan has no representative layers")
 
     os.makedirs(out_dir, exist_ok=True)
-    trace_dir = os.path.join(out_dir, "trace")
-    os.makedirs(trace_dir, exist_ok=True)
     shape_log = os.path.join(out_dir, "shape.jsonl")
     benchmark_log = os.path.join(out_dir, "benchmark.log")
+    progress_path = os.path.join(out_dir, "CAPTURE_PROGRESS.json")
     for path in (shape_log,):
         if os.path.exists(path):
             os.remove(path)
 
+    _write_progress(progress_path, "preparing_runtime", container=container)
     _stop_service(container, setup["port"])
     _deploy(container, model_runner, runtime_module)
     workload = setup["workload"]
@@ -185,9 +187,8 @@ export GEAK_SEMANTICS_LAYERS=%s
 export GEAK_SEMANTICS_PHASES=%s
 export GEAK_SEMANTICS_FORWARDS_PER_BUCKET=%s
 export GEAK_SEMANTICS_CALLABLE_TARGETS=%s
-export GEAK_SEMANTICS_REQUIRE_PROFILER=1
-export PROFILE=1
-export SGLANG_TORCH_PROFILER_DIR=%s
+export GEAK_SEMANTICS_REQUIRE_PROFILER=0
+export PROFILE=0
 export MODEL=%s
 export TP=%s
 export CONC=%s
@@ -204,31 +205,34 @@ bash %s
 """ % (
         shape_log, ",".join(str(layer) for layer in layers),
         ",".join(phases or []), forwards_per_bucket,
-        ",".join(setup.get("callable_targets", [])), trace_dir,
+        ",".join(setup.get("callable_targets", [])),
         setup["model"], setup["tensor_parallel_size"],
         workload["concurrency"], workload["input_length"],
         workload["output_length"], workload.get("random_range_ratio", 0.8),
         setup["port"], repository, benchmark)
     started = time.time()
     try:
+        _write_progress(
+            progress_path, "running_replay", container=container,
+            phases=list(phases or []), representative_layers=layers)
         with open(benchmark_log, "w") as log:
             _docker(container, command, stdout=log)
     finally:
         # Stop only the service started on this replay's dedicated port.
+        _write_progress(progress_path, "stopping_service", container=container)
         _stop_service(container, setup["port"])
-    trace = _latest_trace(trace_dir)
     if not os.path.exists(shape_log) or os.path.getsize(shape_log) == 0:
+        _write_progress(
+            progress_path, "failed", reason="empty_shape_log",
+            benchmark_log=benchmark_log)
         raise RuntimeError(
             "GEAK runtime capture produced no shape metadata: %s" %
-            benchmark_log)
-    if not trace:
-        raise RuntimeError(
-            "GEAK runtime capture produced no profiler trace: %s" %
             benchmark_log)
     result = {
         "schema_version": 1,
         "status": "pass",
-        "capture_mode": "metadata_plus_runtime_markers",
+        "capture_mode": "metadata_only",
+        "timing_source": "baseline_clean_trace",
         "disable_cuda_graph": bool(disable_cuda_graph),
         "capture_phases": list(phases or []),
         "forwards_per_bucket": int(forwards_per_bucket),
@@ -240,14 +244,17 @@ bash %s
         "source_wrapper_map": list(
             setup.get("source_wrapper_map", [])),
         "shape_log": shape_log,
-        "capture_trace": trace,
         "benchmark_log": benchmark_log,
+        "progress_json": progress_path,
         "elapsed_seconds": round(time.time() - started, 3),
     }
     result_path = os.path.join(out_dir, "CAPTURE_RESULT.json")
     result["result_json"] = result_path
     with open(result_path, "w") as fh:
         json.dump(result, fh, indent=2)
+    _write_progress(
+        progress_path, "complete", result_json=result_path,
+        shape_log=shape_log, elapsed_seconds=result["elapsed_seconds"])
     return result
 
 
