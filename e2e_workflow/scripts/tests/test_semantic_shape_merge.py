@@ -315,5 +315,68 @@ class SemanticShapeMergeTest(unittest.TestCase):
             reason_code, "runtime_copy_without_unique_tensor")
 
 
+class PhaseResolutionGateTest(unittest.TestCase):
+    """B8: a phase the shape log covers must resolve at least one table row.
+
+    The eager probe makes the shape log carry decode records, but the merge
+    attaches them by `parent_operator`.  A table built from a CUDA-graph
+    DECODE trace has `parent_operator: "unresolved"` on every row, so every
+    decode row lands at evidence level U while the merge still reports pass.
+    """
+
+    def _audit(self, phase, level):
+        return {"phase": phase, "evidence": {"level": level}}
+
+    def _groups(self, phases):
+        return [{"rank": 0, "phase": phase, "layer": 3} for phase in phases]
+
+    def test_b8_covered_phase_that_resolves_nothing_fails_the_merge(self):
+        result = merge._phase_resolution(
+            [self._audit("decode", "U"), self._audit("decode", "U"),
+             self._audit("prefill", "A"), self._audit("prefill", "U")],
+            self._groups(["decode", "prefill"]))
+        self.assertEqual(result["status"], "fail")
+        self.assertTrue(result["gating"])
+        by_phase = {row["phase"]: row for row in result["phases"]}
+        self.assertEqual(by_phase["decode"]["status"], "fail")
+        self.assertEqual(by_phase["decode"]["rows"], 2)
+        self.assertEqual(by_phase["decode"]["resolved"], 0)
+        self.assertIn("CUDA-graph", by_phase["decode"]["note"])
+        self.assertEqual(by_phase["prefill"]["status"], "pass")
+        self.assertEqual(by_phase["prefill"]["resolved_fraction"], 0.5)
+
+    def test_b8_partial_resolution_passes(self):
+        result = merge._phase_resolution(
+            [self._audit("decode", "U"), self._audit("decode", "B"),
+             self._audit("prefill", "A")],
+            self._groups(["decode", "prefill"]))
+        self.assertEqual(result["status"], "pass")
+        by_phase = {row["phase"]: row for row in result["phases"]}
+        self.assertEqual(by_phase["decode"]["status"], "pass")
+        self.assertEqual(by_phase["decode"]["resolved"], 1)
+        self.assertIsNone(by_phase["decode"]["note"])
+
+    def test_b8_phase_absent_from_the_shape_log_is_not_gated(self):
+        """A phase the probe never covered has no records to attach; that is
+        a coverage gap the capture reports, not a merge failure."""
+        result = merge._phase_resolution(
+            [self._audit("decode", "U"), self._audit("prefill", "A")],
+            self._groups(["prefill"]))
+        self.assertEqual(result["status"], "pass")
+        by_phase = {row["phase"]: row for row in result["phases"]}
+        self.assertFalse(by_phase["decode"]["shape_log_covers_phase"])
+        self.assertEqual(by_phase["decode"]["status"], "pass")
+        self.assertEqual(result["shape_log_phases"], ["prefill"])
+
+    def test_b8_only_rank_zero_shape_records_define_covered_phases(self):
+        """The shape log is keyed to the probed rank; a non-rank-0 group must
+        not make the gate claim coverage the merge cannot use."""
+        result = merge._phase_resolution(
+            [self._audit("decode", "U")],
+            [{"rank": 3, "phase": "decode", "layer": 3}])
+        self.assertEqual(result["status"], "pass")
+        self.assertEqual(result["shape_log_phases"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

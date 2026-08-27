@@ -684,6 +684,61 @@ def _markdown(table_doc):
     return "\n".join(lines) + "\n"
 
 
+def _phase_resolution(audits, groups):
+    """B8: a phase the shape log covers must resolve at least one row.
+
+    The eager probe (B4) makes the *shape log* carry decode records, but the
+    merge attaches them by `parent_operator`.  A table built from a
+    CUDA-graph DECODE trace has `parent_operator: "unresolved"` on every row
+    -- the CPU replays a captured graph and never walks the module tree --
+    so `_candidate_groups` returns [] for all of them and every decode row
+    lands at evidence level U.  Nothing else in this file notices: the
+    identity checks compare the table against itself and pass.
+
+    The fix at the source is to build the decode table from the *eager*
+    capture trace, which does carry module spans.  This gate is what makes
+    the mistake loud instead of silent: if the shape log has records for a
+    phase and not one row of that phase resolved, the merge fails.
+    """
+    log_phases = set()
+    for group in groups:
+        if group.get("rank") == 0 and group.get("phase"):
+            log_phases.add(str(group["phase"]).lower())
+    per_phase = {}
+    for audit in audits:
+        phase = str(audit.get("phase", "")).lower()
+        entry = per_phase.setdefault(phase, {"rows": 0, "resolved": 0})
+        entry["rows"] += 1
+        if audit["evidence"]["level"] != "U":
+            entry["resolved"] += 1
+    phases = []
+    failed = False
+    for phase in sorted(set(per_phase) | log_phases):
+        entry = per_phase.get(phase, {"rows": 0, "resolved": 0})
+        covered = phase in log_phases
+        bad = covered and entry["rows"] > 0 and entry["resolved"] == 0
+        failed = failed or bad
+        phases.append({
+            "phase": phase,
+            "rows": entry["rows"],
+            "resolved": entry["resolved"],
+            "resolved_fraction": round(
+                entry["resolved"] / entry["rows"], 4) if entry["rows"] else 0.0,
+            "shape_log_covers_phase": covered,
+            "status": "fail" if bad else "pass",
+            "note": (
+                "the shape log carries records for this phase but not one "
+                "table row resolved -- the table was almost certainly built "
+                "from a CUDA-graph trace, whose rows have no parent operator "
+                "to key on; rebuild it from the eager capture trace"
+            ) if bad else None,
+        })
+    return {"status": "fail" if failed else "pass",
+            "gating": True,
+            "shape_log_phases": sorted(log_phases),
+            "phases": phases}
+
+
 def merge(table_path, capture_plan_path, shape_log_path, out_dir):
     table_doc = _load(table_path)
     capture_plan = _load(capture_plan_path)
@@ -885,14 +940,17 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir):
     for audit in audits:
         level = audit["evidence"]["level"]
         counts[level] = counts.get(level, 0) + 1
+    phase_resolution = _phase_resolution(audits, groups)
     verification = {
         "schema_version": 1,
-        "status": "pass" if unchanged else "fail",
+        "status": "pass" if (
+            unchanged and phase_resolution["status"] == "pass") else "fail",
         "clean_trace_identity_unchanged": unchanged,
         "evidence_counts": counts,
         "row_count": len(audits),
         "shape_log_group_count": len(groups),
         "representative_table_checks": table_checks,
+        "phase_resolution": phase_resolution,
     }
     with open(verify_out, "w") as fh:
         json.dump(verification, fh, indent=2)

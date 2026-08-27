@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 
 import semantic_kernel_mapping
 import semantic_evidence_ledger
@@ -13,6 +14,10 @@ import semantic_shape_merge
 import semantic_source_mapping
 import validate_structural_patterns
 import run_semantic_shape_capture
+
+# Both model phases are required by default. See the require_phases block in
+# run() for why this is not an env-var opt-in any more.
+DEFAULT_REQUIRE_PHASES = ("prefill", "decode")
 
 
 def _sha256(path):
@@ -26,7 +31,7 @@ def _sha256(path):
 def run(config_path, trace_path, shape_log_path, out_dir,
         config_key="", runtime_sources=None, capture_setup_path="",
         capture_result_path="", capture_result_paths=None,
-        structural_patterns_path=""):
+        structural_patterns_path="", require_phases=None):
     os.makedirs(out_dir, exist_ok=True)
     runtime_sources = list(runtime_sources or [])
     if not structural_patterns_path:
@@ -57,8 +62,39 @@ def run(config_path, trace_path, shape_log_path, out_dir,
         structural_patterns_input, config_path, runtime_sources,
         patterns_path)
 
+    # trace_path may be a single trace or a list; the mapper auto-adopts the
+    # EXTEND/DECODE phase sibling so a run cannot silently cover one phase.
+    #
+    # Both phases are required BY DEFAULT. This used to read an env var that
+    # defaulted to EMPTY, i.e. "require no phase at all" — so unless a caller
+    # happened to export GEAK_SEMANTICS_REQUIRE_PHASES, a prefill-only capture
+    # sailed through and every downstream fusion decision was made on half the
+    # model's execution. A decode-blind semantic table is not a lighter table,
+    # it is a wrong one: decode is where the small-tensor fusions actually pay.
+    #
+    # GEAK_SEMANTICS_REQUIRE_PHASES may still NARROW the requirement (e.g. a
+    # deliberate prefill-only probe run sets it to "prefill"), but that is now
+    # an explicit, logged act rather than the silent default.
+    if require_phases is None:
+        configured = os.environ.get("GEAK_SEMANTICS_REQUIRE_PHASES")
+        if configured is None:
+            require_phases = list(DEFAULT_REQUIRE_PHASES)
+        else:
+            require_phases = [
+                value.strip() for value in configured.split(",")
+                if value.strip()]
+            narrowed = [
+                phase for phase in DEFAULT_REQUIRE_PHASES
+                if phase not in require_phases]
+            if narrowed:
+                print(
+                    "[semantics] GEAK_SEMANTICS_REQUIRE_PHASES=%r NARROWS the "
+                    "default two-phase requirement; dropping %s. Fusion "
+                    "candidates for the dropped phase(s) will not be "
+                    "trustworthy." % (configured, narrowed),
+                    file=sys.stderr)
     semantic = semantic_kernel_mapping.build(
-        trace_path, patterns_path, out_dir)
+        trace_path, patterns_path, out_dir, require_phases=require_phases)
 
     # --- Layer-boundary evidence gate (module spans) -------------------------
     # semantic_kernel_mapping resolves per-layer boundaries from python_function

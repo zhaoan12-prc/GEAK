@@ -110,10 +110,60 @@ def _stage(name, category):
     return _stage_detail(name, category)[0]
 
 
+_PHASE_TAG_RE = re.compile(
+    r"^(?P<stem>.*-TP-\d+)-(?P<phase>EXTEND|DECODE)(?P<suffix>\.trace\.json.*)$")
+
+
+def _phase_tag(path):
+    """Return the EXTEND/DECODE tag SGLang's profile_by_stage put in the name."""
+    match = _PHASE_TAG_RE.match(os.path.basename(path))
+    return match.group("phase") if match else None
+
+
+def _sibling_phase_traces(path):
+    """Sibling traces of the same rank and profiler session, by phase tag.
+
+    SGLang's `profile_by_stage` writes `<stem>-TP-<rank>-EXTEND.trace.json.gz`
+    and `<stem>-TP-<rank>-DECODE.trace.json.gz` as separate files.  Analysing
+    one and never mentioning the other silently halves phase coverage (B2).
+    """
+    match = _PHASE_TAG_RE.match(os.path.basename(path))
+    if not match:
+        return {}
+    directory = os.path.dirname(os.path.abspath(path))
+    found = {}
+    for phase in ("EXTEND", "DECODE"):
+        candidate = os.path.join(directory, "%s-%s%s" % (
+            match.group("stem"), phase, match.group("suffix")))
+        if os.path.exists(candidate):
+            found[phase] = candidate
+    return found
+
+
 def _load_events(path):
     with _open(path) as fh:
         data = json.load(fh)
     return data.get("traceEvents", data if isinstance(data, list) else [])
+
+
+def _load_events_multi(paths):
+    """Concatenate several phase traces into one temporally ordered stream.
+
+    Phase traces from a single profiler session are timestamp-disjoint and
+    ordered (EXTEND strictly precedes DECODE), so concatenating by first
+    timestamp preserves the real execution order.
+    """
+    streams = []
+    for path in paths:
+        events = _load_events(path)
+        stamps = [event.get("ts") for event in events
+                  if isinstance(event, dict) and event.get("ts") is not None]
+        streams.append((min(stamps) if stamps else 0.0, path, events))
+    streams.sort(key=lambda item: item[0])
+    merged = []
+    for _, _, events in streams:
+        merged.extend(events)
+    return merged
 
 
 def _cpu_evidence(events):
@@ -580,6 +630,163 @@ def _module_pattern_templates(rows):
     return templates, core_templates, core_prefixes, evidence
 
 
+_MOE_MARKER_STAGES = ("moe", "topk")
+_ANCHOR_MIN_BODIES = 2
+_ANCHOR_MAX_GAP_CV = 0.35
+
+
+def _pattern_is_moe(pattern):
+    """True when the structural pattern declares a routed-expert FFN."""
+    ffn = str((pattern or {}).get("ffn_type", "")).lower()
+    return "moe" in ffn or "expert" in ffn
+
+
+def _required_stages(pattern):
+    required = {"attn", "gemm"}
+    if _pattern_is_moe(pattern):
+        required = required | {"moe", "topk"}
+    return required
+
+
+def _anchor_candidates(runs, layer_count):
+    """Stages that could mark the start of every layer body in the window."""
+    positions = {}
+    for index, run in enumerate(runs):
+        positions.setdefault(run["stage"], []).append(index)
+    candidates = []
+    for stage, where in positions.items():
+        if stage in ("unknown", "memory"):
+            continue
+        count = len(where)
+        if count < _ANCHOR_MIN_BODIES or count > layer_count:
+            continue
+        gaps = [where[i + 1] - where[i] for i in range(count - 1)]
+        mean = sum(gaps) / len(gaps) if gaps else 0
+        if mean <= 0:
+            continue
+        variance = sum((gap - mean) ** 2 for gap in gaps) / len(gaps)
+        cv = (variance ** 0.5) / mean
+        if cv > _ANCHOR_MAX_GAP_CV:
+            continue
+        candidates.append({
+            "anchor_stage": stage,
+            "anchor_runs": where,
+            "gap_cv": round(cv, 6),
+            "gap_mean": round(mean, 6),
+            "observed_layer_bodies": count,
+        })
+    return candidates
+
+
+def _anchor_bounds(runs, starts):
+    return [(starts[i],
+             (starts[i + 1] - 1) if i + 1 < len(starts) else len(runs) - 1)
+            for i in range(len(starts))]
+
+
+def _anchor_runs(runs, layer_count, patterns):
+    """Find the stage that starts every layer body in a module-less window.
+
+    Returns the run indices where each physical layer body begins, or None when
+    no stage repeats regularly enough to be a per-layer anchor.  This counts the
+    layer bodies that are ACTUALLY in the window instead of assuming the window
+    holds all `layer_count` of them -- a profiler window that stops mid-forward
+    holds fewer, and forcing `layer_count` cuts onto it manufactures degenerate
+    one- and two-kernel "layers".
+
+    Candidates are scored on whether the segments they produce actually look
+    like the declared layers, not on how many segments they produce: a stage
+    that fires twice per layer cuts every layer in half and yields twice as many
+    "bodies", none of which contain a whole layer.
+    """
+    if len(runs) < _ANCHOR_MIN_BODIES:
+        return None
+    best = None
+    for candidate in _anchor_candidates(runs, layer_count):
+        bounds = _anchor_bounds(runs, candidate["anchor_runs"])
+        # A window that starts or stops mid-forward has an incomplete body at
+        # each end by construction (and pre-layer setup kernels can open a
+        # spurious one), so trim the ends until both are whole layers.  Only the
+        # ends are trimmed; a gap in the middle stays a failure.
+        for _ in range(2):
+            if not bounds:
+                break
+            offset, agreement = _anchor_layer_offset(
+                [_segment_is_moe(runs, lo, hi) for lo, hi in bounds],
+                patterns, layer_count)
+            ok = [not (_required_stages(patterns.get(offset + i) or {})
+                       - set(runs[j]["stage"] for j in range(lo, hi + 1)))
+                  for i, (lo, hi) in enumerate(bounds)]
+            if not any(ok):
+                bounds = []
+                break
+            first, last = ok.index(True), len(ok) - 1 - ok[::-1].index(True)
+            if first == 0 and last == len(ok) - 1:
+                break
+            bounds = bounds[first:last + 1]
+        if len(bounds) < _ANCHOR_MIN_BODIES:
+            continue
+        offset, agreement = _anchor_layer_offset(
+            [_segment_is_moe(runs, lo, hi) for lo, hi in bounds],
+            patterns, layer_count)
+        satisfied = 0
+        for body_index, (lo, hi) in enumerate(bounds):
+            stages = set(runs[i]["stage"] for i in range(lo, hi + 1))
+            pattern = patterns.get(offset + body_index) or {}
+            if not (_required_stages(pattern) - stages):
+                satisfied += 1
+        validity = satisfied / len(bounds) if bounds else 0.0
+        candidate = dict(candidate,
+                         anchor_runs=[lo for lo, _ in bounds],
+                         observed_layer_bodies=len(bounds))
+        # An anchor that only marks SOME layer kinds (a router stage fires in
+        # MoE layers but never in dense ones) segments those perfectly while
+        # leaving the rest of the window unassigned, so weigh how much of the
+        # window the segmentation actually claims.
+        claimed = sum(runs[hi]["end"] - runs[lo]["start"] + 1
+                      for lo, hi in bounds)
+        span = runs[-1]["end"] - runs[0]["start"] + 1
+        coverage = claimed / span if span else 0.0
+        key = (round(validity, 4), round(coverage, 4), round(agreement, 4),
+               candidate["observed_layer_bodies"])
+        if best is None or key > best[0]:
+            best = (key, dict(candidate,
+                              layer_id_offset=offset,
+                              pattern_class_agreement=round(agreement, 6),
+                              segment_validity=round(validity, 6),
+                              window_coverage=round(coverage, 6),
+                              anchor_bounds=bounds))
+    if best is None or best[1]["segment_validity"] < 0.9:
+        return None
+    return best[1]
+
+
+def _segment_is_moe(runs, first_run, last_run):
+    stages = set(
+        runs[index]["stage"] for index in range(first_run, last_run + 1))
+    return any(marker in stages for marker in _MOE_MARKER_STAGES)
+
+
+def _anchor_layer_offset(observed_moe, patterns, layer_count):
+    """Align the observed dense/MoE class sequence onto the declared chain.
+
+    A truncated window does not have to start at layer 0, so slide the observed
+    classes along the configured chain and keep the offset that agrees most.
+    """
+    expected = [_pattern_is_moe(patterns.get(layer_id))
+                for layer_id in range(layer_count)]
+    span = len(observed_moe)
+    if span > layer_count:
+        return 0, 0.0
+    best_offset, best_hits = 0, -1
+    for offset in range(layer_count - span + 1):
+        hits = sum(1 for i in range(span)
+                   if expected[offset + i] == observed_moe[i])
+        if hits > best_hits:
+            best_offset, best_hits = offset, hits
+    return best_offset, (best_hits / span if span else 0.0)
+
+
 def _stage_runs(step_rows):
     """Return lossless row ranges for continuously deduplicated stages."""
     runs = []
@@ -1024,6 +1231,79 @@ def _stage_sequence_partition(rows, pattern_doc):
                     "layer_boundaries": cut_events,
                 })
                 continue
+        anchored = (_anchor_runs(runs, layer_count, patterns)
+                    if len(module_instances) < layer_count else None)
+        if anchored and anchored["observed_layer_bodies"] != layer_count:
+            # The window does not hold `layer_count` layer bodies.  Map the ones
+            # that are physically there instead of forcing the configured count
+            # onto them, which is what produced degenerate 2-kernel "layers".
+            bounds = anchored["anchor_bounds"]
+            offset = anchored["layer_id_offset"]
+            class_agreement = anchored["pattern_class_agreement"]
+            for row in step_rows:
+                row["assignment"] = "transition_global"
+                row["layer_id"] = None
+                row["layer_instance_id"] = None
+                row["pattern_id"] = None
+                row["layer_evidence"] = "sequence_outside_layer"
+                row["layer_region"] = "transition_global"
+                row["boundary_role"] = None
+            mapped_count = 0
+            cut_events = []
+            for body_index, (first_run, last_run) in enumerate(bounds):
+                layer_id = offset + body_index
+                first_row = runs[first_run]["start"]
+                last_row = runs[last_run]["end"]
+                segment = step_rows[first_row:last_row + 1]
+                if not segment:
+                    continue
+                instance_id = "%s:anchor:layer-%d" % (step_id, layer_id)
+                pattern = patterns.get(layer_id) or {}
+                for index, row in enumerate(segment):
+                    row["layer_id"] = layer_id
+                    row["layer_instance_id"] = instance_id
+                    row["pattern_id"] = pattern.get("pattern_id")
+                    row["assignment"] = "layer_body"
+                    row["layer_evidence"] = "anchor_repeat_segmentation"
+                    row["layer_region"] = "layer_body"
+                    row["boundary_role"] = (
+                        "body_start_kernel" if index == 0
+                        else "end_kernel"
+                        if index == len(segment) - 1 else None)
+                mapped_count += len(segment)
+                cut_events.append({
+                    "layer_id": layer_id,
+                    "body_start_event": segment[0]["row_id"],
+                    "body_end_event": segment[-1]["row_id"],
+                })
+            diagnostics.append({
+                "step_id": step_id,
+                "status": "mapped",
+                "partition_method": "anchor_repeat_segmentation",
+                "configured_layer_count": layer_count,
+                "module_instance_count": len(module_instances),
+                "observed_stage_run_count": len(runs),
+                "mapped_event_count": mapped_count,
+                "window_truncated": (
+                    anchored["observed_layer_bodies"] < layer_count),
+                "observed_layer_bodies": anchored["observed_layer_bodies"],
+                "layer_id_offset": offset,
+                "anchor_stage": anchored["anchor_stage"],
+                "boundary_reference": "anchor_stage_rotation",
+                "boundary_reference_note": (
+                    "Layer bodies are cut at the recurring anchor stage, not at "
+                    "the module entry, so each body is a cyclic rotation of the "
+                    "true layer: the kernel set and the intra-layer order are "
+                    "faithful, but the first row is not necessarily the layer's "
+                    "first kernel."),
+                "anchor_gap_cv": anchored["gap_cv"],
+                "anchor_gap_mean": anchored["gap_mean"],
+                "pattern_class_agreement": class_agreement,
+                "segment_validity": anchored["segment_validity"],
+                "window_coverage": anchored["window_coverage"],
+                "layer_boundaries": cut_events,
+            })
+            continue
         step_templates, bootstrap_evidence = _bootstrap_missing_templates(
             runs, patterns, templates, layer_count)
         cache_key = (
@@ -1515,6 +1795,55 @@ def _representative_integrity(rows, tables, representatives):
     }
 
 
+def _representative_plausibility(pattern_doc, tables, rows):
+    """Reject representatives that cannot be the layer they claim to be.
+
+    Structural self-consistency is not enough: a segmenter that mis-cuts a
+    window still produces internally consistent tables.  A representative must
+    also CONTAIN the stages its declared pattern requires -- a MoE layer with no
+    routing and no expert GEMM is a segmentation artefact, not a layer.
+    """
+    patterns = _pattern_index(pattern_doc)
+    # Only demand stages the window actually demonstrates.  If the trace holds
+    # no expert kernels at all, a MoE representative without them reflects the
+    # capture, not a bad cut; if the trace does hold them, a MoE representative
+    # without them is a segmentation artefact.
+    stages_in_trace = set(
+        row["stage"] for row in rows if row.get("stage"))
+    audits = []
+    for table in tables:
+        layer_id = table.get("representative_layer_id")
+        pattern = patterns.get(layer_id) or {}
+        stages = set()
+        for row in table.get("rows", []):
+            if row.get("stage"):
+                stages.add(row["stage"])
+        declared = {"attn", "gemm"}
+        if _pattern_is_moe(pattern):
+            declared = declared | {"moe", "topk"}
+        required = declared & stages_in_trace
+        missing = sorted(required - stages)
+        audits.append({
+            "pattern_id": table.get("pattern_id"),
+            "phase": table.get("phase"),
+            "representative_layer_id": layer_id,
+            "row_count": len(table.get("rows", [])),
+            "declared_stages": sorted(declared),
+            "required_stages": sorted(required),
+            "unobserved_in_trace": sorted(declared - stages_in_trace),
+            "observed_stages": sorted(stages),
+            "missing_stages": missing,
+            "status": "pass" if not missing else "fail",
+        })
+    return {
+        "status": "pass" if tables and all(
+            item["status"] == "pass" for item in audits) else "fail",
+        "gating": True,
+        "scope": "exported_representatives",
+        "tables": audits,
+    }
+
+
 def _quality(
         pattern_doc, rows, instances, representatives, spans, out_of_scope,
         partition_diagnostics, tables):
@@ -1559,8 +1888,10 @@ def _quality(
     phase_status = "pass" if spans else "partial"
     representative_integrity = _representative_integrity(
         rows, tables, representatives)
+    plausibility = _representative_plausibility(pattern_doc, tables, rows)
     status = "fail" if (
-        pattern_missing or representative_integrity["status"] == "fail") else (
+        pattern_missing or representative_integrity["status"] == "fail"
+        or plausibility["status"] == "fail") else (
         "partial" if phase_status == "partial" or
         pattern_doc.get("quality", {}).get("status") == "partial" else "pass")
     return {
@@ -1598,11 +1929,85 @@ def _quality(
                 "steps": step_audits,
             },
             "representative_layer_integrity": representative_integrity,
+            "representative_pattern_plausibility": plausibility,
         },
     }
 
 
-def _shape_capture_plan(tables, pattern_doc, trace_path):
+_MODEL_PHASES = ("prefill", "decode")
+
+
+def _phase_coverage(instances, tables, trace_paths, adopted_siblings,
+                    table_phases, require_phases):
+    """Describe what phase coverage this build actually achieved.
+
+    Exists because `table_phases: ["all"]` used to be emitted whenever no
+    filter was requested, which read as full coverage even when the only input
+    was a single-phase EXTEND trace (B1).
+    """
+    def _norm(value):
+        value = str(value or "").strip().lower()
+        return {"extend": "prefill", "prompt": "prefill",
+                "generation": "decode"}.get(value, value)
+
+    in_tables = sorted({_norm(t.get("phase")) for t in tables if t.get("phase")})
+    in_trace = sorted({_norm(i.get("phase")) for i in instances if i.get("phase")})
+    tags = sorted({tag for tag in (_phase_tag(p) for p in trace_paths) if tag})
+    required = sorted({_norm(v) for v in (require_phases or []) if v})
+    missing = [phase for phase in required if phase not in in_tables]
+
+    # Sequence coverage and shape coverage fail independently, and conflating
+    # them is what made the decode gap invisible.  A replay-mode DECODE trace
+    # yields a complete ordered kernel sequence (it has kernel events) but no
+    # module/cpu_op spans, so every shape comes back `unresolved`.
+    shape_stats = {}
+    for table in tables:
+        phase = _norm(table.get("phase"))
+        stat = shape_stats.setdefault(phase, {"rows": 0, "resolved": 0})
+        for row in table.get("rows", []):
+            stat["rows"] += 1
+            if (row.get("shape") or {}).get("source") not in (None, "unresolved"):
+                stat["resolved"] += 1
+    for phase, stat in shape_stats.items():
+        stat["resolved_fraction"] = (
+            round(stat["resolved"] / stat["rows"], 4) if stat["rows"] else 0.0)
+    decode_stat = shape_stats.get("decode", {"rows": 0, "resolved": 0})
+    decode_seq = "decode" in in_tables
+    decode_shapes = decode_stat["resolved"] > 0
+    return {
+        "phases_in_tables": in_tables,
+        "phases_in_trace": in_trace,
+        "phases_absent_from_tables": [
+            phase for phase in _MODEL_PHASES if phase not in in_tables],
+        "single_phase": len(in_tables) <= 1,
+        "shape_resolution_by_phase": shape_stats,
+        # sequence == "which kernels, in what order"; shapes == "with what
+        # dtypes and dims".  Candidate DISCOVERY needs the first; candidate
+        # GENERATION and benchmarking need the second.
+        "decode_sequence_covered": decode_seq,
+        "decode_shapes_covered": decode_shapes,
+        "decode_covered": decode_seq and decode_shapes,
+        "trace_phase_tags": tags,
+        "traces_analysed": [os.path.abspath(p) for p in trace_paths],
+        "siblings_auto_adopted": adopted_siblings,
+        "filter_requested": sorted(table_phases) if table_phases else None,
+        "required_phases": required,
+        "missing_required_phases": missing,
+        # Under CUDA-graph replay the CPU never walks the module tree, so a
+        # steady-state DECODE trace carries kernel events but essentially no
+        # nn.Module spans.  The ordered sequence survives; the shapes do not.
+        # Only the shape half needs an eager probe.
+        "decode_requires_eager_probe": decode_seq and not decode_shapes,
+        "decode_evidence": (
+            "sequence_and_shapes" if (decode_seq and decode_shapes) else
+            "sequence_only_shapes_unresolved" if decode_seq else
+            "trace_present_but_no_decode_tables" if "DECODE" in tags else
+            "no_decode_trace_analysed"),
+    }
+
+
+def _shape_capture_plan(tables, pattern_doc, trace_path,
+                        trace_paths=None, coverage=None):
     needs = []
     target_layers = sorted({
         int(table["representative_layer_id"]) for table in tables
@@ -1654,7 +2059,10 @@ def _shape_capture_plan(tables, pattern_doc, trace_path):
         "scope": "representative_layers_only",
         "analysis_rank": 0,
         "trace_path": os.path.abspath(trace_path),
+        "trace_paths": [os.path.abspath(path)
+                        for path in (trace_paths or [trace_path])],
         "trace_sha256": _sha(trace_path),
+        "phase_coverage": coverage or {},
         "representative_layer_filter": target_layers,
         "target_buckets": target_buckets,
         "patterns": [{
@@ -1670,7 +2078,22 @@ def _shape_capture_plan(tables, pattern_doc, trace_path):
             "metadata_only": True,
             "stdout": False,
             "unresolved_targets_only": True,
-            "decode_capture_windows": ["graph_capture", "warmup", "enforce_eager_probe"],
+            # B3: this used to be a hardcoded three-element list that no code
+            # anywhere read.  It now reports what this build actually achieved
+            # and what a decode-covering rerun would require.
+            "decode_capture_windows_implemented": ["enforce_eager_probe"],
+            "decode_sequence_covered": bool(
+                coverage and coverage.get("decode_sequence_covered")),
+            "decode_shapes_covered": bool(
+                coverage and coverage.get("decode_shapes_covered")),
+            "decode_capture_requires": (
+                [] if (coverage and coverage.get("decode_covered")) else
+                ([] if (coverage and coverage.get("decode_sequence_covered"))
+                 else ["analyse the -TP-0-DECODE trace (auto-adopted by "
+                       "default; --no-auto-sibling disables)"]) +
+                ([] if (coverage and coverage.get("decode_shapes_covered"))
+                 else ["capture --phase decode with the eager probe "
+                       "(--disable-cuda-graph) to resolve decode shapes"])),
         },
         "capture_targets": needs,
         "target_count": len(needs),
@@ -1709,10 +2132,31 @@ def _markdown(tables, quality):
     return "\n".join(lines) + "\n"
 
 
-def build(trace_path, pattern_path, out_dir, table_phases=None):
+def build(trace_path, pattern_path, out_dir, table_phases=None,
+          auto_sibling=True, require_phases=None):
+    """Build the semantic layer/kernel tables.
+
+    `trace_path` may be a single path or a list of phase traces.  When
+    `auto_sibling` is set, an unlisted EXTEND/DECODE sibling of the same rank
+    and profiler session is pulled in automatically rather than silently
+    ignored (B2).
+    """
+    trace_paths = [trace_path] if isinstance(trace_path, str) else list(trace_path)
+    if not trace_paths:
+        raise ValueError("build() needs at least one trace")
+    adopted_siblings = []
+    if auto_sibling:
+        known = {os.path.abspath(path) for path in trace_paths}
+        for path in list(trace_paths):
+            for phase, sibling in sorted(_sibling_phase_traces(path).items()):
+                if os.path.abspath(sibling) not in known:
+                    known.add(os.path.abspath(sibling))
+                    trace_paths.append(sibling)
+                    adopted_siblings.append({"phase": phase, "path": sibling})
+    primary_trace = trace_paths[0]
     with open(pattern_path) as fh:
         pattern_doc = json.load(fh)
-    events = _load_events(trace_path)
+    events = _load_events_multi(trace_paths)
     patterns = _pattern_index(pattern_doc)
     rows, spans, out_of_scope, module_scopes, module_diagnostics = _event_rows(
         events, pattern_doc)
@@ -1730,7 +2174,32 @@ def build(trace_path, pattern_path, out_dir, table_phases=None):
     quality = _quality(
         pattern_doc, rows, instances, representatives, spans, out_of_scope,
         partition_diagnostics, tables)
-    capture_plan = _shape_capture_plan(tables, pattern_doc, trace_path)
+    coverage = _phase_coverage(
+        instances, tables, trace_paths, adopted_siblings, table_phases,
+        require_phases)
+    quality["phase_coverage"] = coverage
+    if coverage["missing_required_phases"]:
+        quality["status"] = "fail"
+        quality.setdefault("failures", []).append(
+            "phase coverage: required phase(s) %s absent from the tables; "
+            "traces analysed: %s" % (
+                ", ".join(coverage["missing_required_phases"]),
+                ", ".join(os.path.basename(p) for p in trace_paths)))
+    elif coverage["decode_requires_eager_probe"]:
+        quality.setdefault("warnings", []).append(
+            "phase coverage: decode kernel SEQUENCE is covered but 0/%d decode "
+            "rows carry resolved shapes (CUDA-graph replay emits no module "
+            "spans). Sequence is enough to discover decode fusion seams; "
+            "generating or benchmarking one needs an eager-probe capture."
+            % (coverage["shape_resolution_by_phase"]
+               .get("decode", {}).get("rows", 0)))
+    elif coverage["single_phase"]:
+        quality.setdefault("warnings", []).append(
+            "phase coverage: tables contain only %s. Fusion candidates derived "
+            "from this table apply to that phase alone." % (
+                ", ".join(coverage["phases_in_tables"]) or "no phase"))
+    capture_plan = _shape_capture_plan(
+        tables, pattern_doc, primary_trace, trace_paths, coverage)
     os.makedirs(out_dir, exist_ok=True)
     paths = {
         "semantic_event_audit_jsonl": os.path.join(out_dir, "semantic_event_audit.jsonl"),
@@ -1745,7 +2214,7 @@ def build(trace_path, pattern_path, out_dir, table_phases=None):
             fh.write(json.dumps(row, sort_keys=True) + "\n")
     docs = (
         (paths["layer_instance_audit_json"], {
-            "schema_version": 1, "trace_sha256": _sha(trace_path),
+            "schema_version": 1, "trace_sha256": _sha(primary_trace),
             "module_scope_diagnostics": module_diagnostics,
             "module_scope_count": len(module_scopes),
             "module_interpolated_event_count": module_interpolated,
@@ -1754,9 +2223,20 @@ def build(trace_path, pattern_path, out_dir, table_phases=None):
             "pattern_stage_templates": pattern_templates,
             "instances": instances, "representatives": representatives}),
         (paths["semantic_table_json"], {
-            "schema_version": 2, "trace_path": os.path.abspath(trace_path),
-            "trace_sha256": _sha(trace_path), "patterns_path": os.path.abspath(pattern_path),
-            "table_phases": sorted(table_phases) if table_phases else ["all"],
+            "schema_version": 3,
+            "trace_path": os.path.abspath(primary_trace),
+            "trace_paths": [os.path.abspath(path) for path in trace_paths],
+            "trace_sha256": _sha(primary_trace),
+            "trace_sha256_by_path": {
+                os.path.abspath(path): _sha(path) for path in trace_paths},
+            "patterns_path": os.path.abspath(pattern_path),
+            # B1: report the phases actually present, never the word "all".
+            # table_phases=None means "no filter applied", which is not the
+            # same as "every phase of the model was observed".
+            "table_phases": coverage["phases_in_tables"],
+            "table_phases_requested": (
+                sorted(table_phases) if table_phases else "unfiltered"),
+            "phase_coverage": coverage,
             "tables": tables}),
         (paths["shape_capture_plan_json"], capture_plan),
         (paths["quality_json"], quality),
@@ -1771,17 +2251,31 @@ def build(trace_path, pattern_path, out_dir, table_phases=None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--trace", required=True)
+    parser.add_argument("--trace", required=True, action="append",
+                        help="phase trace; repeat or comma-separate for "
+                             "EXTEND+DECODE coverage")
     parser.add_argument("--patterns", required=True)
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--result-json", default="")
     parser.add_argument("--table-phases", default="all",
                         help="comma-separated representative-table phases; default all, ordered prefill then decode")
+    parser.add_argument("--require-phases", default="",
+                        help="comma-separated phases that MUST appear in the "
+                             "tables; build fails loudly if one is absent")
+    parser.add_argument("--no-auto-sibling", action="store_true",
+                        help="do not adopt an unlisted EXTEND/DECODE sibling "
+                             "trace of the same rank")
     args = parser.parse_args()
+    traces = [item.strip() for entry in args.trace
+              for item in entry.split(",") if item.strip()]
     requested_phases = set(
         value.strip() for value in args.table_phases.split(",") if value.strip())
     table_phases = None if "all" in requested_phases else requested_phases or None
-    result = build(args.trace, args.patterns, args.out_dir, table_phases)
+    require_phases = [value.strip() for value in args.require_phases.split(",")
+                      if value.strip()]
+    result = build(traces, args.patterns, args.out_dir, table_phases,
+                   auto_sibling=not args.no_auto_sibling,
+                   require_phases=require_phases)
     if args.result_json:
         with open(args.result_json, "w") as fh:
             json.dump(result, fh, indent=2)

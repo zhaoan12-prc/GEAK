@@ -469,5 +469,167 @@ class SemanticKernelMappingTest(unittest.TestCase):
                 sum(item["event_count"] for item in audit["instances"]), 6)
 
 
+class PhaseCoverageTest(unittest.TestCase):
+    """Regression tests for the decode-coverage defects (docs/decode-coverage-bugs.md)."""
+
+    def test_phase_tag_and_sibling_discovery(self):
+        self.assertEqual(
+            mapping._phase_tag("x/1787.0-TP-0-EXTEND.trace.json.gz"), "EXTEND")
+        self.assertEqual(
+            mapping._phase_tag("x/1787.0-TP-3-DECODE.trace.json.gz"), "DECODE")
+        self.assertIsNone(mapping._phase_tag("x/plain.trace.json.gz"))
+
+    def test_sibling_discovery_finds_the_other_phase(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            names = ["1787.0-TP-0-EXTEND.trace.json.gz",
+                     "1787.0-TP-0-DECODE.trace.json.gz",
+                     "1787.0-TP-1-DECODE.trace.json.gz"]
+            for name in names:
+                open(os.path.join(tmp, name), "w").close()
+            found = mapping._sibling_phase_traces(
+                os.path.join(tmp, names[0]))
+            self.assertEqual(sorted(found), ["DECODE", "EXTEND"])
+            # rank 1 must not be adopted into a rank 0 analysis
+            self.assertNotIn("TP-1", found["DECODE"])
+
+    def test_b1_table_phases_never_reports_all(self):
+        """`table_phases` must name observed phases, not the word 'all'."""
+        coverage = mapping._phase_coverage(
+            instances=[{"phase": "extend"}],
+            tables=[{"phase": "prefill", "rows": [
+                {"shape": {"source": "kernel_exact"}}]}],
+            trace_paths=["a-TP-0-EXTEND.trace.json.gz"],
+            adopted_siblings=[], table_phases=None, require_phases=None)
+        self.assertEqual(coverage["phases_in_tables"], ["prefill"])
+        self.assertNotIn("all", coverage["phases_in_tables"])
+        self.assertTrue(coverage["single_phase"])
+        self.assertFalse(coverage["decode_sequence_covered"])
+        self.assertEqual(coverage["decode_evidence"], "no_decode_trace_analysed")
+
+    def test_sequence_and_shape_coverage_fail_independently(self):
+        """A replay DECODE trace gives the sequence but no shapes."""
+        coverage = mapping._phase_coverage(
+            instances=[{"phase": "extend"}, {"phase": "decode"}],
+            tables=[
+                {"phase": "prefill", "rows": [
+                    {"shape": {"source": "kernel_exact"}}]},
+                {"phase": "decode", "rows": [
+                    {"shape": {"source": "unresolved"}},
+                    {"shape": {"source": "unresolved"}}]}],
+            trace_paths=["a-TP-0-EXTEND.trace.json.gz",
+                         "a-TP-0-DECODE.trace.json.gz"],
+            adopted_siblings=[{"phase": "DECODE", "path": "a-TP-0-DECODE.trace.json.gz"}],
+            table_phases=None, require_phases=None)
+        self.assertTrue(coverage["decode_sequence_covered"])
+        self.assertFalse(coverage["decode_shapes_covered"])
+        self.assertFalse(coverage["decode_covered"])
+        self.assertTrue(coverage["decode_requires_eager_probe"])
+        self.assertEqual(coverage["decode_evidence"],
+                         "sequence_only_shapes_unresolved")
+        self.assertEqual(
+            coverage["shape_resolution_by_phase"]["decode"]["resolved_fraction"],
+            0.0)
+
+    def test_require_phases_reports_the_missing_one(self):
+        coverage = mapping._phase_coverage(
+            instances=[], tables=[{"phase": "prefill", "rows": []}],
+            trace_paths=["a-TP-0-EXTEND.trace.json.gz"],
+            adopted_siblings=[], table_phases=None,
+            require_phases=["prefill", "decode"])
+        self.assertEqual(coverage["missing_required_phases"], ["decode"])
+
+    def test_multi_trace_load_orders_by_first_timestamp(self):
+        """DECODE follows EXTEND in wall clock; concatenation must preserve it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            early = os.path.join(tmp, "early.trace.json")
+            late = os.path.join(tmp, "late.trace.json")
+            with open(early, "w") as fh:
+                json.dump({"traceEvents": [{"name": "e", "ts": 10.0}]}, fh)
+            with open(late, "w") as fh:
+                json.dump({"traceEvents": [{"name": "l", "ts": 900.0}]}, fh)
+            merged = mapping._load_events_multi([late, early])
+            self.assertEqual([e["name"] for e in merged], ["e", "l"])
+
+
+class TruncatedWindowSegmentationTest(unittest.TestCase):
+    """A module-less window holds the layer bodies it holds -- no more."""
+
+    PATTERNS = {
+        "num_hidden_layers_main": 61,
+        "patterns": [
+            {"pattern_id": "P0", "ffn_type": "dense_mlp",
+             "attention_type": "MLA", "layer_ids": [0, 1, 2]},
+            {"pattern_id": "P1", "ffn_type": "moe_with_shared_expert",
+             "attention_type": "MLA", "layer_ids": list(range(3, 61))},
+        ],
+    }
+
+    def _runs(self, stages):
+        runs, index = [], 0
+        for stage in stages:
+            runs.append({"stage": stage, "start": index, "end": index})
+            index += 1
+        return runs
+
+    def _window(self, dense_bodies, moe_bodies):
+        """A window of whole layer bodies, dense ones first."""
+        stages = []
+        for _ in range(dense_bodies):
+            stages += ["norm", "attn", "gemm", "activation", "gemm"]
+        for _ in range(moe_bodies):
+            stages += ["norm", "attn", "gemm", "topk", "moe", "activation",
+                       "moe", "gemm"]
+        return self._runs(stages)
+
+    def test_counts_bodies_present_not_layers_configured(self):
+        runs = self._window(3, 18)
+        patterns = mapping._pattern_index(self.PATTERNS)
+        anchored = mapping._anchor_runs(runs, 61, patterns)
+        self.assertIsNotNone(anchored)
+        # 21 bodies are physically present; the config declares 61.
+        self.assertEqual(anchored["observed_layer_bodies"], 21)
+        self.assertEqual(anchored["segment_validity"], 1.0)
+        self.assertEqual(anchored["layer_id_offset"], 0)
+
+    def test_anchor_rejects_stage_firing_twice_per_layer(self):
+        """A stage that fires twice per layer halves every body."""
+        runs = self._window(3, 18)
+        patterns = mapping._pattern_index(self.PATTERNS)
+        anchored = mapping._anchor_runs(runs, 61, patterns)
+        # "gemm" appears twice per body and would report ~42 bodies.
+        self.assertNotEqual(anchored["anchor_stage"], "gemm")
+
+    def test_offset_recovers_window_starting_mid_model(self):
+        runs = self._window(0, 12)
+        patterns = mapping._pattern_index(self.PATTERNS)
+        anchored = mapping._anchor_runs(runs, 61, patterns)
+        self.assertIsNotNone(anchored)
+        # No dense bodies -> the window cannot start at layer 0.
+        self.assertGreaterEqual(anchored["layer_id_offset"], 3)
+
+    def test_plausibility_gate_rejects_degenerate_moe_representative(self):
+        """The defect this gate exists for: a 2-kernel 'MoE layer'."""
+        rows = [{"stage": stage} for stage in
+                ("norm", "attn", "gemm", "topk", "moe", "activation")]
+        tables = [{"pattern_id": "P1", "phase": "decode",
+                   "representative_layer_id": 28,
+                   "rows": [{"stage": "gemm"}, {"stage": "elementwise"}]}]
+        gate = mapping._representative_plausibility(self.PATTERNS, tables, rows)
+        self.assertEqual(gate["status"], "fail")
+        self.assertEqual(gate["tables"][0]["missing_stages"],
+                         ["attn", "moe", "topk"])
+
+    def test_plausibility_gate_ignores_stages_absent_from_the_trace(self):
+        """No expert kernels anywhere means the capture, not a bad cut."""
+        rows = [{"stage": stage} for stage in ("norm", "attn", "gemm")]
+        tables = [{"pattern_id": "P1", "phase": "decode",
+                   "representative_layer_id": 28,
+                   "rows": [{"stage": "attn"}, {"stage": "gemm"}]}]
+        gate = mapping._representative_plausibility(self.PATTERNS, tables, rows)
+        self.assertEqual(gate["status"], "pass")
+        self.assertEqual(gate["tables"][0]["unobserved_in_trace"],
+                         ["moe", "topk"])
+
+
 if __name__ == "__main__":
     unittest.main()

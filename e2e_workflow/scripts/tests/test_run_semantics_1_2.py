@@ -32,11 +32,15 @@ class RunSemantics12Test(unittest.TestCase):
                 fh.write("# phase 1.1\n")
             with open(plan, "w") as fh:
                 json.dump({"capture_targets": []}, fh)
+            audit = os.path.join(tmp, "layer_instance_audit.json")
+            with open(audit, "w") as fh:
+                json.dump({"module_scope_count": 61}, fh)
             semantic = {
                 "status": "pass",
                 "semantic_table_json": table,
                 "semantic_table_md": table_md,
                 "shape_capture_plan_json": plan,
+                "layer_instance_audit_json": audit,
             }
             merged_json = os.path.join(tmp, "merged.json")
             merged_md = os.path.join(tmp, "merged.md")
@@ -76,6 +80,59 @@ class RunSemantics12Test(unittest.TestCase):
                 result["published_semantic_table_md"]))
             self.assertTrue(result["structural_pattern_validation"][
                 "definition_preserved"])
+
+    def _capture_require_phases(self, tmp, env_value):
+        """Drive run() far enough to see what require_phases build() was given."""
+        config = os.path.join(tmp, "config.json")
+        trace = os.path.join(tmp, "trace.json")
+        shape_log = os.path.join(tmp, "shape.log")
+        patterns = os.path.join(tmp, "agent_patterns.json")
+        for path, value in (
+                (config, "{}"), (trace, "{}"), (shape_log, "shape\n"),
+                (patterns, '{"pattern_definition": {}}')):
+            with open(path, "w") as fh:
+                fh.write(value)
+        seen = {}
+
+        def fake_build(*args, **kwargs):
+            seen["require_phases"] = kwargs.get("require_phases")
+            raise RuntimeError("stop here")
+
+        env = dict(os.environ)
+        env.pop("GEAK_SEMANTICS_REQUIRE_PHASES", None)
+        if env_value is not None:
+            env["GEAK_SEMANTICS_REQUIRE_PHASES"] = env_value
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(
+                    runner.validate_structural_patterns, "validate",
+                    return_value={
+                        "patterns": [],
+                        "validation": {"definition_preserved": True}}), \
+                mock.patch.object(
+                    runner.semantic_kernel_mapping, "build", fake_build):
+            with self.assertRaises(RuntimeError):
+                runner.run(
+                    config, trace, shape_log, os.path.join(tmp, "out"),
+                    structural_patterns_path=patterns)
+        return seen["require_phases"]
+
+    def test_two_phase_requirement_is_the_default(self):
+        # Regression: this used to read an env var defaulting to EMPTY, so an
+        # unset var meant "require no phase" and a prefill-only capture passed.
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(
+                sorted(self._capture_require_phases(tmp, None)),
+                ["decode", "prefill"])
+
+    def test_env_var_can_narrow_the_requirement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(
+                self._capture_require_phases(tmp, "prefill"), ["prefill"])
+
+    def test_explicit_argument_still_wins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(runner.DEFAULT_REQUIRE_PHASES,
+                             ("prefill", "decode"))
 
     def test_rejects_missing_agent_structural_patterns(self):
         with tempfile.TemporaryDirectory() as tmp:
