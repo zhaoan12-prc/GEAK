@@ -548,11 +548,11 @@ The harness enforces two floors on non-donor helper rows
 Create:
 
 ```text
-$EVAL_DIR/profile/round_${ROUND}/fusion/
+$EVAL_DIR/02_FUSION_CANDIDATES.md              <- the report (root, human)
+$EVAL_DIR/profile/round_${ROUND}/fusion/       <- the intermediates (machine)
   environment_api_inventory.json
   fusion_candidates.json
-  FUSION_CANDIDATES.md
-  fusion_candidate_validation.json
+  fusion_candidate_result.json
 ```
 
 Write `fusion_candidates.json` first. Do not hand-format the final Markdown.
@@ -562,8 +562,16 @@ Run the deterministic harness:
 python3 "$SKILL_DIR/scripts/fusion_candidate_harness.py" \
   --semantic-table "$SEMANTIC_TABLE_JSON" \
   --candidates "$EVAL_DIR/profile/round_${ROUND}/fusion/fusion_candidates.json" \
-  --out-md "$EVAL_DIR/profile/round_${ROUND}/fusion/FUSION_CANDIDATES.md" \
-  --result-json "$EVAL_DIR/profile/round_${ROUND}/fusion/fusion_candidate_validation.json"
+  --out-md "$EVAL_DIR/02_FUSION_CANDIDATES.md" \
+  --result-json "$EVAL_DIR/profile/round_${ROUND}/fusion/fusion_candidate_result.json"
+```
+
+**报告写根目录，中间产物留工作目录。** `--out-md` 是给人看的，和其他四个阶段的报告并排放
+在 `$EVAL_DIR` 根下（`01_SEMANTIC.md` … `05_FUSION_APPLYBACK.md`）；`--result-json` 是给
+下一阶段读的，留在 `profile/round_${ROUND}/fusion/`。写完刷新索引：
+
+```bash
+python3 "$SKILL_DIR/scripts/report_index.py" --eval-dir "$EVAL_DIR"
 ```
 
 If the harness fails, fix the JSON and rerun it. Do not weaken or bypass the
@@ -751,11 +759,15 @@ qualitative difficulty/risk narrative the ranker cannot derive.
 ```bash
 python3 "$SKILL_DIR/scripts/fusion_topk_harness.py" \
   --candidates "$FUSION_DIR/fusion_candidates.json" \
-  --validation "$FUSION_DIR/fusion_candidate_validation.json" \
+  --validation "$FUSION_DIR/fusion_candidate_result.json" \
   --semantic-table "$SEMANTIC_TABLE_JSON" \
-  --out-md "$FUSION_DIR/FUSION_TOPK.md" \
+  --out-md "$EVAL_DIR/03_FUSION_TOPK.md" \
   --out-json "$FUSION_DIR/fusion_topk.json" --top-k 10
 ```
+
+板子写 `$EVAL_DIR/03_FUSION_TOPK.md`（根目录，和其他阶段报告并排），`fusion_topk.json`
+留在 `$FUSION_DIR` —— 它是 3.0/3.1 的输入，不是给人读的。写完刷新索引：
+`python3 "$SKILL_DIR/scripts/report_index.py" --eval-dir "$EVAL_DIR"`。
 
 The ranker is deterministic and encodes these rules — do not hand-rank:
 

@@ -40,6 +40,27 @@ If a candidate genuinely cannot be benched this round, waive it WITH A REASON
 (`--waive d1_kv_rope_write_cluster="needs paged-KV cache state; deferred to round 2"`).
 "skipped" is not a reason and an empty reason is rejected.
 
+### The caller's aggregation step (after the last candidate)
+
+One verdict per candidate is not a phase result. When the loop is done, the CALLER runs
+the harness once over the whole verdict dir and publishes the Phase 3.0 report at the
+EVAL_DIR root, beside the other four phase reports:
+
+```bash
+python3 "$SKILL_DIR/scripts/fusion_unitside_harness.py" \
+  --candidates "$FUSION_CANDIDATES_JSON" \
+  --verdicts   "$EVAL_DIR/verdict" \
+  --out-md     "$EVAL_DIR/04_FUSION_UNITSIDE.md" \
+  --out-json   "$FUSION_DIR/fusion_unitside.json" \
+  --waive "<id>=<reason>"   # repeat per genuinely un-benchable candidate
+python3 "$SKILL_DIR/scripts/report_index.py" --eval-dir "$EVAL_DIR"
+```
+
+Report at the root (human), `fusion_unitside.json` in the working dir (it is Phase 3.1's
+input). Run this even when the gate FAILS — especially then. A failing 3.0 report at the
+root is how the coverage gap reaches Phase 3.1's denominator; a gate that fails and
+publishes nothing is indistinguishable from a phase that never ran.
+
 ## Inputs
 - `FUSION_CANDIDATES_JSON` — the Phase 2.1 candidates.
 - `CANDIDATE_ID` — the single candidate to validate this run.

@@ -480,6 +480,10 @@ const SEMANTICS_SCHEMA = obj({
   trace_manifest_json: { type: 'string' }, structural_patterns_json: { type: 'string' },
   semantic_event_audit_jsonl: { type: 'string' }, layer_instance_audit_json: { type: 'string' },
   semantic_table_json: { type: 'string' }, semantic_table_md: { type: 'string' },
+  // Phase 1's human report, published at the EVAL_DIR root as 01_SEMANTIC.md beside the
+  // other four phase reports. Before it existed, Phase 1 emitted only JSON and a table
+  // with `decode 0/64 shapes resolved` travelled all the way to apply-back unnoticed.
+  semantic_report_md: { type: 'string' }, semantic_report_json: { type: 'string' },
   shape_capture_plan_json: { type: 'string' }, quality_json: { type: 'string' },
   shape_log_jsonl: { type: 'string' }, op_coverage_manifest: { type: 'string' },
   kernel_semantic_evidence_jsonl: { type: 'string' },
@@ -1231,6 +1235,11 @@ if (want('setup')) {
       if (completed) semantics = completed;
     }
     log(`Baseline semantics mapping: ${semantics ? semantics.status : 'failed'} (non-gating).`);
+    if (semantics && !semantics.semantic_report_md) {
+      log('Semantics mapper returned no semantic_report_md: Phase 1 published no human ' +
+          'report at the EVAL_DIR root. The table still stands, but nobody will see a ' +
+          'shape-blind phase before it reaches apply-back.');
+    }
   } else {
     semantics = { status: SEMANTICS_MAPPING_ON ? 'failed' : 'disabled',
       notes: SEMANTICS_MAPPING_ON ? 'baseline profiler returned no raw trace manifest' : 'disabled by args.semantics_mapping' };

@@ -1024,6 +1024,44 @@ class FusionCandidateHarnessTest(unittest.TestCase):
                             result["errors"])
             self.assertEqual(result["region_coverage"]["uncovered"], 1)
 
+    def test_a_failing_run_still_publishes_its_report(self):
+        # Suppressing the markdown on failure made a failed phase look identical to
+        # a phase that never ran -- the root index just said "未生成" and the
+        # uncovered regions, which are the whole point of the failure, were
+        # invisible. The report publishes either way, flagged red.
+        with tempfile.TemporaryDirectory() as tmp:
+            table = self._write(tmp, "table.json", self._region_table())
+            payload = self._region_payload()
+            payload["environment_api_inventory_json"] = self._env(tmp)
+            candidates = self._write(tmp, "candidates.json", payload)
+            out_md = os.path.join(tmp, "report.md")
+            result = harness.run(table, candidates, out_md,
+                                 os.path.join(tmp, "validation.json"))
+            self.assertEqual(result["status"], "fail")
+            self.assertTrue(os.path.isfile(out_md))
+            with open(out_md) as fh:
+                text = fh.read()
+            self.assertIn("校验未通过", text)
+            self.assertIn("fusible region", text)
+
+    def test_a_passing_run_is_not_prefixed_with_a_failure_banner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            table = self._write(tmp, "table.json", self._region_table())
+            payload = self._region_payload()
+            payload["environment_api_inventory_json"] = self._env(tmp)
+            payload["required_followups"] = [{
+                "row_ids": ["r-act"], "reason": "no fused activation kernel exists "
+                                                "for this dtype; round 2"}]
+            candidates = self._write(tmp, "candidates.json", payload)
+            out_md = os.path.join(tmp, "report.md")
+            result = harness.run(table, candidates, out_md,
+                                 os.path.join(tmp, "validation.json"))
+            with open(out_md) as fh:
+                text = fh.read()
+            if result["status"] == "pass":
+                self.assertNotIn("校验未通过", text)
+            self.assertTrue(text.strip())
+
     def test_fusible_region_deferred_in_followups_passes(self):
         with tempfile.TemporaryDirectory() as tmp:
             table = self._write(tmp, "table.json", self._region_table())

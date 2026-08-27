@@ -201,6 +201,29 @@ Everything lands under `<exp_root>/e2e_<model>_<timestamp>/`:
 - `final/{overlay, final_patch.diff, final_launch.sh}` — the deliverable bundle
 - `architect_report.md`, `director_e2e_validation.json` — the official verified throughput result
 
+### The kernel-fusion reports (root level, numbered)
+The fusion path publishes ONE report per phase at the `<exp_root>` root, in pipeline order,
+with the machine artifacts left in their working directories:
+
+| | report | written by |
+|---|---|---|
+| | `00_INDEX.md` | `scripts/report_index.py` (regenerate after any phase) |
+| Phase 1 | `01_SEMANTIC.md` | `scripts/semantic_report.py` |
+| Phase 2.1 | `02_FUSION_CANDIDATES.md` | `scripts/fusion_candidate_harness.py` |
+| Phase 2.2 | `03_FUSION_TOPK.md` | `scripts/fusion_topk_harness.py` |
+| Phase 3.0 | `04_FUSION_UNITSIDE.md` | `scripts/fusion_unitside_harness.py` |
+| Phase 3.1 | `05_FUSION_APPLYBACK.md` | `scripts/fusion_applyback_harness.py` — the final fusion result |
+
+Two rules make the set readable. **A failing phase still publishes**: a gate that fails
+and writes nothing is indistinguishable from a phase that never ran, and the failure
+detail (which regions are uncovered, which rows have no disposition) is exactly what the
+reader needs. **The index renders absence**: a missing report gets a row saying so rather
+than being omitted, so four tidy phases can never stand in for five.
+
+Each report leads with its own coverage number, and each number is the next phase's
+denominator: fusible regions (01) → candidates per region (02) → the execution list (03)
+→ a 单侧 verdict per row (04) → a disposition per row (05).
+
 ## Files
 ```
 e2e_workflow.js   orchestration (deterministic; recursively calls ../kernel_workflow/kernel_workflow.js)
@@ -208,6 +231,9 @@ roles/                 director, system_architect, profiler, config_tuner, kerne
 knowledge/             e2e_optimization, profile_parse, preflight (env self-check), backend_playbook + gemm_attention_backends (persistent), sglang_internals, shape_capture
 knowledge/analysis_skills/  pluggable profile-analysis skills (INDEX.md + one dir per skill; `roofline` ships by default)
 scripts/               bench_e2e.sh (backend-agnostic dispatcher), adapters/{sglang,vllm}.sh, parse_profile.py (Top-N), op_bench.py, capture_shapes.py, overlay_setup.py
+scripts/report_index.py     regenerates <exp_root>/00_INDEX.md from the reports actually on disk
+scripts/semantic_report.py  Phase 1's human report (a view of pattern_layer_kernel_table.json; gates nothing)
+scripts/fusion_{candidate,topk,unitside,applyback}_harness.py  the four fusion gates (each also renders its phase report)
 scripts/server_teardown.sh  the shared server-kill contract (identity verified at LAUNCH: pid, pgid, /proc start time). Every script that launches a server, including role-authored capture scripts, must source it instead of hand-rolling a kill.
 ```
 

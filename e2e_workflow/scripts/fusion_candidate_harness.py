@@ -1532,9 +1532,26 @@ def run(semantic_table_path, candidates_path, out_md, result_json,
     os.makedirs(os.path.dirname(os.path.abspath(result_json)), exist_ok=True)
     with open(result_json, "w") as fh:
         json.dump(result, fh, indent=2)
-    if not errors:
-        with open(out_md, "w") as fh:
+    # Write the report whether or not the gate passed. Suppressing it on failure
+    # made a failed phase indistinguishable from a phase that never ran: the root
+    # index just showed "未生成" and the reader had no way to see WHICH regions were
+    # uncovered -- which is precisely what the failure is trying to tell them. The
+    # errors go at the top so the report cannot be mistaken for a clean one.
+    with open(out_md, "w") as fh:
+        if errors:
+            fh.write("# 融合候选（Phase 2.1）— 🔴 校验未通过\n\n")
+            fh.write("本报告**未通过**候选覆盖校验，共 %d 条错误。"
+                     "下面的表照常给出，但它不是一份完整的候选集——"
+                     "先修下面这些，再读表。\n\n" % len(errors))
+            for err in errors:
+                fh.write("- 🔴 %s\n" % err)
+            fh.write("\n---\n\n")
+        try:
             fh.write(render_markdown(payload, table))
+        except Exception as exc:  # noqa: BLE001 - a broken payload still gets a report
+            fh.write("\n> ⚠️ 表格无法渲染（%s: %s）；"
+                     "以上错误即为本阶段的全部结论。\n"
+                     % (type(exc).__name__, exc))
     return result
 
 

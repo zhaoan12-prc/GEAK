@@ -162,9 +162,16 @@ python3 "$SKILL_DIR/scripts/fusion_applyback_harness.py" \
   --apply "$EVAL_DIR/fusion/apply_result.json" \
   --unitside "$FUSION_UNITSIDE_JSON" \
   --budget "$FUSION_BUDGET" \
-  --out-md "$EVAL_DIR/03_FUSION_APPLYBACK.md" \
+  --out-md "$EVAL_DIR/05_FUSION_APPLYBACK.md" \
   --out-json "$EVAL_DIR/fusion/fusion_applyback.json"
+python3 "$SKILL_DIR/scripts/report_index.py" --eval-dir "$EVAL_DIR"
 ```
+
+`05_FUSION_APPLYBACK.md` is **this whole pipeline's final report**: it carries the
+execution list's per-row disposition, the applied-fusion detail, and the end-to-end
+numbers, so it is the one file a reader can open and see what the fusion work actually
+produced. It goes at the EVAL_DIR root beside `01_SEMANTIC.md` … `04_FUSION_UNITSIDE.md`;
+`fusion_applyback.json` and everything else stays in the working dir.
 
 `--allow-partial-coverage` exists for a knowingly incomplete round; it prints the gap just
 as loudly and it is not a way to make the red go away. Never edit or weaken the harness —
