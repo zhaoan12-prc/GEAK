@@ -165,6 +165,146 @@ class FusionTopkTest(unittest.TestCase):
             self.assertIn("现成算子", report)
             self.assertIn("C 类（无现成算子", report)
 
+    # ---- the board is a binding execution list, not advice ---------------
+
+    def test_execution_list_names_the_candidates_behind_every_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, actions, _ = self._run(tmp)
+            self.assertEqual(
+                len(result["execution_list"]), len(actions))
+            for entry, action in zip(result["execution_list"], actions):
+                self.assertTrue(entry["candidate_ids"])
+                self.assertEqual(entry["candidate_ids"],
+                                 action["candidate_ids"])
+                self.assertEqual(
+                    entry["required_disposition"],
+                    ["applied", "blocked", "deferred_with_reason"])
+
+    def test_truncation_is_recorded_not_silent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidates = self._candidates()
+            candidates["candidates"].append({
+                "candidate_id": "dc_nq", "phase": "decode", "pattern_id": "P0",
+                "family": "norm_quant",
+                "implementation_class": "existing_api_needs_adapter",
+                "readiness": "ready_for_api_validation",
+                "exact_kernel_status": "yes", "removable_row_ids": ["dn2"],
+                "existing_apis": [{"name": "rmsnorm_quant"}]})
+            validation = self._validation()
+            validation["metrics"]["candidate_savings"].append(
+                {"candidate_id": "dc_nq", "estimate_us": 1.0,
+                 "stack_estimate_us": 10.0, "basis": "roofline"})
+            result, actions, _ = topk.rank(
+                self._write(tmp, "c.json", candidates),
+                self._write(tmp, "v.json", validation),
+                self._write(tmp, "t.json", self._table()), 1)
+            self.assertEqual(len(actions), 1)
+            self.assertEqual(result["truncated_count"], 1)
+            self.assertTrue(result["truncated_actions"])
+            self.assertEqual(result["candidate_total"], 4)
+            self.assertIn("截断 1 条", topk.render_markdown(result, actions))
+
+    def test_board_carries_the_coverage_it_was_built_on(self):
+        # A ranking of an incomplete surface has to say so on the same page.
+        with tempfile.TemporaryDirectory() as tmp:
+            validation = self._validation()
+            validation["phase_coverage"] = {
+                "available": True,
+                "shape_resolution_by_phase": {
+                    "decode": {"rows": 64, "resolved": 0,
+                               "resolved_fraction": 0.0}},
+                "decode_evidence": "sequence_only_shapes_unresolved",
+                "decode_requires_eager_probe": True,
+                "problems": ["phase 'decode' resolved 0/64 row shapes"],
+                "waiver": "known gap", "ok": True}
+            validation["region_coverage"] = {
+                "regions_total": 22, "covered": 20, "deferred": 0,
+                "uncovered": 2}
+            result, actions, _ = topk.rank(
+                self._write(tmp, "c.json", self._candidates()),
+                self._write(tmp, "v.json", validation),
+                self._write(tmp, "t.json", self._table()), 10)
+            self.assertEqual(result["region_coverage"]["uncovered"], 2)
+            md = topk.render_markdown(result, actions)
+            self.assertIn("未覆盖 2", md)
+            self.assertIn("resolved 0/64", md)
+            self.assertIn("known gap", md)
+
+    def test_pairwise_conflicts_do_not_collapse_into_choose_one(self):
+        # A conflicts with B and B with C, but A and C are compatible. Calling
+        # that a "pick exactly one" group would forbid a legal combination --
+        # the same harm as dropping a candidate, dressed as caution.
+        with tempfile.TemporaryDirectory() as tmp:
+            table = {"tables": [{"phase": "decode", "pattern_id": "P0",
+                                 "rows": [{"row_id": r, "provider": "aiter"}
+                                          for r in ("r1", "r2", "r3")]}]}
+            def cand(cid, rows):
+                return {"candidate_id": cid, "phase": "decode",
+                        "pattern_id": "P0", "family": cid,
+                        "implementation_class": "existing_api_needs_adapter",
+                        "readiness": "ready_for_api_validation",
+                        "exact_kernel_status": "yes",
+                        "removable_row_ids": rows,
+                        "existing_apis": [{"name": "k_" + cid}]}
+            candidates = {"candidates": [
+                cand("a", ["r1"]), cand("b", ["r1", "r2"]),
+                cand("c", ["r2"])]}
+            validation = {"metrics": {
+                "phase_total_forward_us": {"decode": 1000.0},
+                "collective_guard_checks": [],
+                "candidate_savings": [
+                    {"candidate_id": "a", "estimate_us": 3.0,
+                     "stack_estimate_us": 30.0, "basis": "roofline"},
+                    {"candidate_id": "b", "estimate_us": 2.0,
+                     "stack_estimate_us": 20.0, "basis": "roofline"},
+                    {"candidate_id": "c", "estimate_us": 1.0,
+                     "stack_estimate_us": 10.0, "basis": "roofline"}]}}
+            result, actions, _ = topk.rank(
+                self._write(tmp, "c.json", candidates),
+                self._write(tmp, "v.json", validation),
+                self._write(tmp, "t.json", table), 10)
+            groups = result["exclusive_groups"]
+            self.assertEqual(len(groups), 1)
+            group = groups[0]
+            self.assertEqual(group["choose"], "compatible_subset")
+            self.assertEqual(len(group["member_exec_ids"]), 3)
+            edges = {tuple(e) for e in group["conflict_edges"]}
+            self.assertEqual(len(edges), 2)
+            md = topk.render_markdown(result, actions)
+            self.assertIn("两两部分冲突", md)
+
+    def test_a_true_clique_is_still_choose_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            table = {"tables": [{"phase": "decode", "pattern_id": "P0",
+                                 "rows": [{"row_id": r, "provider": "aiter"}
+                                          for r in ("r1", "r2")]}]}
+            def cand(cid, rows):
+                return {"candidate_id": cid, "phase": "decode",
+                        "pattern_id": "P0", "family": cid,
+                        "implementation_class": "existing_api_needs_adapter",
+                        "readiness": "ready_for_api_validation",
+                        "exact_kernel_status": "yes",
+                        "removable_row_ids": rows,
+                        "existing_apis": [{"name": "k_" + cid}]}
+            # narrow vs broad at the same position: a真子集 of b, so the single
+            # pair IS the whole group -> a genuine choose-one.
+            candidates = {"candidates": [cand("a", ["r1"]),
+                                         cand("b", ["r1", "r2"])]}
+            validation = {"metrics": {
+                "phase_total_forward_us": {"decode": 1000.0},
+                "collective_guard_checks": [],
+                "candidate_savings": [
+                    {"candidate_id": "a", "estimate_us": 3.0,
+                     "stack_estimate_us": 30.0, "basis": "roofline"},
+                    {"candidate_id": "b", "estimate_us": 2.0,
+                     "stack_estimate_us": 20.0, "basis": "roofline"}]}}
+            result, actions, _ = topk.rank(
+                self._write(tmp, "c.json", candidates),
+                self._write(tmp, "v.json", validation),
+                self._write(tmp, "t.json", table), 10)
+            self.assertEqual(result["exclusive_groups"][0]["choose"], 1)
+            self.assertIn("只能落一条", topk.render_markdown(result, actions))
+
 
 if __name__ == "__main__":
     unittest.main()

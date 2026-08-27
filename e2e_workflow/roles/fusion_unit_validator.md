@@ -16,6 +16,30 @@ This is the fusion analogue of `kernel_extractor` (extract_op) + `op_bench.py`: 
 isolated, oracle-checked bake-off. Reuse `SKILL_DIR/scripts/harness_lib.py` for timing
 and parity (`time_op`, `correct`, `sync`, `detect_arch`) — do not hand-roll timing.
 
+## Coverage — who owns the loop (read this before you start)
+One invocation of this role validates ONE candidate. **The loop over candidates is the
+CALLER's job, and it must cover every 单侧-testable candidate — not a subset you find
+convenient to microbench.** A candidate that cites an existing fused API but never gets a
+verdict is a coverage gap, not a skip.
+
+`fusion_unitside_harness.py` now enforces this: it walks `FUSION_CANDIDATES_JSON` and
+requires every in-scope candidate to end in a verdict, an explicit
+`--waive <id>=<reason>`, or `not_validated` → **the gate FAILS**. tier-C
+(`new_helper_kernel`, no existing kernel) is reported `deferred_author` and is out of
+scope. The report leads with the denominator and a per-phase breakdown.
+
+Why this exists: on DSR1 2026-08-26 the caller benched 16 of 42 candidates and the
+report read `总计 16 条 verdict：pass 16 / fail 0 ... status=pass`. The single highest
+roofline decode candidate and **all 20 prefill candidates** never reached the microbench,
+and nothing turned red. Note the bias in what got dropped — the missing ones were the
+ones whose microbench is HARDEST to set up (paged-KV state, MoE routing state, sorting
+buffers), which has no correlation with payoff. Without a forced denominator the loop
+silently selects for "easy to bench".
+
+If a candidate genuinely cannot be benched this round, waive it WITH A REASON
+(`--waive d1_kv_rope_write_cluster="needs paged-KV cache state; deferred to round 2"`).
+"skipped" is not a reason and an empty reason is rejected.
+
 ## Inputs
 - `FUSION_CANDIDATES_JSON` — the Phase 2.1 candidates.
 - `CANDIDATE_ID` — the single candidate to validate this run.
@@ -101,7 +125,9 @@ Read the candidate object for `CANDIDATE_ID` from `FUSION_CANDIDATES_JSON`:
 ## Rules
 - NEVER edit `fusion_unitside_harness.py` or weaken it. Your verdict is the input it
   gates; if it reports your verdict is untrustworthy (shape/fn/field), FIX the microbench
-  and re-run — do not massage the harness.
+  and re-run — do not massage the harness. This includes the coverage gate: a
+  `not_validated` row is fixed by benching that candidate or waiving it with a reason,
+  NEVER by passing `--allow-partial-coverage` to make the red go away.
 - `tested_shape` must be a real captured member shape and `fused_fn` a real
   `existing_apis` name — otherwise the verdict is rejected as untrustworthy.
 - Report parity honestly. A fused kernel that diverges is a `parity: "fail"` — that is a

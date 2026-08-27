@@ -53,6 +53,19 @@ make the degradation explicit per candidate.
 5. Treat selected buckets as the workload actually represented by the table.
    If they differ from the requested/steady-state workload, mark the candidate
    `advisory_only`; do not silently transfer absolute microseconds.
+6. **Check `phase_coverage` FIRST, and refuse a phase it did not resolve.**
+   The table records `shape_resolution_by_phase[phase]` and, for decode,
+   `decode_sequence_covered` / `decode_shapes_covered`. Candidate DISCOVERY
+   needs only the sequence; candidate GENERATION and the 单侧 microbench need
+   the SHAPES. A phase whose rows are present but carry **zero** resolved
+   shapes cannot be built on — every candidate you emit for it would cite
+   shapes nobody measured. Run the eager shape probe
+   (`run_semantic_shape_capture`) and merge before Phase 2.1, or stop and say
+   so; do NOT emit shape-citing candidates from a shape-blind phase.
+   The harness enforces this at entry and it measures the ROWS, not the
+   declared record (a grafted table can carry a stale record). The
+   `--allow-partial-phase-coverage <reason>` escape exists for a knowing,
+   recorded decision — never to make the red go away.
 
 ### 2. Analyze in execution order
 
@@ -470,6 +483,38 @@ Do not:
 
 Record overlap through `conflict_row_ids` and `mutually_exclusive_with`.
 
+### 5a-2. Every fusible REGION must be accounted for (mandatory, harness-enforced)
+
+The µs floors below tell you which individual ROWS may not vanish. They do not
+make the candidate SET reproducible: two runs over the same table can pass both
+floors with entirely different candidates, because nothing says how far a
+candidate must reach. That is why the same trace produced AR+RMSNorm+Quant every
+time (its family is enumerated below) and a different assortment of everything
+else on each run.
+
+So the required set is now a pure function of the table. Split each
+`(phase, pattern)` layer table on the **donor** stages
+(`gemm / attn / attention / communication / collective / moe / expert_gemm`) —
+a fused kernel cannot cross a donor body. Each maximal contiguous same-stream
+run of ≥2 non-donor rows totalling ≥ `--helper-floor` µs/layer is a **fusible
+region**, and every region must end in exactly one of:
+
+- a candidate whose members **cover the WHOLE region** (a candidate covering a
+  strict subset does NOT discharge it — that is the "partial candidate" gap the
+  harness names), or
+- a `required_followups[]` entry whose `row_ids` cover the WHOLE region, with a
+  reason.
+
+You may of course also emit narrower candidates inside a covered region (the
+narrow-to-broad family below is exactly that) — the rule is a floor on reach,
+not a ceiling on count. `region_coverage {regions_total, covered, deferred,
+uncovered}` is reported in the validation JSON; `uncovered > 0` fails Phase 2.1.
+
+Two regions on DSR1 2026-08-26 were uncovered under this rule: the 9-row
+elementwise/norm/kv_cache/quant rope+KV-write cluster in both MLA patterns, for
+which only sub-chain candidates existed. Neither was wrong — but neither was
+ever put in front of the ranking either.
+
 ### 5b. Completeness escalation (list everything)
 
 Phase 2.1 must surface the whole addressable surface, not just ready-API wins.
@@ -753,6 +798,31 @@ The ranker is deterministic and encodes these rules — do not hand-rank:
   single row (note "N 个等价 kernel 变体"). Genuinely different fusions (different
   removable rows, e.g. AR+norm vs AR+norm+quant) or different tiers stay SEPARATE
   rows; mutually-exclusive ones are marked `✳` and all listed, never dropped.
+
+### 1b. The board is a binding execution list
+
+The ranker now emits, alongside the ranked table:
+
+- `phase_coverage` / `region_coverage` — carried through from Phase 2.1 and
+  rendered at the TOP of `FUSION_TOPK.md`. A ranking of an incomplete surface
+  must say so on the same page as the ranking.
+- `candidate_total` / `candidates_on_board` / `truncated_actions` — the
+  denominator. `--top-k` truncation is printed, never silent: a table with no
+  denominator on it reads as "this is the whole surface", and on DSR1
+  2026-08-26 it was 12 rows drawn from 42 candidates.
+- `execution_list` — one `exec_id` per ranked row, carrying the concrete
+  `candidate_ids` it stands for. **Phase 3.0 and Phase 3.1 are accounted
+  against this list**: every entry must end `applied`, `blocked`, or
+  `deferred_with_reason`. Not being mentioned is a coverage hole, not a skip.
+- `exclusive_groups` — overlap is reported as a pairwise CONFLICT GRAPH, not as
+  an equivalence class. `choose: 1` is claimed only when every pair in the group
+  genuinely conflicts; otherwise `choose: "compatible_subset"` with the actual
+  `conflict_edges`. Collapsing a chain (A conflicts B, B conflicts C, A and C
+  are fine) into "pick one of three" would forbid a legal combination — the same
+  harm as dropping a candidate, dressed as caution.
+
+You still do not choose inside a group; what changed is that NOT choosing is now
+visibly an open decision instead of a quietly dropped row.
 
 ### 2. Add the qualitative layer
 

@@ -324,6 +324,213 @@ def _collective_requirements(table):
     return requirements
 
 
+def _phase_coverage_gate(table, payload, allow_reason):
+    """Refuse to build fusion candidates on a phase the semantics did not resolve.
+
+    Phase 1 records, honestly, how much of each phase it actually resolved --
+    `phase_coverage.shape_resolution_by_phase[phase].resolved` and, for decode,
+    `decode_covered` (sequence AND shapes).  Until now NOTHING downstream read
+    it.  On DSR1 2026-08-26 two of the three published tables carried
+    `decode_covered: false` with decode 0/64 rows shape-resolved, Phase 2
+    consumed them without complaint, and every decode candidate it emitted was
+    built on shapes that were never measured.
+
+    Candidate DISCOVERY needs the sequence (which kernels, in what order).
+    Candidate GENERATION and the 单侧 microbench need the SHAPES.  So a phase
+    that appears in the tables but resolved zero shapes is not a weaker input,
+    it is an unusable one, and the honest answer is to run the eager probe --
+    not to emit candidates nobody can bench.
+
+    Returns (record, errors, warnings).
+    """
+    errors = []
+    warnings = []
+    coverage = table.get("phase_coverage")
+    phases_used = sorted({
+        str(candidate.get("phase") or "")
+        for candidate in (payload.get("candidates") or [])
+        if candidate.get("phase")})
+
+    if not isinstance(coverage, dict) or not coverage:
+        message = (
+            "semantic table has no phase_coverage record: it predates coverage "
+            "reporting, so whether decode was analysed CANNOT be established. "
+            "Regenerate the table with the current semantic mapper, or pass "
+            "--allow-partial-phase-coverage <reason> to proceed knowingly")
+        if allow_reason:
+            warnings.append("%s [waived: %s]" % (message, allow_reason))
+        else:
+            errors.append(message)
+        return ({"available": False, "phases_used": phases_used,
+                 "waiver": allow_reason, "ok": bool(allow_reason)},
+                errors, warnings)
+
+    # Recompute shape resolution from the ROWS, and let that govern.
+    #
+    # The declared record is written when the table is first built; a later step
+    # can legitimately change the rows underneath it.  On DSR1 2026-08-26
+    # `semantics_production_shaped` grafted the eager-probe shapes onto the
+    # production table -- 52 of 64 decode rows ended up with real input_dims --
+    # but its inherited `phase_coverage` still read `decode: 0/64`.  Gating on
+    # the stale field would have rejected a table that is actually usable, and
+    # (worse) the reverse hole exists too: rows can be replaced with shapeless
+    # ones while a healthy record stays behind.  So the gate measures the table
+    # and treats a disagreeing record as a reporting bug, not as evidence.
+    measured = {}
+    for item in table.get("tables", []):
+        phase = str(item.get("phase") or "")
+        stat = measured.setdefault(phase, {"rows": 0, "resolved": 0})
+        for row in item.get("rows", []):
+            stat["rows"] += 1
+            if (row.get("shape") or {}).get("input_dims"):
+                stat["resolved"] += 1
+    for stat in measured.values():
+        stat["resolved_fraction"] = (
+            round(stat["resolved"] / stat["rows"], 4) if stat["rows"] else 0.0)
+
+    declared_stats = coverage.get("shape_resolution_by_phase") or {}
+    for phase, stat in sorted(measured.items()):
+        declared = declared_stats.get(phase) or {}
+        if (declared and int(declared.get("resolved", -1) or 0)
+                != stat["resolved"]):
+            warnings.append(
+                "phase_coverage.shape_resolution_by_phase[%r] is stale: it "
+                "declares %s/%s rows shape-resolved, the table itself carries "
+                "%d/%d. Gating on the measured value; regenerate the record"
+                % (phase, declared.get("resolved"), declared.get("rows"),
+                   stat["resolved"], stat["rows"]))
+
+    in_tables = sorted(measured) or list(coverage.get("phases_in_tables") or [])
+    shape_stats = measured or declared_stats
+    absent = [
+        phase for phase in (coverage.get("phases_in_trace") or [])
+        if phase not in in_tables]
+    missing_required = [
+        phase for phase in (coverage.get("required_phases") or [])
+        if phase not in in_tables]
+
+    problems = []
+    if absent:
+        problems.append(
+            "phases absent from the semantic tables: %s (the trace saw %s). "
+            "A fusion pass that never sees a phase cannot find its fusions"
+            % (absent, coverage.get("phases_in_trace") or []))
+    if missing_required:
+        problems.append(
+            "semantics did not satisfy its own required phases: missing %s"
+            % missing_required)
+    for phase in phases_used:
+        if phase not in in_tables:
+            problems.append(
+                "candidates target phase %r which is not in the semantic "
+                "tables %s" % (phase, in_tables))
+            continue
+        stat = shape_stats.get(phase) or {}
+        resolved = int(stat.get("resolved", 0) or 0)
+        rows = int(stat.get("rows", 0) or 0)
+        if resolved <= 0:
+            problems.append(
+                "phase %r resolved 0/%d row shapes (%s): candidates for it "
+                "would carry shapes nobody measured, and the 单侧 microbench "
+                "has nothing real to build tensors from. Run the eager shape "
+                "probe (run_semantic_shape_capture) and merge before Phase 2"
+                % (phase, rows,
+                   coverage.get("decode_evidence") if phase == "decode"
+                   else "no shape evidence"))
+
+    for problem in problems:
+        if allow_reason:
+            warnings.append("%s [waived: %s]" % (problem, allow_reason))
+        else:
+            errors.append(problem)
+
+    _decode_shapes = int(
+        (shape_stats.get("decode") or {}).get("resolved", 0) or 0)
+    _decode_seq = bool(
+        coverage.get("decode_sequence_covered") or "decode" in shape_stats)
+    record = {
+        "available": True,
+        "phases_in_tables": in_tables,
+        "phases_absent_from_tables": absent,
+        "phases_used_by_candidates": phases_used,
+        "shape_resolution_by_phase": shape_stats,
+        "decode_covered": _decode_shapes > 0 and _decode_seq,
+        "decode_covered_declared": coverage.get("decode_covered"),
+        # Derived from the same measurement as everything else, so the evidence
+        # class can never contradict the resolution numbers printed beside it.
+        "decode_evidence": (
+            coverage.get("decode_evidence") if "decode" not in shape_stats
+            else "sequence_and_shapes" if (_decode_shapes and _decode_seq)
+            else "sequence_only_shapes_unresolved" if _decode_seq
+            else "no_decode_trace_analysed"),
+        "decode_requires_eager_probe": (
+            "decode" in shape_stats and not _decode_shapes),
+        "problems": problems,
+        "waiver": allow_reason,
+        "ok": not problems or bool(allow_reason),
+    }
+    return record, errors, warnings
+
+
+def _fusible_regions(table, floor_us):
+    """Maximal contiguous same-stream runs of NON-donor rows, per (phase, pattern).
+
+    A fused kernel cannot cross a donor body (GEMM / attention / MoE /
+    collective), so the donors partition each layer table into independent
+    fusible regions.  Each region is one fusion opportunity and its BROADEST
+    form is the whole region.
+
+    This is a pure function of the table, and that is the entire point.  Before
+    this existed, only the collective positions had a mandatory narrow-to-broad
+    enumeration (`_collective_requirements`); every other family -- kv/rope write
+    clusters, activation+quant, MoE sorting, norm+quant away from a collective --
+    was discovered by free judgement against duration floors.  So AllReduce +
+    RMSNorm + Quant reproduced on every run while the rest of the候选 set moved
+    around, and a run could quietly propose only a narrow sub-pair of a region
+    and still pass.  Deriving the requirement from the table makes the required
+    candidate set identical for identical input.
+
+    Returns [(key, row_ids, stages, total_us)].
+    """
+    regions = []
+
+    def flush(key, run):
+        if len(run) < 2:
+            return
+        total = sum(float(row.get("duration_us", 0.0) or 0.0) for row in run)
+        if total < floor_us:
+            return
+        regions.append((
+            key,
+            tuple(row.get("row_id") for row in run),
+            "+".join(str(row.get("stage")) for row in run),
+            round(total, 3)))
+
+    for item in table.get("tables", []):
+        key = (item.get("phase"), item.get("pattern_id"))
+        rows = sorted(
+            item.get("rows", []), key=lambda row: int(row.get("pos", 0)))
+        run = []
+        for row in rows:
+            stage = str(row.get("stage") or "").lower()
+            if stage in DONOR_STAGES:
+                flush(key, run)
+                run = []
+                continue
+            if run:
+                previous = run[-1]
+                contiguous = (
+                    row.get("stream") == previous.get("stream")
+                    and int(row.get("device_seq_index", -1))
+                    == int(previous.get("device_seq_index", -2)) + 1)
+                if not contiguous:
+                    flush(key, run)
+                    run = []
+            run.append(row)
+        flush(key, run)
+    return regions
+
+
 def _semantic_index(table):
     tables = {}
     rows = {}
@@ -377,13 +584,22 @@ def _validate_api_list(owner, path, errors):
 def validate(semantic_table_path, candidates_path,
              helper_floor=DEFAULT_HELPER_FLOOR_US,
              escalate_floor=DEFAULT_ESCALATE_FLOOR_US,
-             agg_escalate_floor=DEFAULT_AGG_ESCALATE_FLOOR_US):
+             agg_escalate_floor=DEFAULT_AGG_ESCALATE_FLOOR_US,
+             allow_partial_phase_coverage=None):
     table = _load(semantic_table_path)
     payload = _load(candidates_path)
     tables, source_rows, table_order = _semantic_index(table)
     errors = []
     warnings = []
     bw_per_us = None  # HBM bytes/us for the roofline savings estimate
+
+    # Entry gate: is the semantic evidence good enough to build candidates on?
+    # Runs before anything else so a decode-blind table fails on the reason it
+    # is unusable, not on some downstream symptom of the missing rows.
+    phase_coverage, coverage_errors, coverage_warnings = _phase_coverage_gate(
+        table, payload, allow_partial_phase_coverage)
+    errors.extend(coverage_errors)
+    warnings.extend(coverage_warnings)
 
     # Provenance: the candidates must have been built from exactly this table.
     declared = payload.get("source_semantic_table") or {}
@@ -458,7 +674,11 @@ def validate(semantic_table_path, candidates_path,
                     "no fused-AR guard registry entry for aiter commit %s; "
                     "threshold not cross-checked" % commit)
     if errors:
+        # Even on an early structural failure, hand back the coverage record --
+        # it is usually the REASON, and a report that omits it sends the reader
+        # hunting through downstream symptoms.
         return payload, table, errors, warnings, {
+            "phase_coverage": phase_coverage,
             "source_row_count": len(source_rows),
             "covered_source_row_count": 0,
             "source_row_coverage_pct": 0.0,
@@ -918,6 +1138,55 @@ def validate(semantic_table_path, candidates_path,
                     key, list(member_ids), order,
                     plan_title.replace("+", " + ")))
 
+    # Reproducibility: every fusible region must have a WHOLE-region candidate.
+    #
+    # The collective rule above enumerates its family exhaustively; nothing did
+    # that for any other family, so which non-collective fusions got proposed
+    # varied run to run and a narrow sub-pair could stand in for a region whose
+    # broad fusion was never considered.  A region is satisfied by a candidate
+    # whose members COVER it (a superset is fine -- a boundary candidate that
+    # also carries the donor all-reduce still covers the region), or by an
+    # explicit whole-region deferral in required_followups.  A followup that
+    # lists only PART of the region does not satisfy it: partial deferral is how
+    # the prefill kv/rope write cluster went missing.
+    candidate_regions = {}
+    for candidate_id, candidate in candidates_by_id.items():
+        candidate_regions.setdefault(
+            (candidate.get("phase"), candidate.get("pattern_id")), []).append(
+                (candidate_id, set(candidate_member_ids.get(candidate_id, ()))))
+    followup_row_sets = [
+        set(followup.get("row_ids") or ())
+        for followup in (payload.get("required_followups") or [])]
+    region_records = []
+    for key, row_ids, stages, total_us in _fusible_regions(table, helper_floor):
+        wanted = set(row_ids)
+        covering = sorted(
+            candidate_id
+            for candidate_id, members in candidate_regions.get(key, [])
+            if wanted <= members)
+        deferred = any(wanted <= rows for rows in followup_row_sets)
+        status = ("covered" if covering
+                  else "deferred" if deferred else "uncovered")
+        region_records.append({
+            "phase": key[0], "pattern_id": key[1], "stages": stages,
+            "row_ids": list(row_ids), "us_per_layer": total_us,
+            "status": status, "covered_by": covering})
+        if status == "uncovered":
+            partial = sorted(
+                candidate_id
+                for candidate_id, members in candidate_regions.get(key, [])
+                if members & wanted)
+            errors.append(
+                "%s fusible region %s (%s, %.1f us/layer) has no candidate "
+                "covering the whole region%s. Emit the broad candidate, or "
+                "defer the WHOLE region in required_followups[].row_ids with a "
+                "reason" % (
+                    key, stages, list(row_ids), total_us,
+                    "; only partial candidates %s touch it" % partial
+                    if partial else ""))
+    uncovered_regions = [
+        record for record in region_records if record["status"] == "uncovered"]
+
     # No silent drop of author-track helpers: a non-donor helper row at or above
     # the floor must be a candidate member or a deferred followup row. Absence of
     # a ready API routes it to kernel authoring, never to omission.
@@ -1030,6 +1299,16 @@ def validate(semantic_table_path, candidates_path,
                  for rid, dur in collective_not_candidate[:5]]))
 
     metrics = {
+        "phase_coverage": phase_coverage,
+        "region_coverage": {
+            "regions_total": len(region_records),
+            "covered": sum(
+                1 for r in region_records if r["status"] == "covered"),
+            "deferred": sum(
+                1 for r in region_records if r["status"] == "deferred"),
+            "uncovered": len(uncovered_regions),
+            "regions": region_records,
+        },
         "source_table_count": len(tables),
         "covered_table_count": len(set(
             (key[0], key[1]) for key in covered)),
@@ -1230,16 +1509,22 @@ def render_markdown(payload, table):
 def run(semantic_table_path, candidates_path, out_md, result_json,
         helper_floor=DEFAULT_HELPER_FLOOR_US,
         escalate_floor=DEFAULT_ESCALATE_FLOOR_US,
-        agg_escalate_floor=DEFAULT_AGG_ESCALATE_FLOOR_US):
+        agg_escalate_floor=DEFAULT_AGG_ESCALATE_FLOOR_US,
+        allow_partial_phase_coverage=None):
     payload, table, errors, warnings, metrics = validate(
         semantic_table_path, candidates_path, helper_floor, escalate_floor,
-        agg_escalate_floor)
+        agg_escalate_floor, allow_partial_phase_coverage)
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "pass" if not errors else "fail",
         "semantic_table_json": os.path.abspath(semantic_table_path),
         "fusion_candidates_json": os.path.abspath(candidates_path),
         "fusion_candidates_md": os.path.abspath(out_md),
+        "phase_coverage": metrics.get("phase_coverage"),
+        "region_coverage": {
+            key: value
+            for key, value in (metrics.get("region_coverage") or {}).items()
+            if key != "regions"},
         "errors": errors,
         "warnings": warnings,
         "metrics": metrics,
@@ -1272,11 +1557,21 @@ def main():
         default=DEFAULT_AGG_ESCALATE_FLOOR_US,
         help="min per-layer sum (us) of sub-floor non-candidate helpers in one "
              "(phase, pattern) before they must become a cluster candidate")
+    parser.add_argument(
+        "--allow-partial-phase-coverage", metavar="REASON", default=None,
+        help="proceed even though a phase is absent from the semantic tables "
+             "or resolved no shapes. Requires a REASON, which is recorded in "
+             "the result. This does NOT make the candidates for that phase "
+             "trustworthy -- it records that you knowingly built them anyway")
     args = parser.parse_args()
+    if (args.allow_partial_phase_coverage is not None
+            and not args.allow_partial_phase_coverage.strip()):
+        raise SystemExit(
+            "--allow-partial-phase-coverage requires a non-empty reason")
     result = run(
         args.semantic_table, args.candidates,
         args.out_md, args.result_json, args.helper_floor, args.escalate_floor,
-        args.agg_escalate_floor)
+        args.agg_escalate_floor, args.allow_partial_phase_coverage)
     print(json.dumps(result, indent=2))
     return 0 if result["status"] == "pass" else 1
 

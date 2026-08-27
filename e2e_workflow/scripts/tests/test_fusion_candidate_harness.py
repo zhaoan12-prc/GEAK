@@ -34,6 +34,49 @@ class FusionCandidateHarnessTest(unittest.TestCase):
             env["toolchain"] = {"aiter_git_commit": aiter_commit}
         return self._write(root, "environment.json", env)
 
+    def _shaped(self, table, resolved=True):
+        """Give every row a captured shape (or strip them all).
+
+        The phase gate measures shape resolution off the rows themselves rather
+        than trusting the declared record, so a fixture table has to carry the
+        same evidence a real one does.
+        """
+        for item in table.get("tables", []):
+            for row in item.get("rows", []):
+                if resolved:
+                    row.setdefault("shape", {
+                        "input_dims": [[8, 16]], "input_types": ["bf16"]})
+                else:
+                    row.pop("shape", None)
+        return table
+
+    def _coverage(self, phases=("prefill",), resolved=True):
+        """A healthy phase_coverage record: both halves of the evidence present.
+
+        Phase 2 now refuses to build on a phase whose shapes were never
+        resolved, so a fixture table must say what it actually covered.
+        """
+        return {
+            "phases_in_tables": list(phases),
+            "phases_in_trace": list(phases),
+            "phases_absent_from_tables": [],
+            "shape_resolution_by_phase": {
+                phase: {"rows": 3, "resolved": 3 if resolved else 0,
+                        "resolved_fraction": 1.0 if resolved else 0.0}
+                for phase in phases},
+            "decode_sequence_covered": "decode" in phases,
+            "decode_shapes_covered": "decode" in phases and resolved,
+            "decode_covered": "decode" in phases and resolved,
+            "decode_evidence": (
+                "sequence_and_shapes" if ("decode" in phases and resolved)
+                else "sequence_only_shapes_unresolved" if "decode" in phases
+                else "no_decode_trace_analysed"),
+            "decode_requires_eager_probe": (
+                "decode" in phases and not resolved),
+            "required_phases": list(phases),
+            "missing_required_phases": [],
+        }
+
     def _table(self):
         rows = [
             {
@@ -49,8 +92,9 @@ class FusionCandidateHarnessTest(unittest.TestCase):
                 "stream": 8, "duration_us": 90.0, "stage": "gemm",
             },
         ]
-        return {
+        return self._shaped({
             "trace_sha256": "abc",
+            "phase_coverage": self._coverage(),
             "tables": [{
                 "phase": "prefill",
                 "pattern_id": "P_DENSE",
@@ -59,7 +103,7 @@ class FusionCandidateHarnessTest(unittest.TestCase):
                 "representative_layer_id": 0,
                 "rows": rows,
             }],
-        }
+        })
 
     def _payload(self):
         members = [
@@ -148,11 +192,16 @@ class FusionCandidateHarnessTest(unittest.TestCase):
              "duration_us": 5.0, "stage": "communication"},
             {"row_id": "n0", "pos": 1, "device_seq_index": 25, "stream": 8,
              "duration_us": 4.0, "stage": "norm"},
-            {"row_id": "q0", "pos": 2, "device_seq_index": 26, "stream": 8,
+            # dsi 40, not 26: this fixture's own stage_inventory calls q0 an
+            # "isolated quant, no producer in region", so it must NOT be
+            # device-adjacent to n0 -- otherwise n0+q0 is a genuine fusible
+            # region and the region rule is right to demand a candidate for it.
+            {"row_id": "q0", "pos": 2, "device_seq_index": 40, "stream": 8,
              "duration_us": 3.0, "stage": "quant"},
         ]
-        return {
+        return self._shaped({
             "trace_sha256": "abc",
+            "phase_coverage": self._coverage(),
             "tables": [{
                 "phase": "prefill", "pattern_id": "P_DENSE",
                 "pattern_display_name": "Dense", "pattern_layer_count": 2,
@@ -162,7 +211,7 @@ class FusionCandidateHarnessTest(unittest.TestCase):
                     "input_tokens": tokens},
                 "rows": rows,
             }],
-        }
+        })
 
     def _collective_payload(self, exact="yes"):
         api = {
@@ -322,8 +371,9 @@ class FusionCandidateHarnessTest(unittest.TestCase):
             {"row_id": "tail_ar", "pos": 3, "device_seq_index": 13, "stream": 8,
              "duration_us": 6.0, "stage": "communication"},
         ]
-        return {
+        return self._shaped({
             "trace_sha256": "abc",
+            "phase_coverage": self._coverage(),
             "tables": [{
                 "phase": "prefill", "pattern_id": "P_DENSE",
                 "pattern_display_name": "Dense", "pattern_layer_count": 58,
@@ -333,7 +383,7 @@ class FusionCandidateHarnessTest(unittest.TestCase):
                     "input_tokens": tokens},
                 "rows": rows,
             }],
-        }
+        })
 
     def _boundary_payload(self, exact="yes", occurrences=57,
                           include_occurrences=True):
@@ -826,6 +876,205 @@ class FusionCandidateHarnessTest(unittest.TestCase):
             self.assertTrue(any(
                 "does not match semantic table trace_sha256" in error
                 for error in result["errors"]))
+
+    # ---- phase-coverage entry gate (1.4) --------------------------------
+    # Phase 1 has always recorded how much of each phase it resolved; nothing
+    # downstream read it. On DSR1 2026-08-26 two published tables carried
+    # decode_covered=false with 0/64 decode rows shape-resolved and Phase 2
+    # built decode candidates on them anyway.
+
+    def _decode_table(self, resolved=False):
+        """A decode table whose shapes were (or were not) actually resolved.
+
+        `resolved=False` is the DSR1 shape: decode rows are present -- the
+        SEQUENCE was captured -- but 0 of them carry a measured shape, because
+        CUDA-graph replay emits no nn.Module spans to hang shapes off.
+        """
+        table = self._shaped(self._table(), resolved=resolved)
+        table["tables"][0]["phase"] = "decode"
+        cov = self._coverage(phases=("decode",), resolved=resolved)
+        cov["shape_resolution_by_phase"]["decode"] = {
+            "rows": 64, "resolved": 64 if resolved else 0,
+            "resolved_fraction": 1.0 if resolved else 0.0}
+        table["phase_coverage"] = cov
+        return table
+
+    def _decode_payload(self):
+        payload = self._payload()
+        for candidate in payload["candidates"]:
+            candidate["phase"] = "decode"
+        for row in payload["stage_inventory"]:
+            row["phase"] = "decode"
+        for row in payload["summary_rows"]:
+            row["phase"] = "decode"
+        return payload
+
+    def test_table_without_phase_coverage_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = self._table()
+            raw.pop("phase_coverage")
+            table = self._write(tmp, "table.json", raw)
+            payload = self._payload()
+            payload["environment_api_inventory_json"] = self._env(tmp)
+            candidates = self._write(tmp, "candidates.json", payload)
+            result = harness.run(
+                table, candidates, os.path.join(tmp, "report.md"),
+                os.path.join(tmp, "validation.json"))
+            self.assertEqual(result["status"], "fail")
+            self.assertTrue(any(
+                "phase_coverage" in e and "Regenerate" in e
+                for e in result["errors"]), result["errors"])
+
+    def test_decode_candidates_on_shape_blind_decode_are_refused(self):
+        # The exact DSR1 shape: decode rows are in the table, decode shapes are
+        # 0/64 resolved, and the candidates are decode candidates.
+        with tempfile.TemporaryDirectory() as tmp:
+            table = self._write(tmp, "table.json", self._decode_table())
+            payload = self._decode_payload()
+            payload["environment_api_inventory_json"] = self._env(tmp)
+            candidates = self._write(tmp, "candidates.json", payload)
+            result = harness.run(
+                table, candidates, os.path.join(tmp, "report.md"),
+                os.path.join(tmp, "validation.json"))
+            self.assertEqual(result["status"], "fail")
+            self.assertTrue(any(
+                "decode" in e and "resolved 0" in e for e in result["errors"]),
+                result["errors"])
+            self.assertFalse(result["phase_coverage"]["ok"])
+
+    def test_decode_candidates_pass_once_decode_shapes_resolve(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            table = self._write(
+                tmp, "table.json", self._decode_table(resolved=True))
+            payload = self._decode_payload()
+            payload["environment_api_inventory_json"] = self._env(tmp)
+            candidates = self._write(tmp, "candidates.json", payload)
+            result = harness.run(
+                table, candidates, os.path.join(tmp, "report.md"),
+                os.path.join(tmp, "validation.json"))
+            self.assertEqual(result["status"], "pass", result["errors"])
+            self.assertTrue(result["phase_coverage"]["ok"])
+
+    def test_shape_blind_decode_can_be_waived_with_a_reason(self):
+        # The escape hatch exists, but it is loud: a waiver leaves a warning and
+        # a recorded reason, never a silent pass.
+        with tempfile.TemporaryDirectory() as tmp:
+            table = self._write(tmp, "table.json", self._decode_table())
+            payload = self._decode_payload()
+            payload["environment_api_inventory_json"] = self._env(tmp)
+            candidates = self._write(tmp, "candidates.json", payload)
+            result = harness.run(
+                table, candidates, os.path.join(tmp, "report.md"),
+                os.path.join(tmp, "validation.json"),
+                allow_partial_phase_coverage="eager probe queued for round 2")
+            self.assertEqual(result["status"], "pass", result["errors"])
+            self.assertEqual(
+                result["phase_coverage"]["waiver"],
+                "eager probe queued for round 2")
+            self.assertTrue(any("waived" in w for w in result["warnings"]),
+                            result["warnings"])
+
+    # ---- fusible-region enumeration (3.1) -------------------------------
+    # Before this rule only the collective positions had a mandatory
+    # narrow-to-broad family; every other region depended on the analyst's
+    # judgement against a us floor, which is why the same trace produced a
+    # different candidate set on every run.
+
+    def _region_table(self):
+        """norm -> quant -> activation, all non-donor, then a GEMM donor."""
+        table = self._table()
+        rows = table["tables"][0]["rows"]
+        rows.insert(2, {
+            "row_id": "r1b", "pos": 2, "device_seq_index": 12,
+            "stream": 8, "duration_us": 5.0, "stage": "activation",
+            "shape": {"input_dims": [[8, 16]], "input_types": ["bf16"]}})
+        rows[3]["pos"] = 3
+        rows[3]["device_seq_index"] = 13
+        return table
+
+    def _region_payload(self):
+        """The `_payload` candidate, plus the extra region row in the inventory.
+
+        The candidate still fuses only norm+quant, so the activation row is
+        accounted for row-by-row but the REGION it belongs to is not covered --
+        which is exactly the gap the region rule exists to catch.
+        """
+        payload = self._payload()
+        payload["stage_inventory"].append({
+            "phase": "prefill", "pattern_id": "P_DENSE",
+            "order": 2, "stage": "activation",
+            "row_ids": ["r1b"], "fusion_opportunity": False,
+            "candidate_ids": [],
+            "reason": "activation left out of the norm+quant plan"})
+        return payload
+
+    def test_uncovered_fusible_region_fails(self):
+        # The candidate fuses norm+quant but leaves the adjacent activation row
+        # in the same region unclaimed and undeferred.
+        with tempfile.TemporaryDirectory() as tmp:
+            table = self._write(tmp, "table.json", self._region_table())
+            payload = self._region_payload()
+            payload["environment_api_inventory_json"] = self._env(tmp)
+            candidates = self._write(tmp, "candidates.json", payload)
+            result = harness.run(
+                table, candidates, os.path.join(tmp, "report.md"),
+                os.path.join(tmp, "validation.json"))
+            self.assertEqual(result["status"], "fail")
+            self.assertTrue(any("fusible region" in e for e in result["errors"]),
+                            result["errors"])
+            self.assertEqual(result["region_coverage"]["uncovered"], 1)
+
+    def test_fusible_region_deferred_in_followups_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            table = self._write(tmp, "table.json", self._region_table())
+            payload = self._region_payload()
+            payload["environment_api_inventory_json"] = self._env(tmp)
+            payload["required_followups"] = [{
+                "row_ids": ["r0", "r1", "r1b"],
+                "reason": "no installed kernel fuses activation into this "
+                          "chain; author-track, deferred to round 2"}]
+            candidates = self._write(tmp, "candidates.json", payload)
+            result = harness.run(
+                table, candidates, os.path.join(tmp, "report.md"),
+                os.path.join(tmp, "validation.json"))
+            self.assertEqual(result["status"], "pass", result["errors"])
+            self.assertEqual(result["region_coverage"]["deferred"], 1)
+            self.assertEqual(result["region_coverage"]["uncovered"], 0)
+
+    def test_region_covered_by_the_candidate_passes(self):
+        # The unmodified two-row fixture: the candidate covers the whole region.
+        with tempfile.TemporaryDirectory() as tmp:
+            table = self._write(tmp, "table.json", self._table())
+            payload = self._payload()
+            payload["environment_api_inventory_json"] = self._env(tmp)
+            candidates = self._write(tmp, "candidates.json", payload)
+            result = harness.run(
+                table, candidates, os.path.join(tmp, "report.md"),
+                os.path.join(tmp, "validation.json"))
+            self.assertEqual(result["status"], "pass", result["errors"])
+            self.assertEqual(result["region_coverage"]["covered"], 1)
+
+    def test_a_region_never_spans_a_donor(self):
+        # A fused kernel cannot cross a GEMM/attn/MoE/collective body, so the
+        # donor partitions the layer into independent regions -- it never
+        # merges the rows on either side into one.
+        rows = [
+            {"row_id": "a0", "pos": 0, "device_seq_index": 10, "stream": 8,
+             "duration_us": 6.0, "stage": "norm"},
+            {"row_id": "a1", "pos": 1, "device_seq_index": 11, "stream": 8,
+             "duration_us": 4.0, "stage": "quant"},
+            {"row_id": "g0", "pos": 2, "device_seq_index": 12, "stream": 8,
+             "duration_us": 90.0, "stage": "gemm"},
+            {"row_id": "b0", "pos": 3, "device_seq_index": 13, "stream": 8,
+             "duration_us": 6.0, "stage": "norm"},
+            {"row_id": "b1", "pos": 4, "device_seq_index": 14, "stream": 8,
+             "duration_us": 4.0, "stage": "quant"},
+        ]
+        regions = harness._fusible_regions(
+            {"tables": [{"phase": "prefill", "pattern_id": "P_DENSE",
+                         "rows": rows}]}, 5.0)
+        self.assertEqual([sorted(r[1]) for r in regions],
+                         [["a0", "a1"], ["b0", "b1"]])
 
 
 if __name__ == "__main__":

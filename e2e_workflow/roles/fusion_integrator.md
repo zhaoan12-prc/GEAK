@@ -113,7 +113,59 @@ This is the Phase 3.1/3.2 driver — the orchestrator has no fs access, so YOU l
    rules above.
 3. Persist each accepted fusion under `FUSION_OVERLAYS_DIR/<model>/<fusion>/` and the final stacked
    combined-loader under `.../<model>/combined/`. Return `FUSION_APPLY_SCHEMA`:
-   `{accepted_fusions:[{fusion,rung,overlay_path,tpot_delta_pct,throughput_delta_pct,nonoverlap,
-   gsm8k_base,gsm8k_cand,engaged}], final_overlay (the stacked combined-loader dir), 
-   e2e_throughput_tok_s (final), rejected:[…], deferred_author_count, notes}`. The orchestrator
+   `{accepted_fusions:[{exec_id,fusion,rung,overlay_path,tpot_delta_pct,throughput_delta_pct,
+   nonoverlap,gsm8k_base,gsm8k_cand,engaged}], final_overlay (the stacked combined-loader dir),
+   e2e_throughput_tok_s (final), rejected:[{exec_id,reason}], deferred:[{exec_id,reason}],
+   deferred_author_count, applyback_gate_json, applyback_report_md, notes}`. The orchestrator
    then reprofiles + re-strategizes on `final_overlay`.
+
+## 🔴 Coverage — the execution list is your denominator (mandatory, harness-enforced)
+
+`FUSION_TOPK_JSON.execution_list` is not a menu of suggestions. **Every `exec_id` on it
+must end this phase with an explicit disposition**, and `scripts/fusion_applyback_harness.py`
+checks that before your return is trusted:
+
+| disposition | when | who says it |
+|---|---|---|
+| `applied` | integrated, gated, kept | you — `accepted_fusions[]` |
+| `blocked` | attempted or ruled out — wire failure, accuracy gate, kernel not built, 单侧 fail | you — `rejected[]`, **with a reason** |
+| `deferred_with_reason` | knowingly left for next round | you — `deferred[]`, **with a reason** |
+| `blocked_by_exclusion` | a conflicting entry in its exclusive group was applied | derived by the harness |
+| `deferred_budget` | ranked beyond `FUSION_BUDGET` | derived by the harness |
+| `unaccounted` | nobody said anything | **the gate FAILS** |
+
+Three things about this that are easy to get wrong:
+
+- **"Not mentioned" is not "skipped".** Step 1 above filters the board down to
+  `unit_side_status==pass` tier-B within `FUSION_BUDGET`. That filter is legitimate; what
+  is not legitimate is the filtered rows vanishing from the report. Every row you filtered
+  out still needs its one-line reason. On DSR1 2026-08-26 the apply-back returned two
+  accepted fusions and read as a complete success while the **rank-1 decode candidate**
+  (kv-write cluster, 5.76% of decode forward) had no disposition anywhere — not applied,
+  not blocked, not deferred, just absent.
+- **The budget only excuses the tail.** `--budget N` covers rows ranked beyond N, in board
+  order. A rank-2 row you skipped while integrating a rank-9 row is not a budget effect and
+  stays red.
+- **Exclusion is derived, and only from a REAL conflict.** The harness reads the board's
+  pairwise `conflict_edges`; only entries that actually conflict with something you APPLIED
+  get auto-blocked. Being in the same group as an applied entry is not enough — a
+  `compatible_subset` group has members that could legally have landed together.
+
+Reasons must be reasons. `"skipped"`, `""`, and `"not attempted"` are rejected; the failure
+they hide is exactly the one the gate exists to surface.
+
+Run the gate yourself before returning, and fix what it reports rather than working around it:
+
+```bash
+python3 "$SKILL_DIR/scripts/fusion_applyback_harness.py" \
+  --topk "$FUSION_TOPK_JSON" \
+  --apply "$EVAL_DIR/fusion/apply_result.json" \
+  --unitside "$FUSION_UNITSIDE_JSON" \
+  --budget "$FUSION_BUDGET" \
+  --out-md "$EVAL_DIR/03_FUSION_APPLYBACK.md" \
+  --out-json "$EVAL_DIR/fusion/fusion_applyback.json"
+```
+
+`--allow-partial-coverage` exists for a knowingly incomplete round; it prints the gap just
+as loudly and it is not a way to make the red go away. Never edit or weaken the harness —
+a red gate is fixed by giving the missing rows a disposition.

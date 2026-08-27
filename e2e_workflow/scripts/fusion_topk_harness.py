@@ -285,6 +285,10 @@ def rank(candidates_path, validation_path, semantic_table_path, top_k,
                 "impl_class": Counter(
                     o.get("implementation_class") for o in occ).most_common(
                         1)[0][0] if occ else None,
+                # The concrete candidates this row stands for. Phase 3.0/3.1
+                # account against these ids, so the row is an assignment rather
+                # than a suggestion.
+                "candidate_ids": sorted(o["candidate_id"] for o in occ),
             }
         ranked_recipes.append({
             "recipe_key": recipe["recipe_key"],
@@ -350,6 +354,7 @@ def rank(candidates_path, validation_path, semantic_table_path, top_k,
                 "exact": pp.get("exact", "无"),
                 "recipe_key": recipe["recipe_key"],
                 "removable_key": removable_key,
+                "candidate_ids": pp.get("candidate_ids") or [],
                 "mutually_exclusive_with": recipe["mutually_exclusive_with"],
             }
             if pp["tier"] in show_tiers:
@@ -373,20 +378,139 @@ def rank(candidates_path, validation_path, semantic_table_path, top_k,
         key = (a["phase"], a["removable_key"], a["tier"])
         if a["removable_key"] and key in seen:
             seen[key]["variant_count"] += 1
+            # A folded variant is the SAME fusion by another backend name --
+            # its candidates still have to be accounted for downstream.
+            seen[key]["candidate_ids"] = sorted(
+                set(seen[key]["candidate_ids"]) | set(a["candidate_ids"]))
             continue
         a["variant_count"] = 1
         seen[key] = a
         collapsed.append(a)
     actions = collapsed
-    if top_k:
+    truncated = []
+    if top_k and len(actions) > top_k:
+        # A silent [:K] makes the board read as "this is the whole surface".
+        # It is not: on DSR1 2026-08-26 the fusion phase produced 42 candidates
+        # and the reader saw a table with no denominator on it.
+        truncated = actions[top_k:]
         actions = actions[:top_k]
-    for a in actions + deferred_author:  # drop internal unserializable key
+    for a in actions + truncated + deferred_author:  # drop unserializable key
         a.pop("removable_key", None)
 
+    # ---- the binding execution list -------------------------------------
+    # Top-K used to describe itself as an ADVISORY routing prior, and Phase 3
+    # treated it that way: 42 candidates in, 16 verdicts out, no row anywhere
+    # saying what happened to the other 26. The board now emits the DENOMINATOR
+    # the later phases are accounted against.
+    exec_list = []
+    for index, a in enumerate(actions, 1):
+        exec_list.append({
+            "exec_id": "e%02d" % index,
+            "rank": index,
+            "phase": a["phase"],
+            "tier": a["tier"],
+            "action": a["action"],
+            "handle": a["handle"],
+            "candidate_ids": a["candidate_ids"],
+            "forward_us": a["forward_us"],
+            "forward_pct": a["forward_pct"],
+            "exclusive_group": None,
+            # Every entry must end in one of these downstream. "not mentioned"
+            # is not an outcome.
+            "required_disposition": [
+                "applied", "blocked", "deferred_with_reason"],
+        })
+
+    # Mutual exclusion becomes an explicit DECIDE-ONE group instead of a ✳ in a
+    # column. The reader still chooses; what changes is that not choosing is now
+    # visibly an open decision rather than a silently dropped row.
+    exec_by_recipe = defaultdict(list)
+    for entry, a in zip(exec_list, actions):
+        exec_by_recipe[(a["phase"], a["recipe_key"])].append(entry["exec_id"])
+
+    # Exclusion is a pairwise CONFLICT GRAPH, not an equivalence class. Two
+    # entries conflict when they consume the same row at the same position; that
+    # relation is emphatically not transitive -- A can conflict with B and B
+    # with C while A and C land together happily. Collapsing a component into
+    # "choose exactly one" would quietly forbid a legal combination, which is
+    # the same failure as dropping a candidate, just dressed as caution. So the
+    # component is reported with its actual edges, and "choose 1" is claimed
+    # only when every pair inside it really does conflict.
+    conflicts = set()
+    for entry, a in zip(exec_list, actions):
+        for other_key in a.get("mutually_exclusive_with") or []:
+            for other_id in exec_by_recipe.get((a["phase"], other_key), []):
+                if other_id != entry["exec_id"]:
+                    conflicts.add(
+                        tuple(sorted((entry["exec_id"], other_id))))
+    parent = {e["exec_id"]: e["exec_id"] for e in exec_list}
+
+    def _find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for left, right in conflicts:
+        ra, rb = _find(left), _find(right)
+        if ra != rb:
+            parent[rb] = ra
+    groups = defaultdict(list)
+    for entry in exec_list:
+        groups[_find(entry["exec_id"])].append(entry)
+    by_id = {e["exec_id"]: e for e in exec_list}
+    exclusive_groups = []
+    for gindex, (_root, members) in enumerate(
+            sorted((k, v) for k, v in groups.items() if len(v) > 1), 1):
+        group_id = "x%02d" % gindex
+        ids = [m["exec_id"] for m in members]
+        edges = sorted(
+            pair for pair in conflicts
+            if pair[0] in set(ids) and pair[1] in set(ids))
+        is_clique = len(edges) == len(ids) * (len(ids) - 1) // 2
+        for entry in members:
+            entry["exclusive_group"] = group_id
+            entry["conflicts_with"] = sorted(
+                other for pair in conflicts if entry["exec_id"] in pair
+                for other in pair if other != entry["exec_id"])
+        exclusive_groups.append({
+            "group_id": group_id,
+            "phase": members[0]["phase"],
+            "choose": 1 if is_clique else "compatible_subset",
+            "conflict_edges": [list(pair) for pair in edges],
+            "reason": (
+                "these fusions consume the same rows at the same position; "
+                "exactly one can land there" if is_clique else
+                "these fusions overlap PAIRWISE (see conflict_edges); pick any "
+                "set with no conflicting pair -- not necessarily just one"),
+            "member_exec_ids": ids,
+            "members": [
+                {"exec_id": m["exec_id"], "action": m["action"],
+                 "tier": m["tier"], "forward_pct": m["forward_pct"],
+                 "conflicts_with": m.get("conflicts_with", []),
+                 "candidate_ids": m["candidate_ids"]}
+                for m in members],
+        })
+
+    all_candidate_ids = sorted(candidates)
+    listed_ids = sorted({
+        cid for a in actions for cid in a["candidate_ids"]})
     result = {
-        "schema_version": 2,
+        "schema_version": 3,
         "phase": "rank_topk",
         "top_k": top_k,
+        # Coverage travels WITH the board. A Top-K built on a phase whose shapes
+        # were never resolved, or on a table with uncovered fusible regions, is
+        # a ranking of an incomplete surface -- the reader has to be able to see
+        # that on the same page as the ranking.
+        "phase_coverage": validation.get("phase_coverage"),
+        "region_coverage": validation.get("region_coverage"),
+        "candidate_total": len(all_candidate_ids),
+        "candidates_on_board": len(listed_ids),
+        "truncated_count": len(truncated),
+        "truncated_actions": truncated,
+        "execution_list": exec_list,
+        "exclusive_groups": exclusive_groups,
         "shown_tiers": sorted(show_tiers),
         "tier_weights": TIER_WEIGHT,
         "phase_total_forward_us": phase_total,
@@ -409,6 +533,106 @@ def tier_rank_c(tier):
     return {"C1": 0, "C2": 1, "C3": 2}.get(tier, 3)
 
 
+def _render_coverage(result):
+    """The denominator and the evidence class, on the same page as the ranking.
+
+    A Top-K with no denominator on it reads as "this is the whole surface".
+    On DSR1 2026-08-26 it was 12 rows out of 42 candidates, on a table whose
+    decode shapes had never been resolved, and nothing on the page said so.
+    """
+    lines = ["## 覆盖与证据（先看这里，再看排名）", ""]
+    pc = result.get("phase_coverage") or {}
+    rc = result.get("region_coverage") or {}
+    if pc.get("available"):
+        stats = pc.get("shape_resolution_by_phase") or {}
+        for phase in sorted(stats):
+            stat = stats[phase] or {}
+            lines.append(
+                "- **%s** shape 解析 %s/%s（%.0f%%）"
+                % (phase, stat.get("resolved"), stat.get("rows"),
+                   100.0 * float(stat.get("resolved_fraction") or 0.0)))
+        if pc.get("decode_evidence"):
+            lines.append("- decode 证据等级：`%s`%s" % (
+                pc["decode_evidence"],
+                "（需 eager shape probe）"
+                if pc.get("decode_requires_eager_probe") else ""))
+        for problem in pc.get("problems") or []:
+            lines.append("- ⚠️ %s" % problem)
+        if pc.get("waiver"):
+            lines.append("- ⚠️ 覆盖问题被显式豁免：%s" % pc["waiver"])
+    else:
+        lines.append(
+            "- ⚠️ 上游未提供 `phase_coverage`：**无法确认 decode 是否被分析过**。")
+    if rc:
+        lines.append(
+            "- 可融合区间（fusible region）：%s 个，已覆盖 %s / 已延后 %s / "
+            "**未覆盖 %s**"
+            % (rc.get("regions_total"), rc.get("covered"),
+               rc.get("deferred"), rc.get("uncovered")))
+    total = result.get("candidate_total")
+    if total:
+        lines.append(
+            "- 候选 %s 条，进入本板 %s 条；因 `--top-k %s` 截断 %s 条"
+            % (total, result.get("candidates_on_board"), result.get("top_k"),
+               result.get("truncated_count", 0)))
+    lines.append("")
+    for a in result.get("truncated_actions") or []:
+        lines.append("  - 截断：%s（%s，%.2f%%）" % (
+            a["action"], a["tier"], a.get("forward_pct") or 0.0))
+    if result.get("truncated_actions"):
+        lines.append("")
+    return lines
+
+
+def _render_execution_list(result):
+    """The board as an assignment list, not a suggestion list.
+
+    Phase 3.0 (单侧) and Phase 3.1 (apply-back) are accounted against these
+    entries: every one must end `applied`, `blocked`, or `deferred` WITH a
+    reason. Silence is not a disposition.
+    """
+    exec_list = result.get("execution_list") or []
+    if not exec_list:
+        return []
+    lines = ["## 执行清单（Phase 3.0/3.1 按此逐条交代）", ""]
+    lines.append(
+        "下面每一条都必须在 3.0 单侧 / 3.1 apply-back 里有明确结论："
+        "**已落地 / 被挡（原因）/ 延后（原因）**。没提到 = 覆盖漏洞，不是「跳过」。")
+    lines.append("")
+    lines.append("| exec | 阶段 | 难度 | 动作 | 候选 ID | 收益 | 互斥组 |")
+    lines.append("|:--|:--:|:--:|---|---|---:|:--:|")
+    for entry in exec_list:
+        lines.append("| `%s` | %s | **%s** | %s | %s | %s | %s |" % (
+            entry["exec_id"], entry["phase"].capitalize(), entry["tier"],
+            _esc(entry["action"]),
+            ", ".join("`%s`" % c for c in entry["candidate_ids"]) or "-",
+            ("%.2f%%" % entry["forward_pct"])
+            if entry.get("forward_pct") is not None else "n/a",
+            entry.get("exclusive_group") or "-"))
+    lines.append("")
+    for group in result.get("exclusive_groups") or []:
+        if group.get("choose") == 1:
+            lines.append(
+                "> **互斥组 `%s`（%s）：以下 %d 条只能落一条，必须显式择一**"
+                % (group["group_id"], group["phase"], len(group["members"])))
+        else:
+            lines.append(
+                "> **重叠组 `%s`（%s）：以下 %d 条两两部分冲突，选一组互不冲突的**"
+                % (group["group_id"], group["phase"], len(group["members"])))
+        for member in group["members"]:
+            conflict = member.get("conflicts_with") or []
+            lines.append("> - `%s` %s（%s，%s）%s" % (
+                member["exec_id"], _esc(member["action"]), member["tier"],
+                ("%.2f%%" % member["forward_pct"])
+                if member.get("forward_pct") is not None else "n/a",
+                ("　与 %s 冲突" % ", ".join("`%s`" % c for c in conflict))
+                if conflict else ""))
+        lines.append(">")
+        lines.append("> 未做选择 = 未决事项，不等于这批融合不存在。")
+        lines.append("")
+    return lines
+
+
 def render_markdown(result, actions):
     lines = ["# Kernel Fusion Top-K (Phase 2.2)", ""]
     fwd = result["phase_total_forward_us"]
@@ -426,6 +650,13 @@ def render_markdown(result, actions):
                  % (fwd.get("prefill", 0.0), fwd.get("decode", 0.0)))
     lines.append("互斥（✳）的融合方案（同批算子、每处只落一个）都列出、标注供你/3.2 选，不替你择优。")
     lines.append("")
+    lines.append(
+        "**本板是执行清单，不是建议清单。** 文末「执行清单」里的每一条，"
+        "3.0 单侧 / 3.1 apply-back 都必须给出明确处置（已落地 / 被挡 / 延后+原因）；"
+        "互斥组内选哪一条仍然由你/3.2 决定，但**不做选择本身是一个未决事项**，"
+        "不能当成这批融合不存在。")
+    lines.append("")
+    lines.extend(_render_coverage(result))
     _HEADER = (
         "| 排名 | 实现难度 | 阶段 | 优先行动（集成什么） | 覆盖范围 | "
         "对应 Kernel / API（怎么开）| 预期整-forward 收益 | 现成算子 | 互斥 |")
@@ -467,6 +698,7 @@ def render_markdown(result, actions):
             result["deferred_author"],
             key=lambda x: (tier_rank_c(x["tier"]), -(x["forward_pct"] or 0.0))))
         lines.append("")
+    lines.extend(_render_execution_list(result))
     lines.append(
         "说明：收益为 roofline 工程估算（融合消除的访存往返+launch），"
         "非实测、以 benchmark 为准；只计当前可落地(actionable)的层，guard 挡住/需自写的不计入。"

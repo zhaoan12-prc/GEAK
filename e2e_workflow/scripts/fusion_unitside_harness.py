@@ -18,15 +18,39 @@ with the Phase 2.1 candidate it claims to test) and derives the gate:
 
 A verdict that is malformed, references an unknown candidate, tests a DIFFERENT shape
 than the candidate captured, or names a fused_fn that is not the candidate's existing
-API is an ERROR (untrustworthy → the harness FAILS so it is re-run) — never silently a
+API is an ERROR (untrustworthy → the harness FAILS so it is re-run) -- never silently a
 pass. This is the anti-cheat that keeps 单侧 honest, mirroring the provenance checks in
 fusion_candidate_harness.py.
+
+COVERAGE (recall) gate
+----------------------
+The checks above are all *precision*: they ask whether a SUBMITTED verdict is
+trustworthy. They cannot see a candidate for which no verdict was ever submitted,
+because the validator loops over verdicts, not over candidates. A run that
+microbenched 16 of 42 candidates therefore rendered as
+"总计 16 条 verdict：pass 16 / fail 0 ... status=pass" -- a 38%-coverage run that is
+indistinguishable from a complete one. Observed on DSR1 2026-08-26: the highest
+roofline decode candidate (kv_write_cluster) and all 20 prefill candidates silently
+never reached the microbench, and nothing anywhere turned red.
+
+So the denominator is now explicit. Every candidate that CITES an existing fused API
+(i.e. is 单侧-testable at all) must end up in exactly one of:
+
+  * a real verdict (pass / fail / blocked), or
+  * an explicit `--waive <candidate_id>=<reason>` (status `waived`), or
+  * `not_validated` → the harness FAILS.
+
+tier-C candidates (`implementation_class: new_helper_kernel`, i.e. no existing kernel
+to bench) are reported as `deferred_author` and are legitimately out of scope -- they
+are counted and shown, never silently dropped. Pass `--allow-partial-coverage` to
+report the gap without failing (the gap is still printed loudly either way).
 
 Usage:
   python3 fusion_unitside_harness.py --candidates fusion_candidates.json \
       --verdicts <dir-of-*.json | combined.json> \
       --out-md FUSION_UNITSIDE.md --out-json fusion_unitside.json \
-      [--min-speedup 1.0]
+      [--min-speedup 1.0] [--allow-partial-coverage] \
+      [--waive <candidate_id>=<reason> ...]
 """
 import argparse
 import glob
@@ -114,17 +138,61 @@ def _tested_shape_tuple(tested_shape):
         return None
 
 
-def validate(candidates_path, verdicts_path, min_speedup=1.0):
+# tier-C: the candidate has no existing fused kernel, so there is nothing to
+# microbench against the split reference. Legitimately out of 单侧 scope -- but it is
+# REPORTED (deferred_author), never dropped from the denominator silently.
+DEFERRED_CLASSES = ("new_helper_kernel",)
+
+ROW_FIELDS = ("candidate_id", "family", "phase", "tier_hint", "unit_side_status",
+              "reason", "parity", "isolated_speedup", "ref_ms", "cand_ms",
+              "engaged", "tested_shape", "fused_fn", "tp", "tol")
+
+
+def _in_scope(candidate):
+    """True iff this candidate is 单侧-testable: it cites an existing fused API.
+
+    tier-C (author a new kernel) has nothing to bench -> out of scope (deferred),
+    not missing. Everything else MUST produce a verdict or an explicit waiver."""
+    if str(candidate.get("implementation_class") or "") in DEFERRED_CLASSES:
+        return False
+    return bool(candidate.get("existing_apis"))
+
+
+def _row(cid, candidate, status, reason, **extra):
+    """One result row with a uniform schema, so coverage rows (which have no
+    measurement) render alongside verdict rows without KeyErrors."""
+    row = {f: None for f in ROW_FIELDS}
+    row.update({
+        "candidate_id": cid,
+        "family": candidate.get("family") if candidate else None,
+        "phase": candidate.get("phase") if candidate else None,
+        "tier_hint": candidate.get("implementation_class") if candidate else None,
+        "unit_side_status": status,
+        "reason": reason,
+    })
+    row.update(extra)
+    return row
+
+
+def validate(candidates_path, verdicts_path, min_speedup=1.0,
+             require_coverage=True, waivers=None):
     payload = _load(candidates_path)
-    candidates = {c["candidate_id"]: c
-                  for c in payload.get("candidates", [])}
+    candidate_list = payload.get("candidates", [])
+    candidates = {c["candidate_id"]: c for c in candidate_list}
     verdicts = _load_verdicts(verdicts_path)
+    waivers = dict(waivers or {})
 
     errors = []
     results = []
+    # Every candidate_id a verdict was SUBMITTED for -- including ones whose
+    # verdict turned out untrustworthy. An untrustworthy verdict is a loud error
+    # already; it must not ALSO be reported as a silent coverage gap.
+    submitted = set()
     for index, verdict in enumerate(verdicts):
         vp = "verdict[%d]" % index
         cid = verdict.get("candidate_id")
+        if cid:
+            submitted.add(cid)
         # 1. well-formed
         missing = [f for f in REQUIRED_VERDICT_FIELDS if verdict.get(f) is None]
         if missing:
@@ -219,16 +287,80 @@ def validate(candidates_path, verdicts_path, min_speedup=1.0):
             "tol": verdict.get("tol"),
         })
 
-    counts = {"pass": 0, "fail": 0, "blocked": 0}
+    # ---- COVERAGE (recall): close the loop over CANDIDATES, not verdicts ------
+    # Up to here the loop was verdict-driven, so a candidate nobody benched was
+    # invisible. Walk the candidate list and give every in-scope candidate an
+    # explicit disposition.
+    coverage_rows = []
+    unvalidated = []
+    waived_unknown = sorted(set(waivers) - set(candidates))
+    for candidate in candidate_list:
+        cid = candidate.get("candidate_id")
+        if not cid or cid in submitted:
+            continue
+        if not _in_scope(candidate):
+            coverage_rows.append(_row(
+                cid, candidate, "deferred_author",
+                "no existing fused kernel (tier-C, 需自写) — out of 单侧 scope, "
+                "counted but not benched"))
+            continue
+        if cid in waivers:
+            coverage_rows.append(_row(
+                cid, candidate, "waived",
+                "explicitly waived: %s" % waivers[cid]))
+            continue
+        coverage_rows.append(_row(
+            cid, candidate, "not_validated",
+            "NO verdict submitted — this candidate never reached the microbench"))
+        unvalidated.append(cid)
+    results.extend(coverage_rows)
+    for cid in waived_unknown:
+        errors.append("--waive references unknown candidate_id '%s'" % cid)
+
+    in_scope = [c for c in candidate_list if _in_scope(c)]
+    by_phase = {}
+    for candidate in in_scope:
+        ph = str(candidate.get("phase") or "?")
+        slot = by_phase.setdefault(ph, {"in_scope": 0, "validated": 0,
+                                        "waived": 0, "not_validated": 0})
+        slot["in_scope"] += 1
+        cid = candidate.get("candidate_id")
+        if cid in submitted:
+            slot["validated"] += 1
+        elif cid in waivers:
+            slot["waived"] += 1
+        else:
+            slot["not_validated"] += 1
+    coverage = {
+        "required": require_coverage,
+        "in_scope": len(in_scope),
+        "validated": sum(1 for c in in_scope if c.get("candidate_id") in submitted),
+        "waived": sum(1 for c in in_scope
+                      if c.get("candidate_id") not in submitted
+                      and c.get("candidate_id") in waivers),
+        "not_validated": len(unvalidated),
+        "not_validated_ids": unvalidated,
+        "deferred_author": sum(1 for c in candidate_list if not _in_scope(c)),
+        "candidates_total": len(candidate_list),
+        "by_phase": by_phase,
+        "complete": not unvalidated,
+    }
+
+    counts = {"pass": 0, "fail": 0, "blocked": 0,
+              "not_validated": 0, "waived": 0, "deferred_author": 0}
     for r in results:
         counts[r["unit_side_status"]] = counts.get(r["unit_side_status"], 0) + 1
+
+    coverage_fail = bool(require_coverage and unvalidated)
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "phase": "unitside_gate",
-        "status": "pass" if not errors else "fail",
+        "status": "fail" if (errors or coverage_fail) else "pass",
         "min_speedup": min_speedup,
         "candidates_json": os.path.abspath(candidates_path),
         "errors": errors,
+        "coverage": coverage,
+        "coverage_ok": not coverage_fail,
         "counts": counts,
         "verdict_count": len(verdicts),
         "results": results,
@@ -248,6 +380,32 @@ def render_markdown(result):
         "fused 路径未生效(size-guard 回退)，非失败；`fail` = 无收益/不正确。")
     lines.append("")
     c = result["counts"]
+    cov = result.get("coverage") or {}
+    # Coverage FIRST: the denominator is the headline. A report that leads with
+    # "16 verdict, 16 pass" reads as complete at 38% coverage -- that is exactly the
+    # failure this section exists to make impossible.
+    if cov:
+        lines.append(
+            "**覆盖率**：在范围内候选 **%d** / 已验证 **%d** / 未验证 **%d** / 豁免 %d"
+            "；tier-C 待自写 %d（不计入范围）；候选总数 %d。"
+            % (cov.get("in_scope", 0), cov.get("validated", 0),
+               cov.get("not_validated", 0), cov.get("waived", 0),
+               cov.get("deferred_author", 0), cov.get("candidates_total", 0)))
+        by_phase = cov.get("by_phase") or {}
+        if by_phase:
+            lines.append("")
+            lines.append("分阶段覆盖：" + "；".join(
+                "%s **%d/%d**" % (ph, v.get("validated", 0) + v.get("waived", 0),
+                                  v.get("in_scope", 0))
+                for ph, v in sorted(by_phase.items())) + "。")
+        lines.append("")
+        if cov.get("not_validated"):
+            lines.append(
+                "> 🔴 **覆盖率不完整**：%d 条在范围内的候选从未提交 verdict。"
+                "单侧结论对它们**没有任何结论**——不是 pass，也不是 fail，是没测。"
+                "补测或用 `--waive <id>=<理由>` 显式豁免。"
+                % cov.get("not_validated", 0))
+            lines.append("")
     lines.append("总计 %d 条 verdict：pass %d / fail %d / blocked %d；harness status=**%s**（错误 %d）。"
                  % (result["verdict_count"], c.get("pass", 0), c.get("fail", 0),
                     c.get("blocked", 0), result["status"], len(result["errors"])))
@@ -261,6 +419,18 @@ def render_markdown(result):
             r["unit_side_status"], _esc(r["parity"]), sp, _esc(r["engaged"]),
             _esc(r["tested_shape"]), _esc(r["fused_fn"]), _esc(r["reason"])))
     lines.append("")
+    gaps = [r for r in result["results"]
+            if r.get("unit_side_status") == "not_validated"]
+    if gaps:
+        lines.append("## 覆盖率缺口：未验证候选（必须补 verdict 或显式豁免）")
+        lines.append("")
+        lines.append("| 候选 | 阶段 | family | tier | 说明 |")
+        lines.append("|---|:--:|---|---|---|")
+        for r in gaps:
+            lines.append("| `%s` | %s | %s | %s | %s |" % (
+                _esc(r["candidate_id"]), _esc(r["phase"]), _esc(r["family"]),
+                _esc(r["tier_hint"]), _esc(r["reason"])))
+        lines.append("")
     if result["errors"]:
         lines.append("## 不可信 verdict（harness 错误，需按报错重跑，不得当作 pass）")
         lines.append("")
@@ -271,13 +441,32 @@ def render_markdown(result):
         "说明：本 gate 只校验 microbench verdict 的**可信度**（字段完整 + 候选存在 + "
         "tested_shape 属于候选抓到的 member shape + fused_fn 属于候选 existing_apis + "
         "collective 是否真生效）并据此判 pass/fail/blocked；它不跑 kernel、不产生自己的 "
-        "perf 数字。isolated speedup / parity 由 fusion_unit_validator 的隔离 microbench 实测。")
+        "perf 数字。isolated speedup / parity 由 fusion_unit_validator 的隔离 microbench 实测。"
+        "**并且**校验覆盖率：每条在范围内的候选都必须有 verdict 或显式豁免，"
+        "否则 `not_validated` 且 harness fail——「没测」不得渲染成「测过了」。")
     lines.append("")
     return "\n".join(lines) + "\n"
 
 
-def run(candidates_path, verdicts_path, out_md, out_json, min_speedup=1.0):
-    result = validate(candidates_path, verdicts_path, min_speedup)
+def _parse_waivers(pairs):
+    """--waive dc_kv=needs paged-KV state -> {"dc_kv": "needs paged-KV state"}.
+    A waiver without a reason is rejected: "skipped" is not a reason."""
+    out = {}
+    for item in pairs or []:
+        cid, sep, reason = str(item).partition("=")
+        cid, reason = cid.strip(), reason.strip()
+        if not sep or not cid or not reason:
+            raise SystemExit(
+                "--waive must be <candidate_id>=<reason> with a non-empty reason; "
+                "got %r" % item)
+        out[cid] = reason
+    return out
+
+
+def run(candidates_path, verdicts_path, out_md, out_json, min_speedup=1.0,
+        require_coverage=True, waivers=None):
+    result = validate(candidates_path, verdicts_path, min_speedup,
+                      require_coverage=require_coverage, waivers=waivers)
     os.makedirs(os.path.dirname(os.path.abspath(out_json)), exist_ok=True)
     with open(out_json, "w") as fh:
         json.dump(result, fh, indent=2, ensure_ascii=False)
@@ -295,11 +484,26 @@ def main():
     parser.add_argument("--out-json", required=True)
     parser.add_argument("--min-speedup", type=float, default=1.0,
                         help="isolated_speedup must exceed this for a pass (default 1.0)")
+    parser.add_argument("--allow-partial-coverage", action="store_true",
+                        help="report the coverage gap without failing the gate "
+                             "(the gap is printed loudly either way)")
+    parser.add_argument("--waive", action="append", metavar="ID=REASON", default=[],
+                        help="explicitly waive one candidate from the coverage "
+                             "requirement, with a reason (repeatable)")
     args = parser.parse_args()
     result = run(args.candidates, args.verdicts, args.out_md, args.out_json,
-                 args.min_speedup)
+                 args.min_speedup,
+                 require_coverage=not args.allow_partial_coverage,
+                 waivers=_parse_waivers(args.waive))
+    cov = result.get("coverage") or {}
     print(json.dumps({"status": result["status"], "counts": result["counts"],
-                      "errors": len(result["errors"])}, indent=2))
+                      "errors": len(result["errors"]),
+                      "coverage": {k: cov.get(k) for k in
+                                   ("in_scope", "validated", "not_validated",
+                                    "waived", "deferred_author", "complete")}},
+                     indent=2))
+    if result["status"] != "pass":
+        return 1
     return 0
 
 

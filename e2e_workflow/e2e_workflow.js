@@ -499,11 +499,19 @@ const STRATEGY_SCHEMA = obj({
 // and returns the accepted set + the final stacked overlay + the new throughput. The
 // orchestrator then reprofiles + re-strategizes on the fused baseline. (Same "one role call
 // loops the candidates and keeps wins" pattern as config_tuner:sweep.)
+// COVERAGE: `accepted_fusions` alone made a 2-of-12 round render as a success. The
+// Top-K execution_list is the denominator now, so the return also carries the rows that
+// did NOT land — `rejected` (blocked, with a reason) and `deferred` (left for next round,
+// with a reason) — plus the applyback gate's own verdict. `fusion_applyback_harness.py`
+// fails on any exec_id nobody accounted for; "not mentioned" is a hole, not a skip.
 const FUSION_APPLY_SCHEMA = obj({
-  accepted_fusions: arrObj,   // [{fusion, rung, overlay_path, tpot_delta_pct, throughput_delta_pct, nonoverlap, gsm8k_base, gsm8k_cand, engaged}]
+  accepted_fusions: arrObj,   // [{exec_id, fusion, rung, overlay_path, tpot_delta_pct, throughput_delta_pct, nonoverlap, gsm8k_base, gsm8k_cand, engaged}]
   final_overlay: { type: 'string' },      // stacked combined-loader overlay dir (PYTHONPATH), '' if none accepted
   e2e_throughput_tok_s: { type: 'number' },
-  rejected: arrObj, deferred_author_count: { type: 'number' },
+  rejected: arrObj,           // [{exec_id, reason}] — attempted or ruled out
+  deferred: arrObj,           // [{exec_id, reason}] — knowingly left for next round
+  deferred_author_count: { type: 'number' },
+  applyback_gate_json: { type: 'string' }, applyback_report_md: { type: 'string' },
   notes: { type: 'string' },
 }, ['accepted_fusions']);
 
@@ -1342,7 +1350,12 @@ if (want('head') && FUSION_INPUTS.FUSION_TOPK_JSON) {
       'prove the ENGAGED banner on all TP ranks, run an interleaved A/B (cand_min>ref_max + >noise band) vs the ' +
       'CURRENT baseline, and a gsm8k accuracy gate (--max-tokens 4096) for quant fusions. STACK accepted overlays ' +
       'via a combined-loader; on wire/gate/accuracy failure DEGRADE to the next ladder rung, then move to the next ' +
-      'candidate. Skip tier-C (author, 二期). Return the accepted set + the final stacked overlay dir + new tok/s.', {
+      'candidate. Skip tier-C (author, 二期). COVERAGE: FUSION_TOPK_JSON.execution_list is the ' +
+      'denominator — EVERY exec_id must end applied / blocked+reason (rejected[]) / deferred+reason ' +
+      '(deferred[]); a row you filtered out (not 单侧-pass, not tier-B, past budget) still needs its ' +
+      'one-line reason. Run scripts/fusion_applyback_harness.py --topk --apply --unitside --budget ' +
+      'before returning and fix what it reports; return its report + json paths. ' +
+      'Return the accepted set + the final stacked overlay dir + new tok/s.', {
         EVAL_DIR, MODEL_PATH, SERVING_GPU, TP: SERVING_TP, WORKLOAD,
         FUSION_TOPK_JSON: FUSION_INPUTS.FUSION_TOPK_JSON,
         FUSION_CANDIDATES_JSON: FUSION_INPUTS.FUSION_CANDIDATES_JSON,
@@ -1354,6 +1367,18 @@ if (want('head') && FUSION_INPUTS.FUSION_TOPK_JSON) {
       }),
     { phase: 'FusionApplyBack', label: 'fusion_integrator:apply_back', schema: FUSION_APPLY_SCHEMA });
   const acc = (fapply && Array.isArray(fapply.accepted_fusions)) ? fapply.accepted_fusions : [];
+  // Surface the coverage verdict in the run log next to the win count. Two accepted
+  // fusions out of a twelve-row board is a real result AND an incomplete one; the log
+  // should not report only the half that looks like success.
+  if (fapply) {
+    const dispositioned = acc.length
+      + (Array.isArray(fapply.rejected) ? fapply.rejected.length : 0)
+      + (Array.isArray(fapply.deferred) ? fapply.deferred.length : 0);
+    log(`Fusion apply-back coverage: ${dispositioned} execution-list row(s) given an explicit ` +
+        `disposition (applied ${acc.length} / blocked ${(fapply.rejected || []).length} / ` +
+        `deferred ${(fapply.deferred || []).length}); gate report: ` +
+        `${fapply.applyback_report_md || '(not run — fusion_applyback_harness.py was skipped)'}`);
+  }
   if (acc.length) {
     curOverlay = fapply.final_overlay || curOverlay;
     if (fapply.e2e_throughput_tok_s && fapply.e2e_throughput_tok_s > curTput) curTput = fapply.e2e_throughput_tok_s;
