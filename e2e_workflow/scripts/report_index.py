@@ -99,6 +99,17 @@ def _summarise(kind, data):
             parts.append("区间 %d：覆盖 %d / 延后 %d / 未覆盖 %d"
                          % (rc.get("regions_total", 0), rc.get("covered", 0),
                             rc.get("deferred", 0), rc.get("uncovered", 0)))
+        # Known-fusion priors: the run-to-run stability number. It belongs on
+        # the index line because its failure mode is silence -- a prior that was
+        # never proposed shows up nowhere else on this page.
+        pr = data.get("prior_coverage") or (
+            data.get("metrics") or {}).get("prior_coverage") or {}
+        if pr:
+            parts.append("已知先验 %d：带入 %d / 已生效 %d / 不适用 %d / 无交代 %d"
+                         % (pr.get("priors_total", 0), pr.get("carried", 0),
+                            pr.get("already_engaged", 0),
+                            pr.get("not_applicable", 0),
+                            pr.get("undisposed", 0)))
         status = data.get("status") or ("fail" if data.get("errors") else "pass")
         flag = "🔴 fail" if status != "pass" else "✅ pass"
         if pc and pc.get("problems"):

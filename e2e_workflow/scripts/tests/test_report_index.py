@@ -201,5 +201,29 @@ class ReportIndexTest(unittest.TestCase):
                          [report_index.INDEX_NAME] + names)
 
 
+    def test_prior_coverage_reaches_the_index_line(self):
+        # A prior nobody disposed of is invisible everywhere else on this page:
+        # it produced no candidate, no row, and no symptom a reader would spot.
+        self._write("02_FUSION_CANDIDATES.md", "# candidates\n")
+        self._json("round1/fusion/fusion_candidate_result.json", {
+            "status": "fail",
+            "metrics": {"candidate_count": 42},
+            "prior_coverage": {"priors_total": 2, "carried": 1,
+                               "already_engaged": 0, "not_applicable": 0,
+                               "undisposed": 1},
+        })
+        index = report_index.run(self.dir)
+        md = open(index["index_path"]).read()
+        self.assertIn("已知先验 2", md)
+        self.assertIn("无交代 1", md)
+
+    def test_a_run_with_no_kb_shows_no_prior_line(self):
+        self._write("02_FUSION_CANDIDATES.md", "# candidates\n")
+        self._json("round1/fusion/fusion_candidate_result.json", {
+            "status": "pass", "metrics": {"candidate_count": 7}})
+        index = report_index.run(self.dir)
+        self.assertNotIn("已知先验", open(index["index_path"]).read())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,13 @@ import os
 import re
 import sys
 
+import fusion_priors
+
+try:
+    import fusion_catalog
+except Exception:  # noqa: BLE001 - catalog gate is opt-in via --catalog
+    fusion_catalog = None
+
 
 PHASE_ORDER = {"prefill": 0, "decode": 1}
 READINESS = {
@@ -17,8 +24,6 @@ READINESS = {
     "research_only",
 }
 EXACT_STATUS = {"yes", "no"}
-# Author-track classes (no existing kernel -> 现成算子=无).
-AUTHOR_CLASSES = {"new_helper_kernel", "main_kernel_or_algorithmic"}
 # Generic tokens that indicate a quantization output/arg in a routed call
 # signature. Used to check that a flag actually fuses quant before an A-tier
 # *_quant candidate may claim it — model/kernel-agnostic, no hard-coded answer.
@@ -544,6 +549,147 @@ def _semantic_index(table):
     return tables, rows, table_order
 
 
+# --- catalog falsification gate (opt-in via --catalog) -----------------------
+# Maps a candidate region's member stages to the shared op-tag vocabulary
+# (fusion_catalog._OP_RULES). 'elementwise'/'copy' are deliberately UNMAPPED:
+# they are too generic to assert an op, and over-tagging a region would only
+# make the containment test miss a real covering kernel (a safe, not a false,
+# error). Kernel-name tags are added on top from the same vocabulary.
+STAGE_OP_TAG = {
+    "kv_cache": "kv_cache", "quant": "quant", "norm": "norm",
+    "rmsnorm": "norm", "layernorm": "norm", "activation": "activation",
+    "rope": "rope", "allreduce": "allreduce", "communication": "allreduce",
+    "collective": "allreduce", "topk": "topk", "router": "topk",
+    "gemm": "gemm", "expert_gemm": "moe", "moe": "moe", "cast": "cast",
+    "layout": "layout",
+}
+
+
+def _region_op_tags(candidate):
+    """The op-set a candidate's removable region actually fuses."""
+    tags = set()
+    for member in candidate.get("members", []):
+        stage = str(member.get("stage") or "").lower()
+        if stage in STAGE_OP_TAG:
+            tags.add(STAGE_OP_TAG[stage])
+        if fusion_catalog is not None:
+            tags.update(fusion_catalog._op_tags(str(member.get("kernel") or "")))
+    return sorted(tags)
+
+
+def _region_dtype_tags(candidate):
+    """The precision the region operates in (fp8/fp4), for dtype-compat match.
+
+    Read from member tensor dtypes when the shape logger captured them; fall
+    back to fp8 when the region has a quant stage and nothing says fp4 (per-group
+    fp8 is the dominant quant scheme — this only tightens the match so an FP4
+    kernel cannot masquerade as covering an fp8 region)."""
+    tags = set()
+    has_quant = False
+    for member in candidate.get("members", []):
+        if str(member.get("stage") or "").lower() == "quant":
+            has_quant = True
+        schema = (member.get("shape") or {}).get("logger_schema") or {}
+        for tensor in schema.get("tensors", []):
+            dtype = str(tensor.get("dtype") or "").lower()
+            if any(t in dtype for t in ("float8", "fp8", "e4m3", "e5m2")):
+                tags.add("fp8")
+            if any(t in dtype for t in ("float4", "fp4", "e2m1")):
+                tags.add("fp4")
+    if has_quant and "fp8" not in tags and "fp4" not in tags:
+        tags.add("fp8")
+    return sorted(tags)
+
+
+# author-track implementation classes: no existing kernel is CLAIMED, so the
+# catalog is exactly what falsifies that claim.
+AUTHOR_CLASSES = {"new_helper_kernel", "main_kernel_or_algorithmic"}
+
+
+def _catalog_falsify(payload, catalog_path, errors, warnings,
+                     strategies_path=""):
+    """Falsify 'author-track / similar-only' against the installed kernel surface,
+    then fill any remaining gap from the provider-agnostic strategy priors.
+
+    Two layers, in order (scan-first, prior-fills-gaps):
+      1. catalog (`--catalog`): what is ACTUALLY installed here. A catalog kernel
+         covering an author-track/similar region -> hard ERROR + `match` so Top-K
+         floors the tier at B.
+      2. strategy priors (`--fusion-priors`, knowledge/fusion): whether the region
+         is a KNOWN fusion at all, even when no kernel is installed here. A prior
+         hit on an otherwise-blind author-track region -> `prior` annotation + a
+         warning naming the known kernel/provider (a real install blind spot when
+         that provider was not scanned), NOT a tier floor (it is not installed).
+    Returns {candidate_id: {op_tags, dtype_tags, match, match_count, prior}}.
+    Both flags are opt-in / non-breaking."""
+    matches = {}
+    if not catalog_path:
+        warnings.append(
+            "no --catalog: author-track / 'similar'-coverage claims are NOT "
+            "falsified against the installed kernel surface. Build one with "
+            "fusion_catalog.py and pass --catalog to close the discovery gap.")
+        return matches
+    if fusion_catalog is None:
+        warnings.append("fusion_catalog import failed; --catalog gate skipped")
+        return matches
+    try:
+        _, kernels = fusion_catalog.load_index(catalog_path)
+    except (OSError, ValueError) as exc:
+        warnings.append("could not load --catalog %s: %r" % (catalog_path, exc))
+        return matches
+    strategies = []
+    if strategies_path:
+        try:
+            strategies = fusion_catalog.load_strategies(strategies_path)
+        except (OSError, ValueError) as exc:
+            warnings.append(
+                "could not load --fusion-priors %s: %r" % (strategies_path, exc))
+    for candidate in payload.get("candidates") or []:
+        cid = candidate.get("candidate_id")
+        op_tags = _region_op_tags(candidate)
+        dtype_tags = _region_dtype_tags(candidate)
+        hits = fusion_catalog.covers(kernels, op_tags, dtype_tags)
+        best = hits[0]["name"] if hits else None
+        matches[cid] = {
+            "op_tags": op_tags, "dtype_tags": dtype_tags,
+            "match": best, "match_count": len(hits), "prior": None}
+        apis = candidate.get("existing_apis") or []
+        author = candidate.get("implementation_class") in AUTHOR_CLASSES
+        similar_only = bool(apis) and all(
+            api.get("coverage") == "similar" for api in apis)
+        if op_tags and hits and (author or similar_only):
+            errors.append(
+                "%s is %s but catalog kernel '%s' covers its op-set %s "
+                "(dtype %s) — reclassify as existing_api (tier B), or record in "
+                "existing_apis[].constraints why '%s' does not apply here"
+                % (cid, "author-track" if author else "similar-only", best,
+                   op_tags, dtype_tags or "-", best))
+        # Prior-fill: the scan found nothing installed, but is this a KNOWN
+        # fusion? Record it so an author-track lead carries a reference instead
+        # of a blind "no kernel".
+        if op_tags and not hits and strategies:
+            prior_hits = fusion_catalog.match_strategies(
+                strategies, op_tags, dtype_tags)
+            if prior_hits:
+                strat = prior_hits[0]
+                kn = strat.get("known_kernels") or []
+                matches[cid]["prior"] = {
+                    "strategy_id": strat.get("strategy_id"),
+                    "confidence": strat.get("confidence"),
+                    "known_kernels": kn}
+                if author:
+                    warnings.append(
+                        "%s is author-track and not installed here, but is a "
+                        "KNOWN fusion (strategy '%s', %s): kernels %s. If that "
+                        "provider was not scanned it is an install blind spot — "
+                        "port/author with this reference rather than from scratch"
+                        % (cid, strat.get("strategy_id"),
+                           strat.get("confidence"),
+                           ", ".join("%s:%s" % (k.get("provider"), k.get("name"))
+                                     for k in kn[:3])))
+    return matches
+
+
 def _validate_api_list(owner, path, errors):
     status = owner.get("exact_kernel_status")
     if status not in EXACT_STATUS:
@@ -585,7 +731,8 @@ def validate(semantic_table_path, candidates_path,
              helper_floor=DEFAULT_HELPER_FLOOR_US,
              escalate_floor=DEFAULT_ESCALATE_FLOOR_US,
              agg_escalate_floor=DEFAULT_AGG_ESCALATE_FLOOR_US,
-             allow_partial_phase_coverage=None):
+             allow_partial_phase_coverage=None,
+             priors_index=None, catalog_path="", strategies_path=""):
     table = _load(semantic_table_path)
     payload = _load(candidates_path)
     tables, source_rows, table_order = _semantic_index(table)
@@ -1371,10 +1518,34 @@ def validate(semantic_table_path, candidates_path,
              "implementation_class": c.get("implementation_class")}
             for cid, c in candidates_by_id.items()],
     }
+    # Known-fusion recall: every measured fusion card in knowledge/learned must
+    # get an explicit disposition. This is the run-to-run stability gate -- the
+    # DSR1 complaint was that the same trace produced a different fusion set each
+    # run, because rediscovery is not deterministic and a prior that is never
+    # proposed leaves no artifact saying so. Priors ADD candidates, never prune
+    # them (knowledge/learned/README.md), so `not_applicable` with an honest
+    # reason passes; only SILENCE fails.
+    prior_rows = []
+    if priors_index:
+        priors = fusion_priors.load_priors(priors_index)
+        prior_errors, prior_rows = fusion_priors.check_dispositions(
+            priors, payload, set(candidates_by_id))
+        errors.extend(prior_errors)
+        metrics["prior_coverage"] = fusion_priors.summarise(prior_rows)
+        metrics["prior_rows"] = [
+            {k: row[k] for k in
+             ("slug", "title", "confidence", "disposable", "disposition",
+              "reason", "candidate_id")}
+            for row in prior_rows]
+    # Catalog falsification (opt-in): flag author-track/similar claims that a
+    # real installed kernel covers, and hand Top-K the per-candidate match so it
+    # can floor the tier at B instead of dropping the row to deferred_author.
+    metrics["candidate_catalog_match"] = _catalog_falsify(
+        payload, catalog_path, errors, warnings, strategies_path)
     return payload, table, errors, warnings, metrics
 
 
-def render_markdown(payload, table):
+def render_markdown(payload, table, prior_rows=None):
     tables, _, table_order = _semantic_index(table)
     summaries = sorted(payload["summary_rows"], key=lambda item: (
         PHASE_ORDER.get(item.get("phase"), 99),
@@ -1386,6 +1557,10 @@ def render_markdown(payload, table):
     lines = [
         "# Kernel Fusion Candidate Analysis",
         "",
+    ]
+    if prior_rows:
+        lines.append(fusion_priors.render_markdown(prior_rows))
+    lines += [
         "## Fusion 总表（Prefill → Decode）",
         "",
         "| Phase | Pattern | Stage（时间顺序） | Fusion 方案（按建议顺序） | "
@@ -1510,10 +1685,12 @@ def run(semantic_table_path, candidates_path, out_md, result_json,
         helper_floor=DEFAULT_HELPER_FLOOR_US,
         escalate_floor=DEFAULT_ESCALATE_FLOOR_US,
         agg_escalate_floor=DEFAULT_AGG_ESCALATE_FLOOR_US,
-        allow_partial_phase_coverage=None):
+        allow_partial_phase_coverage=None,
+        priors_index=None, catalog_path="", strategies_path=""):
     payload, table, errors, warnings, metrics = validate(
         semantic_table_path, candidates_path, helper_floor, escalate_floor,
-        agg_escalate_floor, allow_partial_phase_coverage)
+        agg_escalate_floor, allow_partial_phase_coverage, priors_index,
+        catalog_path, strategies_path)
     result = {
         "schema_version": 2,
         "status": "pass" if not errors else "fail",
@@ -1521,6 +1698,7 @@ def run(semantic_table_path, candidates_path, out_md, result_json,
         "fusion_candidates_json": os.path.abspath(candidates_path),
         "fusion_candidates_md": os.path.abspath(out_md),
         "phase_coverage": metrics.get("phase_coverage"),
+        "prior_coverage": metrics.get("prior_coverage"),
         "region_coverage": {
             key: value
             for key, value in (metrics.get("region_coverage") or {}).items()
@@ -1547,7 +1725,8 @@ def run(semantic_table_path, candidates_path, out_md, result_json,
                 fh.write("- 🔴 %s\n" % err)
             fh.write("\n---\n\n")
         try:
-            fh.write(render_markdown(payload, table))
+            fh.write(render_markdown(
+                payload, table, metrics.get("prior_rows")))
         except Exception as exc:  # noqa: BLE001 - a broken payload still gets a report
             fh.write("\n> ⚠️ 表格无法渲染（%s: %s）；"
                      "以上错误即为本阶段的全部结论。\n"
@@ -1575,11 +1754,31 @@ def main():
         help="min per-layer sum (us) of sub-floor non-candidate helpers in one "
              "(phase, pattern) before they must become a cluster candidate")
     parser.add_argument(
+        "--priors-index", metavar="INDEX_MD", default=None,
+        help="knowledge/learned/INDEX.md. When given, every fusion card in it "
+             "must have an explicit entry in the candidates' "
+             "`prior_dispositions` (candidate | already_engaged | "
+             "not_applicable + reason). Priors only ADD candidates; the gate "
+             "is on the disposition EXISTING, not on the answer being yes")
+    parser.add_argument(
+        "--catalog", metavar="AVAILABLE_FUSION_KERNELS_JSON", default="",
+        help="available_fusion_kernels.json from fusion_catalog.py. When given, "
+             "any author-track / 'similar'-coverage candidate whose op-set a "
+             "real installed kernel covers is a hard ERROR (closes the P2.1 "
+             "under-discovery gap). Without it, the gate only warns.")
+    parser.add_argument(
         "--allow-partial-phase-coverage", metavar="REASON", default=None,
         help="proceed even though a phase is absent from the semantic tables "
              "or resolved no shapes. Requires a REASON, which is recorded in "
              "the result. This does NOT make the candidates for that phase "
              "trustworthy -- it records that you knowingly built them anyway")
+    parser.add_argument(
+        "--fusion-priors", metavar="FUSION_STRATEGIES_JSON", default="",
+        help="knowledge/fusion/fusion_strategies.json. Fills the gap the "
+             "installed-kernel scan cannot see: a fusible region with no catalog "
+             "kernel but a matching known strategy is annotated with the "
+             "strategy + its kernel/provider (a porting reference for the author "
+             "track), instead of a blind 'no kernel'.")
     args = parser.parse_args()
     if (args.allow_partial_phase_coverage is not None
             and not args.allow_partial_phase_coverage.strip()):
@@ -1588,7 +1787,8 @@ def main():
     result = run(
         args.semantic_table, args.candidates,
         args.out_md, args.result_json, args.helper_floor, args.escalate_floor,
-        args.agg_escalate_floor, args.allow_partial_phase_coverage)
+        args.agg_escalate_floor, args.allow_partial_phase_coverage,
+        args.priors_index, args.catalog, args.fusion_priors)
     print(json.dumps(result, indent=2))
     return 0 if result["status"] == "pass" else 1
 

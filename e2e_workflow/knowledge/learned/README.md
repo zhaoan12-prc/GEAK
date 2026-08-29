@@ -56,7 +56,9 @@ last_seen: YYYY-MM-DD
 - ★★★ = ≥2 independent runs non-overlapping, OR Director-verified e2e.
 
 ## How to UPDATE it after a run (write path) — CURATE, never blind-append
-Owners: System Architect (routing/method cards) and Op Benchmarker (head GEMM/attn cards). One transaction:
+Owners: System Architect (routing/method cards), Op Benchmarker (head GEMM/attn cards), and
+Fusion Integrator (`## kernel fusion` cards — written after apply-back's e2e gate, read back by
+the Kernel Fusion Analyst at Phase 2.1 where every one of them must get a disposition). One transaction:
 1. **Read INDEX.md.** Find the card whose `key` matches your finding.
 2. **MERGE if it exists** — bump `confidence` if it reproduced, widen/correct `effect` (esp. the
    e2e-transfer note), append a `source`, update `last_seen`. Update its INDEX line. Don't create a

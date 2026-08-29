@@ -516,6 +516,12 @@ const FUSION_APPLY_SCHEMA = obj({
   deferred: arrObj,           // [{exec_id, reason}] — knowingly left for next round
   deferred_author_count: { type: 'number' },
   applyback_gate_json: { type: 'string' }, applyback_report_md: { type: 'string' },
+  // Which knowledge/learned cards this run merged/inserted. Phase 2.1 requires a
+  // disposition for every card in INDEX.md's `## kernel fusion` group, so this step is
+  // what makes the next run reproduce THIS one: without it a fusion measured at +11.80%
+  // e2e is simply never proposed again, and nothing turns red because "never proposed"
+  // leaves no artifact. [] is a valid answer (nothing cleared >=** this round).
+  learned_cards: arrObj,      // [{card, action: merged|inserted|archived, key, confidence}]
   notes: { type: 'string' },
 }, ['accepted_fusions']);
 
@@ -1364,6 +1370,13 @@ if (want('head') && FUSION_INPUTS.FUSION_TOPK_JSON) {
       '(deferred[]); a row you filtered out (not 单侧-pass, not tier-B, past budget) still needs its ' +
       'one-line reason. Run scripts/fusion_applyback_harness.py --topk --apply --unitside --budget ' +
       'before returning and fix what it reports; return its report + json paths. ' +
+      'THEN CURATE knowledge/learned/: for each fusion that passed its e2e+accuracy gate, MERGE ' +
+      "the card matching its reuse key or INSERT a new one (>=** only) under INDEX.md's " +
+      '`## kernel fusion` group, with the seam as `apply:` and the ENGAGED proof as `verify:`; a ' +
+      'surprising negative becomes a conditioned `caution:` ("also verify X"), never a blocklist; ' +
+      'NULL/ungated/accuracy-failed fusions write nothing. Keep INDEX.md <=40 card lines. This is ' +
+      'what lets the NEXT run reproduce this one - Phase 2.1 requires a disposition for every card ' +
+      'there. Return learned_cards[]. ' +
       'Return the accepted set + the final stacked overlay dir + new tok/s.', {
         EVAL_DIR, MODEL_PATH, SERVING_GPU, TP: SERVING_TP, WORKLOAD,
         FUSION_TOPK_JSON: FUSION_INPUTS.FUSION_TOPK_JSON,
@@ -1387,6 +1400,14 @@ if (want('head') && FUSION_INPUTS.FUSION_TOPK_JSON) {
         `disposition (applied ${acc.length} / blocked ${(fapply.rejected || []).length} / ` +
         `deferred ${(fapply.deferred || []).length}); gate report: ` +
         `${fapply.applyback_report_md || '(not run — fusion_applyback_harness.py was skipped)'}`);
+    // The reproducibility half. An apply-back that banks wins but writes no card leaves the
+    // next run to rediscover them, and rediscovery is not deterministic — that is exactly how
+    // the same trace produced a different fusion set run to run.
+    const cards = Array.isArray(fapply.learned_cards) ? fapply.learned_cards : [];
+    log(cards.length
+      ? `Fusion knowledge: ${cards.length} learned card(s) curated (${cards.map(c => `${c.card}:${c.action}`).join(', ')}).`
+      : 'Fusion knowledge: NO learned cards written — the next run will rediscover these fusions from scratch. ' +
+        'Expected only if nothing cleared the ★★ bar this round.');
   }
   if (acc.length) {
     curOverlay = fapply.final_overlay || curOverlay;

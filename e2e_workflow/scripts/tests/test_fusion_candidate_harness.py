@@ -1062,6 +1062,77 @@ class FusionCandidateHarnessTest(unittest.TestCase):
                 self.assertNotIn("校验未通过", text)
             self.assertTrue(text.strip())
 
+    def _kb_index(self, root):
+        """A one-card knowledge/learned KB, as the analyst would read it."""
+        kb = os.path.join(root, "learned")
+        os.makedirs(kb, exist_ok=True)
+        with open(os.path.join(kb, "fusion-known.md"), "w") as fh:
+            fh.write("---\nkey: fusion \u00b7 gfx942 \u00b7 fp8\ntype: lever\n"
+                     "confidence: \u2605\u2605\u2605\neffect: -9% decode\n"
+                     "last_seen: 2026-08-26\n---\n# A fusion we already measured\n"
+                     "- lever: try it\n- source: eval_dir\n")
+        index = os.path.join(kb, "INDEX.md")
+        with open(index, "w") as fh:
+            fh.write("# Learned\n\n## kernel fusion\n"
+                     "- [gfx942] a fusion we already measured "
+                     "\u2605\u2605\u2605 \u2014 (fusion-known.md)\n")
+        return index
+
+    def test_a_known_fusion_prior_with_no_disposition_fails_the_gate(self):
+        # The run-to-run instability: the same trace produced a different fusion
+        # set each run because a measured prior could simply never be proposed,
+        # and "never proposed" leaves no artifact saying so.
+        with tempfile.TemporaryDirectory() as tmp:
+            table = self._write(tmp, "table.json", self._region_table())
+            payload = self._region_payload()
+            payload["environment_api_inventory_json"] = self._env(tmp)
+            candidates = self._write(tmp, "candidates.json", payload)
+            result = harness.run(
+                table, candidates, os.path.join(tmp, "report.md"),
+                os.path.join(tmp, "validation.json"),
+                priors_index=self._kb_index(tmp))
+            self.assertEqual(result["status"], "fail")
+            self.assertTrue(any("no disposition" in e
+                                for e in result["errors"]), result["errors"])
+            self.assertEqual(
+                result["prior_coverage"]["undisposed"], 1)
+
+    def test_a_prior_ruled_out_with_a_reason_clears_the_gate(self):
+        # ADD-only: the gate is on the SENTENCE existing, not on the answer
+        # being yes. An honest "does not apply here" is a complete disposition.
+        with tempfile.TemporaryDirectory() as tmp:
+            table = self._write(tmp, "table.json", self._region_table())
+            payload = self._region_payload()
+            payload["environment_api_inventory_json"] = self._env(tmp)
+            payload["prior_dispositions"] = [{
+                "card": "fusion-known", "disposition": "not_applicable",
+                "reason": "card is gfx942 MLA decode; this table has no MLA "
+                          "rows in either phase"}]
+            candidates = self._write(tmp, "candidates.json", payload)
+            out_md = os.path.join(tmp, "report.md")
+            result = harness.run(
+                table, candidates, out_md,
+                os.path.join(tmp, "validation.json"),
+                priors_index=self._kb_index(tmp))
+            self.assertFalse(any("disposition" in e for e in result["errors"]),
+                             result["errors"])
+            self.assertEqual(result["prior_coverage"]["not_applicable"], 1)
+            with open(out_md) as fh:
+                text = fh.read()
+            self.assertIn("\u5df2\u77e5\u878d\u5408\u5148\u9a8c", text)
+
+    def test_without_a_priors_index_nothing_is_imposed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            table = self._write(tmp, "table.json", self._region_table())
+            payload = self._region_payload()
+            payload["environment_api_inventory_json"] = self._env(tmp)
+            candidates = self._write(tmp, "candidates.json", payload)
+            result = harness.run(table, candidates,
+                                 os.path.join(tmp, "report.md"),
+                                 os.path.join(tmp, "validation.json"))
+            self.assertIsNone(result["prior_coverage"])
+            self.assertFalse(any("disposition" in e for e in result["errors"]))
+
     def test_fusible_region_deferred_in_followups_passes(self):
         with tempfile.TemporaryDirectory() as tmp:
             table = self._write(tmp, "table.json", self._region_table())

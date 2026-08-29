@@ -367,6 +367,7 @@ def validate(topk_path, apply_path, unitside_path=None, budget=None,
         # which candidates made the board → which of those actually landed.
         "phase_coverage": topk.get("phase_coverage"),
         "region_coverage": topk.get("region_coverage"),
+        "family_coverage": topk.get("family_coverage"),
         "candidate_total": topk.get("candidate_total"),
         "candidates_on_board": topk.get("candidates_on_board"),
         "truncated_count": topk.get("truncated_count"),

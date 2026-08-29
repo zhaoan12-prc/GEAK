@@ -116,7 +116,8 @@ This is the Phase 3.1/3.2 driver — the orchestrator has no fs access, so YOU l
    `{accepted_fusions:[{exec_id,fusion,rung,overlay_path,tpot_delta_pct,throughput_delta_pct,
    nonoverlap,gsm8k_base,gsm8k_cand,engaged}], final_overlay (the stacked combined-loader dir),
    e2e_throughput_tok_s (final), rejected:[{exec_id,reason}], deferred:[{exec_id,reason}],
-   deferred_author_count, applyback_gate_json, applyback_report_md, notes}`. The orchestrator
+   deferred_author_count, applyback_gate_json, applyback_report_md,
+   learned_cards:[{card,action:merged|inserted|archived,key,confidence}], notes}`. The orchestrator
    then reprofiles + re-strategizes on `final_overlay`.
 
 ## 🔴 Coverage — the execution list is your denominator (mandatory, harness-enforced)
@@ -176,3 +177,42 @@ produced. It goes at the EVAL_DIR root beside `01_SEMANTIC.md` … `04_FUSION_UN
 `--allow-partial-coverage` exists for a knowingly incomplete round; it prints the gap just
 as loudly and it is not a way to make the red go away. Never edit or weaken the harness —
 a red gate is fixed by giving the missing rows a disposition.
+
+## CURATE `knowledge/learned/` — make this run's fusions reproducible next time
+
+The last thing you do, after the gate is green (or knowingly red) and the report is
+published. Phase 2.1 is required to dispose of every fusion card in
+`knowledge/learned/INDEX.md`'s `## kernel fusion` group — **this step is what puts the
+cards there.** Skip it and the next run rediscovers the same fusion from scratch, which is
+exactly the instability this closes: on DSR1 a fusion measured at **+11.80% e2e output
+throughput** was never proposed again in the following run, and nothing turned red because
+"never proposed" leaves no artifact.
+
+One transaction, per `knowledge/learned/README.md` — **CURATE, never blind-append**:
+
+1. **Read `INDEX.md` first.** Match the reuse key `<fusion family> · <gfx> · <regime>`
+   (e.g. `fusion · gfx942 · sglang MLA fp8 decode, cudagraph`).
+2. **MERGE if the card exists** — bump `confidence` if it reproduced, widen/correct
+   `effect` (keep the e2e-transfer note: isolated speedup vs what e2e actually moved),
+   append the eval-dir `source`, update `last_seen`, and update its ONE index line. Never a
+   second card for the same key.
+3. **INSERT only if novel AND effective (≥★★** = single-run non-overlapping A/B, or ≥2
+   consistent runs, or a Director-verified e2e). Card ≤~15 lines with
+   `lever / apply / verify / caution / source`, plus ONE index line under `## kernel
+   fusion`. For a fusion, `apply:` is the **seam** (which call site the adapter rebinds)
+   and `verify:` is the **engagement proof** (the `[overlay-…] ENGAGED` banner + the kernel
+   the trace shows reaching n=0), because that is what the next run cannot rederive.
+4. **NULL / overlapping / accuracy-failed / un-gated → write NOTHING here.** It goes in the
+   eval-dir report only. A fusion that did not survive its own gate is not a prior.
+5. **A surprising negative → a CONDITIONED `caution:` line** on the relevant card, with the
+   condition it held under and its source — framed as "**also verify X**", NEVER as
+   "don't use X". A future run must stay free to try it and beat the prior; the box judges.
+   A claim contradicted by new evidence → move the card to `_archive.md` with the refuting
+   source. `caution:` is where the traps go: the flag that prints its banner while it is
+   `False`, the fused collective that silently falls back above a size guard, the capture
+   path that differs from eager.
+6. **Budget:** `INDEX.md` ≤40 card lines total across all groups. Over → evict the lowest
+   `confidence × freshness` (its card → `_archive.md`). ★★★ is never auto-evicted.
+
+A card is advice the box can overrule, not a rule that overrules the box. Write it so the
+next run knows **where to look first** — not so it can skip looking.

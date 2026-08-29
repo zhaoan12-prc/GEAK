@@ -28,6 +28,13 @@ Optional:
 - `SEMANTIC_TABLE_MD`: presentation-only companion; JSON remains authoritative
 - `PROFILE_TOPN_JSON`: global hotness cross-check only
 - `PERF_KNOWLEDGE_DIR`: defaults to the sibling `perf_knowledge` directory
+- `LEARNED_INDEX`: defaults to `$SKILL_DIR/knowledge/learned/INDEX.md` — the
+  fusions this workflow has ALREADY measured, as **advisory priors** (an aid,
+  not a cage). Read the `## kernel fusion` group **after** you have formed your
+  own profile-driven candidate set, as a cross-check and a source of EXTRA
+  candidates: it only ADDs options, never prunes one the profile found and never
+  substitutes for measurement (`knowledge/learned/README.md`). Every card in
+  that group needs a disposition — see 5c.
 - `RUNTIME_SETUP_FILE`: run configuration containing the actual image, model,
   TP, and workload. When supplied, it is authoritative for environment lookup.
 - `RUNTIME_IMAGE`, `MODEL_PATH`, `TP`: explicit overrides when the setup file
@@ -298,6 +305,49 @@ When `RUNTIME_SETUP_FILE` or `RUNTIME_IMAGE` is available:
 5. If the environment cannot be inspected, you cannot prove a kernel exists, so
    default 现成算子=`no` (treat as author-track until an installed kernel is cited).
 
+### 4a. Build the deterministic kernel catalog (mandatory — the authority for existence)
+
+Your own recall of "which kernels exist" is not trustworthy and never has been:
+on DSR1 2026-08-28 a hand-written inventory found 13 kernels where the installed
+aiter has 378, so real fusions (the fp8 MLA rope+cache write chain, the o_proj /
+V-absorb prequant fold) were mis-sent to the author track because the analyst
+simply did not enumerate them. So **existence is decided by a deterministic
+enumeration, not by you.** Before writing any candidate:
+
+```bash
+python3 "$SKILL_DIR/scripts/fusion_catalog.py" \
+  --out "$EVAL_DIR/profile/round_${ROUND}/fusion/available_fusion_kernels.json" \
+  --trace "<analysis_rank_trace>"      # optional: adds trace-observed kernels
+```
+
+Run it INSIDE the runtime container. It scans **every installed backend, not just
+aiter** (aiter / sglang / vllm / flashinfer, auto-detected — a catalog limited to
+one library is blind to the others: vllm ships `fused_add_rms_norm` /
+`silu_mul_fp8_quant_deep_gemm`, sglang the MLA `set_mla_kv_buffer_triton_fp8_quant`
+kv-write+quant). For each it walks the package (`def NAME(` catches the
+`@compile_ops`-registered kernels that `dir()` does NOT surface — the exact class
+the hand search misses), csrc symbols, and any trace-observed names; it tags each
+kernel with an op-set + dtype. The output carries `providers_scanned`, so it
+**declares its own scope** — a backend not listed there is a blind spot (add it
+with `--extra-provider name=/path`). `available_fusion_kernels.json` is the
+authority for "what exists". Your `environment_api_inventory.json` and every
+candidate's `existing_apis`/`implementation_class` must be **consistent with it**:
+if the catalog lists a kernel whose op-set covers a region at a compatible dtype,
+that region is 现成算子=`yes` (tier B) — you may not classify it author-track. Cite
+the catalog kernel name in `existing_apis[].name`. This is harness-enforced in
+step 6 (`--catalog`): a catalog-covered region left as author-track / similar-only
+is a hard failure.
+
+**Prior-fill (scan-first, prior-fills-gaps).** The scan is ground truth for THIS
+build; it cannot know a fusion whose kernel lives in a backend not installed here.
+`knowledge/fusion/fusion_strategies.json` is the provider-agnostic prior of
+op-combinations known to be fusable at all. Pass it as `--fusion-priors` in step 6:
+a fusible region with **no installed kernel** but a matching known strategy is
+annotated with that strategy + the kernel/provider to port from — turning a blind
+"no kernel → author-track" into a referenced author lead. Priors only ADD
+context; they never floor the tier (not installed here) and never substitute for
+the on-box bake-off.
+
 For each candidate distinguish:
 
 - `existing_flag_or_env`
@@ -415,18 +465,20 @@ already the live default for its op, set `readiness` accordingly and mark the ca
 has no existing fused kernel — classify it author-track (C), NOT a ready-B. Verify against
 the baseline trace + installed dispatch defaults, not the mere existence of a symbol.
 
-**Gate B — 现成算子=`no` (C) must be an evidenced search conclusion, not an
-opinion.** Before classifying a fusion as author-track you MUST run an exhaustive
-symbol search over the installed libraries for a kernel that does this op
-combination, and record it in `absence_search` `[{query, location, result}]`:
-the actual grep/queries you ran (search on the op names AND on quant/scale
-variants — e.g. `act.*quant`, `silu.*mul`, `*_and_*quant*`, `rmsnorm.*quant`),
-the installed paths searched, and the null/only-non-applicable result. If any
-search turns up an installed kernel/variant that performs this fusion's compute
-(even one needing an adapter), it is 现成算子=`yes` → **B**, not C. The harness
-fails an author-track candidate with no `absence_search`. This stops a fusion
-being sent to the expensive author track merely because the analyst did not look
-hard enough — "no kernel" must carry the search that proves it.
+**Gate B — 现成算子=`no` (C) must be falsifiable against the catalog, not an
+opinion.** The deterministic catalog (step 4a) is the authority. Before
+classifying a fusion author-track you MUST confirm no catalog kernel's op-set
+covers the region at a compatible dtype, and record the check in `absence_search`
+`[{query, location, result}]`: the catalog query (op-tags searched) plus any
+grep on quant/scale variants, and the null/only-non-applicable result. Two ways
+this now fails hard, both in the step-6 harness with `--catalog`:
+(1) a catalog kernel DOES cover the region → the candidate is 现成算子=`yes` →
+**B**, not C (reclassify, cite the catalog kernel); (2) an author-track candidate
+carries no `absence_search`. Note the FP4-vs-fp8 trap that caused the DSR1 miss:
+finding a *similar* kernel at the wrong precision (e.g. an FP4 rope+cache kernel)
+does NOT justify author-track when a dtype-compatible one exists — the catalog's
+dtype tags (fp8_blockscale ⇒ fp8) make that a covered region. "No kernel" must
+carry the catalog result that proves it.
 
 Every plan variant must populate an API assessment, even when the answer is
 negative:
@@ -543,6 +595,48 @@ The harness enforces two floors on non-donor helper rows
   non-boundary candidate whose members straddle a donor). Emit one author-track
   candidate per contiguous cluster.
 
+### 5c. Known-fusion priors must each get a disposition (mandatory, harness-enforced)
+
+Read `$LEARNED_INDEX`'s `## kernel fusion` group AFTER 5a/5b, and give **every
+card in it an explicit disposition** in `fusion_candidates.json`:
+
+```json
+"prior_dispositions": [
+  {"card": "fusion-vabsorb-fp8-batched-gemm-gfx942",
+   "disposition": "candidate", "candidate_id": "d3_vabsorb_dequant_fold"},
+  {"card": "fusion-allreduce-rmsnorm-quant-gfx942",
+   "disposition": "already_engaged",
+   "reason": "--enable-aiter-allreduce-fusion is on in this run's launch and the "
+             "banner is in server.log:1841; incremental here is ~0"},
+  {"card": "fusion-x-gfx950", "disposition": "not_applicable",
+   "reason": "card is gfx950 MXFP8; this box is gfx942 and the op is absent from "
+             "both phase tables"}
+]
+```
+
+`candidate` needs the `candidate_id` it became (the harness checks the id is
+really in your candidate list). `already_engaged` / `not_applicable` need a REAL
+reason — name the gfx/regime/flag/op that does not match. `"skipped"`, `""` and
+`"n/a"` are rejected. `type: method` cards are advisory: read them, no
+disposition needed.
+
+**This is the run-to-run stability gate, and it is the only one.** The DSR1
+complaint was that the same model + same trace produced a *different* fusion set
+on different runs: rediscovery is not deterministic, and a fusion measured at
++11.80% e2e in one run was simply never proposed in the next. Nothing turned red,
+because "never proposed" leaves no artifact — the weaker run's report read exactly
+as clean as the stronger one's.
+
+Two things this gate is NOT:
+
+- **It is not a mandate.** A prior is a place to look first, not a verdict.
+  `not_applicable` with an honest reason is a complete, passing disposition.
+  The gate is on the SENTENCE existing, not on the answer being yes.
+- **It is not a filter.** Priors only ADD. Nothing in `learned/` may remove a
+  candidate your profile found, shrink the escalation floors of 5b, or excuse a
+  region from 5a-2. If a card and the box disagree, the box wins and the card
+  gets corrected after the run (see `fusion_integrator.md` 的 curate step).
+
 ### 6. Produce and validate Phase 2.1 artifacts
 
 Create:
@@ -550,20 +644,25 @@ Create:
 ```text
 $EVAL_DIR/02_FUSION_CANDIDATES.md              <- the report (root, human)
 $EVAL_DIR/profile/round_${ROUND}/fusion/       <- the intermediates (machine)
+  available_fusion_kernels.json                <- the catalog (step 4a)
   environment_api_inventory.json
   fusion_candidates.json
   fusion_candidate_result.json
 ```
 
 Write `fusion_candidates.json` first. Do not hand-format the final Markdown.
-Run the deterministic harness:
+Run the deterministic harness (`--catalog` is mandatory — it falsifies every
+author-track / similar-only claim against the installed kernel surface):
 
 ```bash
 python3 "$SKILL_DIR/scripts/fusion_candidate_harness.py" \
   --semantic-table "$SEMANTIC_TABLE_JSON" \
   --candidates "$EVAL_DIR/profile/round_${ROUND}/fusion/fusion_candidates.json" \
   --out-md "$EVAL_DIR/02_FUSION_CANDIDATES.md" \
-  --result-json "$EVAL_DIR/profile/round_${ROUND}/fusion/fusion_candidate_result.json"
+  --result-json "$EVAL_DIR/profile/round_${ROUND}/fusion/fusion_candidate_result.json" \
+  --catalog "$EVAL_DIR/profile/round_${ROUND}/fusion/available_fusion_kernels.json" \
+  --fusion-priors "$SKILL_DIR/knowledge/fusion/fusion_strategies.json" \
+  --priors-index "${LEARNED_INDEX:-$SKILL_DIR/knowledge/learned/INDEX.md}"
 ```
 
 **报告写根目录，中间产物留工作目录。** `--out-md` 是给人看的，和其他四个阶段的报告并排放

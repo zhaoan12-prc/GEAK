@@ -112,10 +112,16 @@ def _region_lang(candidate, row_provider):
     return Counter(langs).most_common(1)[0][0]
 
 
-def _tier(candidate, row_provider):
+def _tier(candidate, row_provider, catalog_match=None):
     base = IMPL_BASE_TIER.get(candidate.get("implementation_class"), "C")
     if base != "C":
         return base
+    # The candidate declared author-track, but the deterministic catalog says a
+    # real installed kernel covers its op-set — so it is an existing_api (B), not
+    # something to author. Floor it at B so it lands on the A/B board instead of
+    # being dropped to deferred_author on a false "no kernel" claim.
+    if catalog_match and catalog_match.get("match"):
+        return "B"
     lang = _region_lang(candidate, row_provider)
     return "C1" if lang == NATIVE_AUTHOR_LANG else "C2"
 
@@ -169,6 +175,9 @@ def rank(candidates_path, validation_path, semantic_table_path, top_k,
     row_provider = _row_provider_index(table)
 
     metrics = validation.get("metrics", {})
+    # per-candidate catalog match (from candidate_harness --catalog); floors a
+    # falsely-author-track candidate's tier at B so it is not dropped.
+    catalog_match = metrics.get("candidate_catalog_match", {}) or {}
     savings_by_id = {
         s["candidate_id"]: s for s in metrics.get("candidate_savings", [])}
     phase_total = metrics.get("phase_total_forward_us", {}) or {}
@@ -185,7 +194,7 @@ def rank(candidates_path, validation_path, semantic_table_path, top_k,
     annotated = {}
     for cid, cand in candidates.items():
         sv = savings_by_id.get(cid, {})
-        tier = _tier(cand, row_provider)
+        tier = _tier(cand, row_provider, catalog_match.get(cid))
         apis = cand.get("existing_apis") or []
         annotated[cid] = {
             "candidate_id": cid,
@@ -458,7 +467,6 @@ def rank(candidates_path, validation_path, semantic_table_path, top_k,
     groups = defaultdict(list)
     for entry in exec_list:
         groups[_find(entry["exec_id"])].append(entry)
-    by_id = {e["exec_id"]: e for e in exec_list}
     exclusive_groups = []
     for gindex, (_root, members) in enumerate(
             sorted((k, v) for k, v in groups.items() if len(v) > 1), 1):
@@ -492,6 +500,26 @@ def rank(candidates_path, validation_path, semantic_table_path, top_k,
                 for m in members],
         })
 
+    # Catalog-backed family coverage: a family whose region a real installed
+    # kernel covers must reach the A/B board (>=1 exec) or be an explicit author
+    # deferral — never silently vanish because it was mis-tiered upstream. This
+    # is the denominator the DSR1 miss lacked (mla/kv-write/V-absorb dropped to
+    # deferred_author on a false "no kernel" and never surfaced anywhere).
+    fam_of = {cid: cand.get("family") for cid, cand in candidates.items()}
+    catalog_backed = {cid for cid, m in catalog_match.items() if m.get("match")}
+    catalog_families = {fam_of.get(cid) for cid in catalog_backed}
+    exec_families = {fam_of.get(cid) for a in actions for cid in a["candidate_ids"]}
+    deferred_families = {
+        fam_of.get(cid) for a in deferred_author for cid in a["candidate_ids"]}
+    family_coverage = {
+        "catalog_backed_families": sorted(f for f in catalog_families if f),
+        "on_board_families": sorted(f for f in exec_families if f),
+        "author_deferred_families": sorted(f for f in deferred_families if f),
+        "uncovered_catalog_families": sorted(
+            f for f in catalog_families
+            if f and f not in exec_families and f not in deferred_families),
+    }
+
     all_candidate_ids = sorted(candidates)
     listed_ids = sorted({
         cid for a in actions for cid in a["candidate_ids"]})
@@ -511,6 +539,7 @@ def rank(candidates_path, validation_path, semantic_table_path, top_k,
         "truncated_actions": truncated,
         "execution_list": exec_list,
         "exclusive_groups": exclusive_groups,
+        "family_coverage": family_coverage,
         "shown_tiers": sorted(show_tiers),
         "tier_weights": TIER_WEIGHT,
         "phase_total_forward_us": phase_total,

@@ -224,6 +224,23 @@ Each report leads with its own coverage number, and each number is the next phas
 denominator: fusible regions (01) → candidates per region (02) → the execution list (03)
 → a 单侧 verdict per row (04) → a disposition per row (05).
 
+**Run-to-run stability comes from the same idea applied across runs.** Rediscovery is not
+deterministic: on DSR1 the same model and the same trace produced a different fusion set on
+different runs, and a fusion measured at +11.80% e2e was simply never proposed again — with
+nothing turning red, because "never proposed" leaves no artifact. So the fusions this
+workflow has already measured live in `knowledge/learned/INDEX.md` under `## kernel fusion`,
+and they become Phase 2.1's cross-run denominator: `scripts/fusion_priors.py` requires every
+card there to get an explicit disposition in `fusion_candidates.json` —
+`candidate` (with the candidate id it became), `already_engaged`, or `not_applicable` (with
+a real reason; `"skipped"` is rejected). `type: method` cards are advisory and need none.
+
+The gate is on the SENTENCE existing, never on the answer being yes. Per
+`knowledge/learned/README.md` the KB is ADD-only: a card may add a candidate to try, but it
+may not remove one the profile found, shrink an escalation floor, or excuse a region. The
+box is still the judge — the prior only says where to look first. `fusion_integrator` closes
+the loop by curating the cards after apply-back's e2e + accuracy gate (merge / insert ≥★★ /
+conditioned `caution:` for a surprising negative — never a blocklist).
+
 ## Files
 ```
 e2e_workflow.js   orchestration (deterministic; recursively calls ../kernel_workflow/kernel_workflow.js)
@@ -234,6 +251,7 @@ scripts/               bench_e2e.sh (backend-agnostic dispatcher), adapters/{sgl
 scripts/report_index.py     regenerates <exp_root>/00_INDEX.md from the reports actually on disk
 scripts/semantic_report.py  Phase 1's human report (a view of pattern_layer_kernel_table.json; gates nothing)
 scripts/fusion_{candidate,topk,unitside,applyback}_harness.py  the four fusion gates (each also renders its phase report)
+scripts/fusion_priors.py    the cross-run gate: every `## kernel fusion` card in knowledge/learned/INDEX.md must get a disposition at Phase 2.1 (ADD-only — priors never prune a candidate)
 scripts/server_teardown.sh  the shared server-kill contract (identity verified at LAUNCH: pid, pgid, /proc start time). Every script that launches a server, including role-authored capture scripts, must source it instead of hand-rolling a kill.
 ```
 

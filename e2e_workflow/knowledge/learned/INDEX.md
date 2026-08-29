@@ -24,6 +24,12 @@ Confidence (a hint strength, not authority): ★ noise/unverified · ★★ sing
 ## linear-attention / FLA / mamba (editable Triton)
 - [gfx942 · prefill-dominated hybrid] stack-and-compound cluster; Amdahl pre-dispatch screen ★★★ — (editable-triton-cluster-amdahl.md)
 
+## kernel fusion
+- [gfx942 · sglang MLA fp8 decode, cudagraph] fold a per-step fp8 weight DEQUANT into the GEMM (V-absorb -> `batched_gemm_a8w8_..._prequant_...`); the dequant kernels must reach n=0, not just get faster; the capture path can differ from eager ★★★ **-9.13% decode kernel time; +11.80% e2e output throughput (verified, gsm8k-clean) for the 2-patch stack** — (fusion-vabsorb-fp8-batched-gemm-gfx942.md)
+- [gfx942 · sglang fp8 decode TP8] aiter fused AllReduce+add+RMSNorm+per-group-quant (`--enable-aiter-allreduce-fusion`); the banner can print while the arg is False, and the fused collective silently falls back above a size guard ★★ -1.81% decode kernel time, launches -50.6%/iter — (fusion-allreduce-rmsnorm-quant-gfx942.md)
+- fusion coverage: give every phase a DENOMINATOR (fusible regions -> candidates -> execution list -> 单侧 verdict -> disposition); omission looks identical to success ★★★ — (method-fusion-coverage-denominator.md)
+- split prefill/decode capture: both traces must reach the table, and rows-without-shapes is as fatal as no rows ★★ — (method-split-trace-two-phase.md)
+
 ## method (cross-model, applies to any run)
 - engagement verification: one-shot stderr banner + log grep ★★★ — (method-verify-engagement.md)
 - e2e A/B: pinned port, interleaved, non-overlap gate ★★★ — (method-e2e-ab-harness.md)
