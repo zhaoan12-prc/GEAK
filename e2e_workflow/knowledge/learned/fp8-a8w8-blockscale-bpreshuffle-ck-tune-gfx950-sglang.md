@@ -3,7 +3,7 @@ key: fp8 a8w8 blockscale GEMM · gfx950 · sglang (ROCm>=7.2) prefill+decode
 type: lever
 confidence: ★★★
 effect: bpreshuffle CK per-shape tune DB → iso 1.46× geomean (per-shape 1.01–2.28×, no regressions); e2e VERIFIED +20.91% (Qwen3-14B-FP8 TP1, Director validated_win, 5046.9→6102.0 tok/s, byte-identical parity 8/8, TPOT −17.5%) at a 53.51% head — i.e. AT the Amdahl ceiling.
-last_seen: 2026-08-17
+last_seen: 2026-08-28
 ---
 # gfx950 sglang fp8 a8w8 blockscale — the live kernel is CK **bpreshuffle**, so tune THAT DB
 
@@ -34,5 +34,16 @@ last_seen: 2026-08-17
   where rebinding a PLAIN-blockscale call to bpreshuffle without the layout fix gave rel≈42 garbage.
   Author lanes are low-ROI here: flydsl is role-forbidden for fp8 blockscale, CK author needs the absent
   ckProfiler, and Triton is unlikely to beat tuned CK bpreshuffle.
+- caution (build-level precondition, verify BEFORE budgeting a round): a CK/cktile tuned table selects a
+  **pre-compiled instance by name**, so it only binds if the installed aiter actually threads `kernelName`
+  through the block-scale entry points. On builds predating that fix, `gemm_a8w8_blockscale_bpreshuffle_ck`
+  / `..._cktile` take no `kernelName` (or the cktile branch drops it) and the tuned CSV binds to NOTHING —
+  a silent `no_engagement`, and a ck/cktile table on such a build has been seen to REGRESS e2e. Probe the
+  installed signature first. Separately, re-check WHICH impl is live after the config sweep: if a
+  `*_USE_TRITON_GEMM`-style flag wins, the seam is the Triton path and the CK table is undeployable there —
+  retarget to the Triton per-shape JSON tables instead (see `gemm-mbucket-lowconc-decode-triton-tune.md`).
 - source: exp/e2e_*Qwen3-14B-FP8*_sglang_*/ 2026-08-17 (bakeoff + tuned CSV in `ck_tune/`; 34/36 shapes
   updated, all correct; Director validated_win +20.91%, non-overlapping, gsm8k unchanged).
+  Precondition source: exp/e2e_*DeepSeek-R1*_atom_*/ 2026-08-28 (aiter v0.1.12-series build,
+  `kernelName` dispatch broken for the block-scale CK families; the Triton-table lever was used instead
+  and banked +4.24% e2e).

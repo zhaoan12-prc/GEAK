@@ -3,7 +3,7 @@ key: fp8 a8w8 blockscale GEMM · gfx950 · vLLM prefill+decode
 type: lever
 confidence: ★★★
 effect: e2e +16.1% / +65.69% / +18.86% on three models; iso 1.86–3.17× serving-weighted. Gain is gated by SHIPPED aiter table coverage — ~0 when the head shapes already bind tuned (measured 1.03× on a saturated model). Probe coverage before budgeting.
-last_seen: 2026-08-19
+last_seen: 2026-08-28
 ---
 # gfx950 vLLM fp8 a8w8 blockscale — per-shape CK tune DB (no overlay needed)
 
@@ -31,6 +31,10 @@ last_seen: 2026-08-19
   the same lever landed 1.067×. The +16.1% (Qwen3.5-27B) is the weakest of the three: parity n/a under
   the fp8 accuracy gate, tuned-shape binds unreproduced, and a server-flag bundle confounds it.
   If ckProfiler is absent the CK *author* lane is unavailable, but the tune DB still applies.
+- caution (build-level): also verify the installed aiter threads `kernelName` through the block-scale entry
+  points before budgeting a CK table — on builds where it does not, the tuned CSV binds to nothing (silent
+  no_engagement); details + the Triton-table fallback in
+  `fp8-a8w8-blockscale-bpreshuffle-ck-tune-gfx950-sglang.md` and `gemm-mbucket-lowconc-decode-triton-tune.md`.
 - confirm (2026-08-19, Qwen3-14B-FP8 TP1, gfx950/MI355, head 67.3% GPU): swap-only aiter-linear
   Triton->CK (VLLM_ROCM_USE_AITER[_LINEAR]=1), UNTUNED CK, measured on the immutable unittest
   (`aiter.gemm_a8w8_blockscale`, non-transposed scale, parity rel~7e-3 << TOL 0.05): serving-weighted
