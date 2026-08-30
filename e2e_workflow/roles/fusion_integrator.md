@@ -130,6 +130,18 @@ checks that before your return is trusted:
 |---|---|---|
 | `applied` | integrated, gated, kept | you — `accepted_fusions[]` |
 | `blocked` | attempted or ruled out — wire failure, accuracy gate, kernel not built, 单侧 fail | you — `rejected[]`, **with a reason** |
+
+🔴 **`blocked` requires an ATTEMPT or a physical impossibility — never a caller-side gate
+alone.** "sglang won't dispatch to it on this arch/dtype" and "no sglang call site exists"
+are NOT reasons to skip a candidate: your overlay replaces the seam and bypasses that
+dispatcher, which is exactly how the accepted rungs land. If 3.0 reports a candidate with
+`isolated_speedup > 1` you MUST author the overlay and take it to A/B, even when 3.0 marked
+it `engaged=false` for a caller-side gate or left a parity failure undiagnosed. Where 3.0
+flagged a layout/contiguity/dtype parity failure, fix it in the adapter (supply the
+contiguous (B,N,K) weight, the fnuz variant, the arg the gate would have supplied) and
+re-check parity in-adapter before the A/B. Only after the overlay is written and it fails
+to engage, fails parity for a diagnosed reason, or loses the A/B, may it be `blocked` —
+and the reason must state what was attempted and what the measurement was.
 | `deferred_with_reason` | knowingly left for next round | you — `deferred[]`, **with a reason** |
 | `blocked_by_exclusion` | a conflicting entry in its exclusive group was applied | derived by the harness |
 | `deferred_budget` | ranked beyond `FUSION_BUDGET` | derived by the harness |

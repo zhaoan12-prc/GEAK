@@ -277,6 +277,42 @@ class SemanticKernelMappingTest(unittest.TestCase):
             self.assertTrue(all(item["boundary_complete"] for item in audit["instances"]))
             self.assertEqual({item["layer_id"] for item in audit["instances"]}, {0, 1})
 
+    def test_cpu_module_spans_use_the_cpu_step_window_not_the_gpu_one(self):
+        """Eager decode: host wall-clock >> device time, so the GPU-side
+        `step[...]` window covers only a fraction of the CPU-side
+        `nn.Module: DecoderLayer_N` spans.  Locating CPU spans against the GPU
+        window dropped most layers and silently degraded decode boundaries to
+        anchor segmentation; they must be located against the CPU window."""
+        events = [
+            # CPU-side step annotation spans the whole host-side step.
+            {"ph": "X", "cat": "user_annotation", "name": "step[DECODE bs=4]",
+             "ts": 1000, "dur": 10000},
+            # GPU-side annotation covers only the tail: the device work.
+            {"ph": "X", "cat": "gpu_user_annotation", "name": "step[DECODE bs=4]",
+             "ts": 10500, "dur": 400},
+        ]
+        # Three DecoderLayer spans, all inside the CPU window, only the last
+        # inside the GPU window.
+        for layer_id, ts in enumerate((1500, 5000, 10600)):
+            events.append({
+                "ph": "X", "cat": "python_function", "ts": ts, "dur": 100,
+                "name": "nn.Module: DeepseekV2AttentionDecoderLayer_%d" % layer_id,
+            })
+        spans = mapping._collect_step_spans(events)
+        self.assertTrue(spans, "step span not recognised")
+        self.assertEqual(len(spans[0]), 9, "CPU window not carried on the span")
+        self.assertEqual((spans[0][7], spans[0][8]), (1000, 11000))
+        pattern_doc = {
+            "num_hidden_layers_main": 3,
+            "patterns": [{"pattern_id": "P_FULL", "attention_type": "full",
+                          "layer_ids": [0, 1, 2]}],
+        }
+        scopes, diagnostics = mapping._module_layer_scopes(
+            events, spans, pattern_doc)
+        self.assertEqual(len(scopes), 3)
+        self.assertEqual(diagnostics[0]["full_passes"], 1)
+        self.assertEqual([s["layer_id"] for s in scopes], [0, 1, 2])
+
     def test_module_medoid_partitions_moduleless_decode_without_named_anchor(self):
         with tempfile.TemporaryDirectory() as tmp:
             patterns = os.path.join(tmp, "patterns.json")

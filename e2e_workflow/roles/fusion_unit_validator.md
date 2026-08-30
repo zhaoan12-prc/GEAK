@@ -120,6 +120,29 @@ Read the candidate object for `CANDIDATE_ID` from `FUSION_CANDIDATES_JSON`:
        the dispatcher returned the fused result rather than None / did not take the
        fallback branch) and report it. If it fell back, set `engaged=false` (the harness
        will mark this `blocked`, not a fail).
+     - 🔴 **`engaged=false` is ONLY for a RUNTIME guard inside the fused kernel itself**
+       (a size/byte threshold that makes the kernel decline THIS shape). It is NOT for a
+       compile-time dispatch gate in the *caller* (`_use_aiter_gfx95`, a `dtype ==
+       float8_e4m3fn` clause, or "no sglang call site on any arch"). Those say the
+       framework does not ROUTE to the kernel; they say nothing about whether the kernel
+       RUNS. Phase 3.1 lands fusions with a sitecustomize overlay that REPLACES the seam
+       and bypasses the caller's dispatcher entirely, so a caller-side gate is not a
+       blocker — it is the thing the overlay exists to route around.
+       When you meet a caller-side gate: call the fused API **directly** with the captured
+       shapes, set `engaged=true` if it executes, and report parity + speedup normally.
+       Record the gate under `dispatch_gate_note` (file:line + the condition) so 3.1 knows
+       the overlay must supply the arg the gate would have. Only if the kernel itself
+       refuses to execute on this arch (import error, unsupported-arch abort, or an
+       internal guard) is it `blocked`, with the actual error text as the reason.
+     - 🔴 **A parity failure is a claim about YOUR harness until you have ruled the harness
+       out.** Before reporting `parity: fail`, check the mundane causes first, since the
+       fused kernel usually demands a stricter layout than the split path tolerates:
+       non-contiguous weight views (`w.transpose(-1,-2)` — pass `.contiguous()` in the
+       layout the kernel documents, e.g. (B,N,K)), transposed/row-vs-column scale layout,
+       wrong group_size, fnuz-vs-fn fp8 variant, or comparing two independent fp8
+       quantizations. Report which of these you eliminated. A candidate with a large
+       isolated speedup and a parity failure you did NOT diagnose is an OPEN item, not a
+       closed `blocked`.
    - **single-GPU family (norm/activation/quant/gemm-prologue) → 1-GPU microbench** on
      one `GPU_IDS` card: ref = the split member ops in sequence; cand = the fused API.
      `engaged=true` (no distributed guard).

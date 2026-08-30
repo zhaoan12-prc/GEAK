@@ -68,8 +68,93 @@ def _collect_step_spans(events):
             event["ts"], event["ts"] + event["dur"], tag,
             int(tokens or 0), int(batch), "step-%d" % raw_index,
             "sglang_step_annotation"))
+
+    # SGLang emits each step[...] annotation TWICE: a CPU-side `user_annotation`
+    # spanning the host wall-clock of the step, and a GPU-side
+    # `gpu_user_annotation` spanning only the device work.  The spans above are
+    # the GPU ones, which is right for device rows but WRONG for CPU-side
+    # python_function `nn.Module:` spans.
+    #
+    # In prefill the two windows are nearly the same length (the GPU is the
+    # bottleneck), so using the GPU window to contain CPU module spans happened
+    # to work.  In eager decode the host runs ~40x longer than the device
+    # (1794ms CPU vs 45ms GPU on DSR1/MI308X), so 52 of 61 DecoderLayer spans
+    # fall outside the GPU window, `full_passes` drops to 0, and every decode
+    # layer boundary silently degrades to anchor_repeat_segmentation.
+    #
+    # Carry the CPU window alongside each span (indices 7,8) so CPU-side
+    # containment can use it.  Falls back to the GPU window when a trace has no
+    # CPU-side annotation (older captures).
+    cpu_by_name = {}
+    for event in events:
+        if not isinstance(event, dict) or event.get("cat") != "user_annotation":
+            continue
+        name = event.get("name")
+        if (not isinstance(name, str) or not SGLANG_STEP_RE.match(name)
+                or event.get("ts") is None or event.get("dur") is None):
+            continue
+        cpu_by_name.setdefault(name, []).append(
+            (event["ts"], event["ts"] + event["dur"]))
+    for key in cpu_by_name:
+        cpu_by_name[key].sort()
+    widened = []
+    for span in spans:
+        cpu_lo, cpu_hi = span[0], span[1]
+        for lo, hi in cpu_by_name.get(_step_span_name(span), ()):
+            # Pair a CPU window with the GPU window it encloses/overlaps.
+            if lo <= span[0] < hi or (span[0] <= lo and hi <= span[1]):
+                cpu_lo, cpu_hi = min(cpu_lo, lo), max(cpu_hi, hi)
+                break
+        widened.append(tuple(span) + (cpu_lo, cpu_hi))
+    spans = widened
     spans.sort(key=lambda item: (item[0], item[1], item[5]))
     return spans
+
+
+def _step_span_name(span):
+    """Reconstruct the sglang annotation name a step span was parsed from."""
+    kind = "EXTEND" if span[2] == "P" else "DECODE"
+    if kind == "EXTEND":
+        return "step[EXTEND bs=%d toks=%d]" % (span[4], span[3])
+    return "step[DECODE bs=%d]" % span[4]
+
+
+def has_module_layer_spans(path):
+    """True when a trace carries `nn.Module: ...DecoderLayer_N` python spans.
+
+    CUDA-graph-replayed decode traces do not: the whole layer stack replays as
+    one opaque graph launch, so there are no per-layer python frames and no
+    External ids.  Used to decide whether an eager capture trace can supply
+    decode layer boundaries the clean trace cannot.
+    """
+    try:
+        events = _load_events(path)
+    except Exception:
+        return False
+    for event in events:
+        if (isinstance(event, dict)
+                and event.get("cat") == "python_function"
+                and MODULE_LAYER_RE.match(str(event.get("name", "")))):
+            return True
+    return False
+
+
+def _cpu_step_index(spans):
+    """(spans, starts) sorted by CPU window start, for CPU-side containment."""
+    usable = [span for span in spans if len(span) >= 9]
+    usable.sort(key=lambda item: (item[7], item[8]))
+    return usable, [span[7] for span in usable]
+
+
+def _cpu_step_at(ts, spans, starts):
+    if ts is None or not spans:
+        return None
+    pos = bisect.bisect_right(starts, ts) - 1
+    while pos >= 0:
+        if ts < spans[pos][8]:
+            return spans[pos]
+        pos -= 1
+    return None
 
 
 STAGE_RULESET_VERSION = "semantic-stage-v2"
@@ -224,7 +309,10 @@ def _module_layer_scopes(events, spans, pattern_doc):
     if expected_count <= 0:
         return [], []
     pattern_by_layer = _pattern_index(pattern_doc)
-    span_starts = [span[0] for span in spans]
+    # CPU-side module spans must be located against the CPU-side step window.
+    cpu_spans, span_starts = _cpu_step_index(spans)
+    if not cpu_spans:
+        cpu_spans, span_starts = spans, [span[0] for span in spans]
     candidates = []
     for raw_index, event in enumerate(events):
         if not isinstance(event, dict) or event.get("cat") != "python_function":
@@ -233,7 +321,7 @@ def _module_layer_scopes(events, spans, pattern_doc):
         match = MODULE_LAYER_RE.match(name)
         if not match or event.get("ts") is None or event.get("dur") is None:
             continue
-        step = _step_at(event["ts"], spans, span_starts)
+        step = _cpu_step_at(event["ts"], cpu_spans, span_starts)
         if step is None:
             continue
         candidates.append({

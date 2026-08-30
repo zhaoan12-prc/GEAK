@@ -189,6 +189,56 @@ def run(config_path, trace_path, shape_log_path, out_dir,
             "shape_log_path, capture_setup_path, or capture_result_path "
             "is required")
 
+    # --- F3: rebuild layer boundaries from the eager capture DECODE trace ----
+    # The phase-1.1 build above ran before any capture existed, so its decode
+    # rows came from the CLEAN trace -- which is captured with CUDA graphs on.
+    # A graph-replayed decode trace carries no `nn.Module: DecoderLayer_N`
+    # python spans and no External ids, so decode boundaries degraded to
+    # anchor_repeat_segmentation (rotated layer bodies) and every decode row
+    # fell back to layer-level identity (`canonical_op = model.layers.N`).
+    # Real per-kernel ops -- e.g. the MLA v-absorb `aten::bmm
+    # [[16,4,512],[16,512,128]]` -- were therefore invisible to fusion search.
+    #
+    # The shape capture already runs eager (disable_cuda_graph), and its DECODE
+    # trace has all 61 module spans plus External-id linkage.  Rebuild with
+    # [clean EXTEND] + [eager capture DECODE] so prefill keeps its clean-trace
+    # boundaries while decode gains K-level identity.  auto_sibling is off so
+    # the graph DECODE sibling is not re-adopted alongside it.
+    boundary_rebuild = None
+    eager_decode_traces = []
+    for capture in capture_results:
+        by_phase = capture.get("capture_traces_by_phase") or {}
+        decode_trace = by_phase.get("DECODE")
+        if (decode_trace and os.path.exists(decode_trace)
+                and semantic_kernel_mapping.has_module_layer_spans(
+                    decode_trace)):
+            eager_decode_traces.append(decode_trace)
+    if eager_decode_traces:
+        extend_traces = [
+            path for path in (
+                [trace_path] if isinstance(trace_path, str) else list(trace_path))
+            if "-DECODE" not in os.path.basename(path)]
+        rebuild_dir = os.path.join(out_dir, "boundary_rebuild")
+        rebuilt = semantic_kernel_mapping.build(
+            extend_traces + eager_decode_traces, patterns_path, rebuild_dir,
+            auto_sibling=False, require_phases=require_phases)
+        if rebuilt["status"] != "fail":
+            shutil.copyfile(rebuilt["semantic_table_json"], phase_1_1_json)
+            shutil.copyfile(rebuilt["semantic_table_md"], phase_1_1_md)
+            with open(rebuilt["layer_instance_audit_json"]) as fh:
+                rebuild_audit = json.load(fh)
+            module_scope_count = int(
+                rebuild_audit.get("module_scope_count", 0) or 0)
+        boundary_rebuild = {
+            "applied": rebuilt["status"] != "fail",
+            "status": rebuilt["status"],
+            "reason": "graph-decode trace has no DecoderLayer module spans; "
+                      "decode boundaries rebuilt from the eager capture trace",
+            "traces": [os.path.abspath(path)
+                       for path in extend_traces + eager_decode_traces],
+            "out_dir": rebuild_dir,
+        }
+
     probe_tables = []
     probe_runs = []
     if shape_log_path:
@@ -238,11 +288,39 @@ def run(config_path, trace_path, shape_log_path, out_dir,
         capture.get("runtime_marker_mapping", {}).get(
             "phase_coverage_complete", False)
         for capture in capture_results)
+    # --- Per-phase boundary evidence -----------------------------------------
+    # `boundary_evidence` above is an AGGREGATE over the whole run: prefill's 61
+    # module spans set it to "module_span" even when every decode layer fell
+    # back to anchor_repeat_segmentation.  That fail-open is what let a rotated,
+    # identity-less decode table reach the fusion analyst marked healthy.  Grade
+    # each phase separately and require BOTH.
+    phase_boundary_evidence = {}
+    try:
+        with open(phase_1_1_json) as fh:
+            for table in json.load(fh).get("tables", []):
+                phase = table.get("phase")
+                if not phase:
+                    continue
+                levels = {row.get("layer_evidence")
+                          for row in table.get("rows", [])}
+                degraded = {level for level in levels
+                            if not str(level).startswith(
+                                ("module_span", "python_module_span"))}
+                phase_boundary_evidence[phase] = (
+                    "degraded:" + ",".join(sorted(str(x) for x in degraded))
+                    if degraded else "module_span")
+    except Exception as exc:  # pragma: no cover - diagnostics only
+        phase_boundary_evidence = {"error": str(exc)}
+    degraded_phases = sorted(
+        phase for phase, level in phase_boundary_evidence.items()
+        if level != "module_span")
+
     status = "pass" if (
         semantic["status"] != "fail"
         and merged["status"] == "pass"
         and capture_phase_coverage_complete
         and boundary_evidence == "module_span"
+        and not degraded_phases
     ) else "fail"
     result = {
         "schema_version": 1,
@@ -259,6 +337,9 @@ def run(config_path, trace_path, shape_log_path, out_dir,
         "capture_phase_coverage_complete": (
             capture_phase_coverage_complete),
         "boundary_evidence": boundary_evidence,
+        "phase_boundary_evidence": phase_boundary_evidence,
+        "degraded_boundary_phases": degraded_phases,
+        "boundary_rebuild": boundary_rebuild,
         "module_scope_count": module_scope_count,
         "inputs": {
             "config": {
