@@ -2,8 +2,8 @@
 key: kernel fusion (collective+norm+quant) · gfx942 · sglang fp8 decode TP8
 type: lever
 confidence: ★★★
-effect: reproduced on 2 independent runs. Decode kernel time -20.0% over the fusion set (51.96 -> 41.55 us/layer); launches 245 -> 121/iter (-50.6%). e2e transfer, ISOLATED at last: **+1.583% output tok/s, non-overlapping** (167.330 -> 169.979 tok/s) — i.e. this rung ALONE is worth ~1.6%, not the +11.80% of the stack it previously shipped inside.
-confirms: 2
+effect: reproduced on 2 independent runs. Decode kernel time -20.0% over the fusion set (51.96 -> 41.55 us/layer); launches 245 -> 121/iter (-50.6%). e2e transfer, ISOLATED at last: **+1.583% output tok/s, non-overlapping** (167.330 -> 169.979 tok/s) — i.e. this rung ALONE is worth ~1.6%, not the +11.80% of the stack it previously shipped inside. 3rd confirm 2026-08-30: **+2.014% output tok/s marginal, non-overlapping (220.853 < 224.145)**, TPOT -2.23%, gsm8k 0.935 -> 0.945.
+confirms: 3
 last_seen: 2026-08-30
 ---
 # aiter fused AllReduce+add+RMSNorm+per-group-quant — and the flag that lies about being on
@@ -28,5 +28,21 @@ last_seen: 2026-08-30
   shape separately**: the fused collective carries a byte guard (64 MiB) and at ISL=8192/TP8 the
   prefill collectives are 101.9 MiB, so the fusion is decode-only at that shape and TTFT does not move
   (-0.53%, not significant) — the decode win is real, the prefill win is not there to be had.
-- source: /raid/users/zhaoan/fusion_kernel_result/20260826_e2e/dsr1/round1 (apply/FINAL_RESULT.md §4 patch 02)
-- source: /raid/users/zhaoan/fusion_kernel_result/20260829_e2e_v1/dsr1 (COMBINED_ATTRIBUTION.md §4.1, §5 e02)
+- source: 2026-08-26 round1 (apply/FINAL_RESULT.md §4 patch 02)
+- source: 2026-08-29 (COMBINED_ATTRIBUTION.md §4.1, §5 e02)
+- 2026-08-30, two things that decide whether this rung can be reached at all:
+  - `ca_comm` must be `aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce` — the class
+    `dispatch_custom_allreduce()` returns on ROCm. **sglang's own `CustomAllreduce` defines no fused
+    method at all**, so on a build that selects it (`_use_amd_deterministic_impl()`, i.e.
+    `SGLANG_USE_1STAGE_ALLREDUCE=1` or deterministic inference) `GroupCoordinator.fused_allreduce_rmsnorm`
+    returns None and `--enable-aiter-allreduce-fusion` silently degrades to a plain all-reduce plus
+    norm. Check the class, not the flag.
+  - the flag is not optional even for the QUANT variant reached by an overlay: it is what makes the
+    previous layer stamp `_sglang_needs_allreduce_fusion` on its output
+    (deepseek_v2.py:1982 <- `should_fuse_mlp_allreduce_with_next_layer`). With the flag off, the
+    overlay's branch is never entered and its counters read **0 fused / 0 fallback while the ENGAGED
+    banner still prints on all 8 ranks**.
+  - caution: phase-tag the counters. At ISL 8192 the prefill call is ~117 MiB and aiter
+    `should_custom_ar` declines above 64 MiB, so a correct decode-only landing looks like
+    `decode 3600/0, prefill 180/4740`. Untagged it reads as a 19% fallback rate and gets misjudged.
+- source: 2026-08-30 (05_FUSION_APPLYBACK.md e04; overlay fusion/fusion_overlays/dsr1/e04_ar_norm_quant)

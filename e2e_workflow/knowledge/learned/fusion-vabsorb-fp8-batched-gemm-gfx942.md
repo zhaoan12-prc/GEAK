@@ -2,8 +2,8 @@
 key: kernel fusion (weight dequant into GEMM) · gfx942 · sglang MLA fp8 decode cudagraph
 type: lever
 confidence: ★★★
-effect: -9.13% decode kernel time; e2e TPOT -10.94% / output throughput +11.80% (verified, gsm8k-clean) for the 2-patch stack. REPRODUCED 2026-08-30 on a second box/container as an ISOLATED marginal rung: +10.340% output throughput, non-overlapping (base_max 171.733 < cand_min 188.405), gsm8k 0.935 -> 0.935 (dead flat)
-confirms: 2
+effect: -9.13% decode kernel time; e2e TPOT -10.94% / output throughput +11.80% (verified, gsm8k-clean) for the 2-patch stack. REPRODUCED 2026-08-30 on a second box/container as an ISOLATED marginal rung: +10.340% output throughput, non-overlapping (base_max 171.733 < cand_min 188.405), gsm8k 0.935 -> 0.935 (dead flat) REPRODUCED AGAIN 2026-08-30 (3rd confirm) as a marginal rung on top of the rope/kv fusion: **+14.04% output tok/s, non-overlapping (188.512..190.875 -> 215.114..215.421)**, TPOT -13.68%.
+confirms: 3
 last_seen: 2026-08-30
 ---
 # The win is deleting the per-step weight dequant, not swapping the GEMM
@@ -42,6 +42,7 @@ last_seen: 2026-08-30
   env-only overlay was authored + kernel-availability-gated PASS but could NOT be e2e-gated (2026-08-29 run:
   DeepSeek-R1-0528 weights absent + /mnt/raid0 100% full -> no server). Overlay ready to gate:
   geak_fusion_result/20260828_e2e/dsr1/fusion/fusion_overlays/dsr1/mla_headprep_decode/.
-- source: /raid/users/zhaoan/fusion_kernel_result/20260826_e2e/dsr1/round1 (apply/FINAL_RESULT.md §2-4 patch 01)
-- source: /raid/users/zhaoan/fusion_kernel_result/20260829_e2e_v2/dsr1 (05_FUSION_APPLYBACK.md; leg c06;
+- source: 2026-08-26 round1 (apply/FINAL_RESULT.md §2-4 patch 01)
+- source: 2026-08-29 (05_FUSION_APPLYBACK.md; leg c06;
   applyback/COMBINED_ATTRIBUTION.md shows the fp8 dequant kernel at n=22 -> n=0)
+- source: 2026-08-30 (05_FUSION_APPLYBACK.md e05; overlay fusion/fusion_overlays/dsr1/e05_vabsorb_prequant)

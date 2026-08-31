@@ -2,8 +2,8 @@
 key: kernel fusion (RoPE + cat + fp8 KV write) · gfx942 · sglang MLA fp8 decode
 type: lever
 confidence: ★★★
-effect: +7.302% e2e output throughput marginal on top of an already-fused stack, non-overlapping (base_max 171.733 < cand_min 182.980), TPOT -7.057%, gsm8k 0.935 -> 0.940; lands TWO exec_ids with one overlay
-confirms: 1
+effect: +7.302% e2e output throughput marginal on top of an already-fused stack, non-overlapping (base_max 171.733 < cand_min 182.980), TPOT -7.057%, gsm8k 0.935 -> 0.940; lands TWO exec_ids with one overlay REPRODUCED 2026-08-30 on a THIRD container as the FIRST rung on a stock baseline: **+20.61% output tok/s, non-overlapping (ref_max 157.229 < cand_min 188.512)**, TPOT -18.48%, median ITL -19.46%, gsm8k 0.935 -> 0.940.
+confirms: 2
 last_seen: 2026-08-30
 ---
 # A caller-side arch gate is a DISPATCH decision, not a capability statement
@@ -30,5 +30,20 @@ last_seen: 2026-08-30
   False — that would mean upstream RoPE is still running and the model silently double-RoPEs.
   Audit every reference to a flag before flipping it (11 here).
 - verify: `PATH fused` per-rank counts with 0 fallback, not just the ENGAGED banner.
-- source: /raid/users/zhaoan/fusion_kernel_result/20260829_e2e_v2/dsr1 (05_FUSION_APPLYBACK.md; leg c05;
+- source: 2026-08-29 (05_FUSION_APPLYBACK.md; leg c05;
   overlay fusion/fusion_overlays/dsr1/e05_rope_kv_write)
+- 2026-08-30 additions, all measured on gfx942/TP8/DSR1-fp8:
+  - `self.rotary_emb.cos_cache` / `.sin_cache` is the RIGHT source and it DOES exist at runtime as a
+    plain instance attribute — it is NOT in the rotary_embedding source tree (grep finds only
+    `cos_sin_cache` / `cos_cached_total`), so do not "fix" the upstream line to `cos_sin_cache`:
+    that raises `AttributeError: 'DeepseekScalingRotaryEmbedding' object has no attribute
+    'cos_sin_cache'`. Shape is (163840, 32) bf16, i.e. already the 2-D form the kernel wants.
+  - caution: the upstream `fp8q` rung (`q_out_dtype=fp8_dtype` when the KV cache is fp8) ALSO moves
+    the aiter MLA decode core from `mla_a16w8` to `mla_a8w8_qh16_qseqlen*`. Both are prebuilt in
+    `aiter/hsa/gfx942/mla/`, so it works — but the two effects are inside ONE rung. **Also verify
+    the `bf16q` rung** if you need them apportioned.
+  - caution: with `--attention-backend aiter`, `handle_attention_aiter` returns
+    AttnForwardMethod.MHA for every extend batch, so `forward_absorb_core` is DECODE-ONLY. The
+    prefill twins of this candidate have no seam to land on there — the MHA path's q is
+    [T,128,192] with per-head k/v from kv_b_proj, which the fused kernel cannot produce.
+- source: 2026-08-30 (05_FUSION_APPLYBACK.md e03; COMBINED_ATTRIBUTION.md; overlay fusion/fusion_overlays/dsr1/e03_rope_cat_kvwrite)

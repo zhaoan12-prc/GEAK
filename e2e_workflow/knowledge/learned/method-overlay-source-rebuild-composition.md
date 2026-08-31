@@ -30,5 +30,5 @@ last_seen: 2026-08-30
   shipped to a GPU leg. Arm the overlays in leg order against the installed library with no server and
   no weights, then assert every `_OVL_*` injection is present in the final source AND resolvable in
   module globals.
-- source: /raid/users/zhaoan/fusion_kernel_result/20260829_e2e_v2/dsr1 (applyback/smoke_stack.py,
+- source: 2026-08-29 (applyback/smoke_stack.py,
   fusion/fusion_overlays/dsr1/_ovl_util.py; 05_FUSION_APPLYBACK.md "失败与修复")

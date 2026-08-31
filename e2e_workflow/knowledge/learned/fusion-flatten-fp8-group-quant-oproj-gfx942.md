@@ -1,9 +1,9 @@
 ---
 key: kernel fusion (reshape+quant) · gfx942 · sglang MLA fp8 decode
 type: lever
-confidence: ★★
-effect: +1.606% e2e output tok/s MARGINAL on top of an already-accepted fusion, non-overlapping (169.979 -> 172.709 tok/s); TPOT -1.624%; gsm8k flat 0.940. Kernel: one standalone quant call/layer removed, replaced by a fused flatten+quant at 4.94 us/layer.
-confirms: 1
+confidence: ★★★
+effect: +1.606% e2e output tok/s MARGINAL on top of an already-accepted fusion, non-overlapping (169.979 -> 172.709 tok/s); TPOT -1.624%; gsm8k flat 0.940. Kernel: one standalone quant call/layer removed, replaced by a fused flatten+quant at 4.94 us/layer. REPRODUCED 2026-08-30 on a different container and a different underlying stack: **+2.142% output tok/s marginal, non-overlapping (215.421 < 219.277)**, TPOT -2.52%.
+confirms: 2
 last_seen: 2026-08-30
 ---
 # fold the o_proj input reshape into its fp8 group-quant (MLA attention output)
@@ -28,4 +28,5 @@ last_seen: 2026-08-30
   trace arithmetic is sound only for the fusion set in aggregate (it explained 93% of the combined
   -0.685 ms/token ITL), not per rung. Also verify fp8 dtype: this box is `float8_e4m3fnuz`, and several
   aiter entry points branch to a gfx95-only path on `float8_e4m3fn`.
-- source: /raid/users/zhaoan/fusion_kernel_result/20260829_e2e_v1/dsr1 (COMBINED_ATTRIBUTION.md §4.1, §5 e07)
+- source: 2026-08-29 (COMBINED_ATTRIBUTION.md §4.1, §5 e07)
+- source: 2026-08-30 (05_FUSION_APPLYBACK.md e09; overlay fusion/fusion_overlays/dsr1/e09_oproj_flatten_quant)
