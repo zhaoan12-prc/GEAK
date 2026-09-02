@@ -40,6 +40,10 @@ The fast-path artifacts live under `<exp_root>/geak_e2e_moe_int4/`
   "accepted_flags": "--attention-backend triton",  // best config from the caller's search
   "accepted_env": "SGLANG_USE_AITER=1",
   "launch_recipe": "/path/baseline_config.with_envs.yaml",  // optional launch script/recipe
+  "exec_prefix": "docker exec geak-runtime", // optional role shell prefix
+  "runtime_image": "lmsysorg/sglang:latest", // optional fresh unitside runtime
+  "fusion_discovery": true,               // default true; fast mode skips fusion
+  "fusion_unitside_budget": 10,           // explicit Top-K validation budget
   "raw_baseline_tput": 1485.4,           // caller's pre-change session baseline (audit reference)
   "orchestrator_best_tput_same_config": 1550.8, // caller best measured with accepted_flags/env
   "exp_root": "/work/experiment/geak",   // basename MUST be `geak`; the timestamped run dir is created here
@@ -79,6 +83,9 @@ a ~10-15% 口径 gap. Both default to `0` (fixed) so the standalone and forwarde
 | `accepted_flags` | `initial_extra_server_args` | seeds the baseline = caller best config |
 | `accepted_env` | `initial_extra_env` | seeds baseline env |
 | `launch_recipe` | `launch_script` | optional |
+| `exec_prefix` | `exec_prefix` | optional command prefix for KernelFusion roles only |
+| `runtime_image` / `image` | `runtime_image` | optional image used when UnitSide must create a fresh runtime and no `exec_prefix` is supplied |
+| `fusion` / `fusion_discovery` / `fusion_*_budget` | same names | optional complete prior or discovery/budget controls; a complete topk+candidates+unitside prior short-circuits discovery |
 | `raw_baseline_tput` | result audit metadata | pre-change session baseline; never used as the measurement-alignment signal |
 | `orchestrator_best_tput_same_config` | result alignment metadata | caller throughput on the accepted config GEAK uses for its baseline |
 | `exp_root` | `exp_root` | run dir root |

@@ -12,7 +12,17 @@ This renders the parts that decide what happens downstream:
   * provenance -- which traces, which sha, which phases, how shapes were resolved
   * phase coverage, MEASURED off the rows rather than read off the declared record
     (a later step can graft shapes onto the table and leave the record stale)
-  * per-pattern cost, and the stage mix inside each layer
+  * per-pattern cost, the stage mix inside each layer, and EVERY row of every
+    layer table in trace order with its measured `input_dims` / `input_types`.
+    Not a top-N, and donor rows included. This report is the only human-readable
+    artifact that travels between phases, so whatever it drops is, in practice,
+    dropped: it used to render `shape` as a bare `✓` and never touch
+    `input_types` at all, and downstream then rebuilt shapes by multiplying
+    config fields (`input_tokens` x `kv_lora_rank`). That silently loses the
+    batch axis and the 64 rope columns, the kernel falls into a degenerate path,
+    and the resulting parity failure plus distorted timing is indistinguishable
+    from "this fusion is not worth it" (DSR1, 2026-08-31: two fusions worth
+    +20.6% and +14.0% e2e were blocked this way).
   * the FUSIBLE REGIONS -- contiguous non-donor runs, i.e. the fusion surface the
     Phase 2.1 harness will hold the candidate set against. Seeing them here, one
     phase before candidates exist, is the point: it turns "did we find everything?"
@@ -71,6 +81,65 @@ def _stage_mix(item):
     return mix
 
 
+def _row_order(row):
+    """Trace order. Fusion is an adjacency question, so `pos` is the only order
+    that lets a reader see which rows sit next to which."""
+    for key in ("pos", "device_seq_index", "raw_event_index"):
+        val = row.get(key)
+        if isinstance(val, (int, float)):
+            return (0, float(val))
+    return (1, 0.0)
+
+
+def _op_name(parent_operator):
+    """`parent_operator` is either a plain aten/aiter name or a mapping record
+    carrying it under `canonical_op`. The name is what tells a reader what the
+    row actually is (`aten::bmm`, `aten::cat`); the rest of the record is
+    provenance and belongs in the JSON, not in a table cell."""
+    if isinstance(parent_operator, dict):
+        return parent_operator.get("canonical_op") or parent_operator.get("op") or ""
+    return parent_operator or ""
+
+
+def _fmt_dims(dims):
+    """`input_dims` verbatim, one operand per group, in operand order.
+
+    A TensorList operand (aten::cat) nests one level and is rendered `{a; b}` so
+    that `[[4,16,512],[4,16,64]]` does not read as two separate operands -- those
+    two are the halves that concatenate to 576, and losing that grouping is
+    exactly how a 576-wide kernel ends up being fed 512.
+    A dimensionless operand (a Scalar) is `·`; it holds its slot so the dims line
+    up positionally with `input_types`.
+    """
+    if dims is None:
+        return "—"
+    if not isinstance(dims, list):
+        return _esc(dims)
+    if not dims:
+        return "—"
+
+    def one(operand):
+        if not isinstance(operand, list):
+            return str(operand)
+        if not operand:
+            return "·"
+        if all(isinstance(v, (int, float)) for v in operand):
+            return "[%s]" % ",".join(str(int(v)) for v in operand)
+        return "{%s}" % "; ".join(one(v) for v in operand)
+
+    return _esc(" ".join(one(d) for d in dims))
+
+
+def _fmt_types(types):
+    """`input_types` verbatim minus the `c10::` noise. The fp8 variant (`fnuz` vs
+    `fn`) rides in this column and decides parity on its own."""
+    if not types:
+        return "—"
+    if not isinstance(types, list):
+        return _esc(types)
+    return _esc(",".join(str(t).replace("c10::", "") or "·" for t in types))
+
+
 def build(table_path, helper_floor=5.0, top_rows=8):
     table = _load(table_path)
     measured = _measure_phases(table)
@@ -117,6 +186,21 @@ def build(table_path, helper_floor=5.0, top_rows=8):
                 for r in sorted(rows,
                                 key=lambda r: -float(r.get("duration_us", 0.0) or 0.0))
                 if str(r.get("stage") or "").lower() not in DONOR_STAGES][:top_rows],
+            # EVERY row, in trace order, carrying the shapes and dtypes verbatim.
+            # Not a top-N and not non-donor-only: see the module docstring.
+            "row_detail": [
+                {"pos": r.get("pos"),
+                 "row_id": r.get("row_id"),
+                 "stage": r.get("stage"),
+                 "donor": str(r.get("stage") or "").lower() in DONOR_STAGES,
+                 "short_name": r.get("short_name"),
+                 "parent_operator": r.get("parent_operator"),
+                 "duration_us": round(float(r.get("duration_us", 0.0) or 0.0), 3),
+                 "provider": r.get("provider"),
+                 "shape_source": (r.get("shape") or {}).get("source"),
+                 "input_dims": (r.get("shape") or {}).get("input_dims"),
+                 "input_types": (r.get("shape") or {}).get("input_types")}
+                for r in sorted(rows, key=_row_order)],
         })
 
     regions = []
@@ -251,16 +335,27 @@ def render_markdown(rep):
             lines.append("| %s%s | %d | %.2f | %.1f%% |"
                          % (_esc(stage), mark, v["count"], v["us"], pct))
         lines.append("")
-        if p["top_non_donor_rows"]:
-            lines.append("最贵的非-donor 行（融合的直接目标）：")
+        detail = p.get("row_detail") or []
+        if detail:
+            unresolved = [r for r in detail if not r.get("input_dims")]
+            lines.append(
+                "这一层的**全部 %d 行**，按 trace 顺序（`pos`），donor 行也在内。"
+                "`input_dims` / `dtypes` 是 trace 里量到的原文，"
+                "**下游构造融合参考侧和单侧 microbench 时必须从这里抄，不要从配置字段拼**。%s"
+                % (len(detail),
+                   ("其中 **%d 行没有解出 shape**（`—`）——它们对下游是盲区。"
+                    % len(unresolved)) if unresolved else "全部 %d 行都解出了 shape。" % len(detail)))
             lines.append("")
-            lines.append("| row | stage | kernel | µs/层 | provider | shape |")
-            lines.append("|---|---|---|---:|---|:--:|")
-            for r in p["top_non_donor_rows"]:
-                lines.append("| `%s` | %s | `%s` | %.2f | %s | %s |" % (
-                    _esc(r["row_id"]), _esc(r["stage"]), _esc(r["short_name"]),
-                    r["duration_us"], _esc(r["provider"]),
-                    "✓" if r["shape_resolved"] else "—"))
+            lines.append("| pos | row | stage | kernel | 算子 | µs/层 | input_dims | dtypes |")
+            lines.append("|---:|---|---|---|---|---:|---|---|")
+            for r in detail:
+                mark = " *(donor)*" if r.get("donor") else ""
+                lines.append("| %s | `%s` | %s%s | `%s` | `%s` | %.2f | %s | %s |" % (
+                    _esc(r.get("pos")), _esc(r.get("row_id")),
+                    _esc(r.get("stage")), mark,
+                    _esc(r.get("short_name")), _esc(_op_name(r.get("parent_operator"))),
+                    r.get("duration_us") or 0.0,
+                    _fmt_dims(r.get("input_dims")), _fmt_types(r.get("input_types"))))
             lines.append("")
 
     lines.append("## 4. 可融合面：fusible regions")
@@ -274,6 +369,13 @@ def render_markdown(rep):
     lines.append(
         "Phase 2.1 会按这张表核对候选集：每个区间都必须有一条覆盖**整段**的候选，"
         "或一条写明理由的延后。这就是让「候选集」变成表的函数、而不是每次跑各凭判断的地方。")
+    lines.append("")
+    lines.append(
+        "**每个 `row_id` 的 shape 和 dtype 在第 3 节该 pattern 的逐行表里，按 `pos` 排好。**"
+        "构造候选、构造 split 参考、跑单侧 microbench，用的都必须是那里的 `input_dims` 原文。"
+        "从 `structural_context` 的配置字段（`kv_lora_rank`、`input_tokens`、`num_attention_heads`）"
+        "拼一个 shape 出来，会拼掉 batch 轴、拼掉 rope 那 64 列——kernel 于是走退化路径，"
+        "parity 挂、计时失真，而失真后的数字长得和「这个融合不划算」一模一样。")
     lines.append("")
     lines.append("| # | 阶段 | pattern | 行数 | stages | µs/层 | row_ids |")
     lines.append("|---:|:--:|---|---:|---|---:|---|")

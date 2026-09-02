@@ -271,6 +271,20 @@ def map_args(h: dict, timeout_s: int | None = None) -> dict:
     # subset of {setup,profile,config,head,kernel,final} (default unset => "all").
     if h.get("phases"):
         ps_args["phases"] = str(h["phases"])
+    # Optional command prefix used only by the KernelFusion pre-stage.
+    if h.get("exec_prefix"):
+        ps_args["exec_prefix"] = str(h["exec_prefix"])
+    if h.get("runtime_image") or h.get("image"):
+        ps_args["runtime_image"] = str(
+            h.get("runtime_image") or h.get("image"))
+    if isinstance(h.get("fusion"), dict):
+        ps_args["fusion"] = dict(h["fusion"])
+    for key in (
+        "fusion_discovery", "fusion_top_k", "fusion_budget",
+        "fusion_unitside_budget",
+    ):
+        if h.get(key) is not None:
+            ps_args[key] = h[key]
     # Optional A/B repeat count override (bounds the cost of a resume / finalize
     # A/B — e.g. 1 repeat per leg is enough to PROVE both legs ran). General.
     if h.get("e2e_repeats") is not None:

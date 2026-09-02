@@ -100,6 +100,7 @@ class FusionTopkTest(unittest.TestCase):
             self.assertEqual(actions[0]["tier"], "A")
             self.assertEqual(actions[0]["phase"], "decode")
             self.assertIn("collective_norm", actions[0]["recipe_key"])
+            self.assertIn("KernelFusion", actions[0]["route"])
             # prefill AR (exact=no B) is not actionable -> not in the list
             self.assertFalse(any(
                 a["phase"] == "prefill" and "collective_norm" in a["recipe_key"]
@@ -304,6 +305,50 @@ class FusionTopkTest(unittest.TestCase):
                 self._write(tmp, "t.json", table), 10)
             self.assertEqual(result["exclusive_groups"][0]["choose"], 1)
             self.assertIn("只能落一条", topk.render_markdown(result, actions))
+
+    def test_same_family_different_seams_do_not_conflict(self):
+        """e01/e02-style rows in different pattern positions may coexist.
+
+        Family equality is not conflict evidence; only same phase+pattern with
+        intersecting removable row ids can create an edge.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            table = {"tables": [
+                {"phase": "decode", "pattern_id": "P_LEFT",
+                 "rows": [{"row_id": "left_q", "provider": "aiter"}]},
+                {"phase": "decode", "pattern_id": "P_RIGHT",
+                 "rows": [{"row_id": "right_q", "provider": "aiter"}]},
+            ]}
+            def cand(cid, pattern, row):
+                return {
+                    "candidate_id": cid, "phase": "decode",
+                    "pattern_id": pattern, "family": "norm_quant",
+                    "implementation_class": "existing_api_needs_adapter",
+                    "readiness": "ready_for_api_validation",
+                    "exact_kernel_status": "yes",
+                    "removable_row_ids": [row],
+                    "existing_apis": [{"name": "kernel_for_" + cid}],
+                }
+            candidates = {"candidates": [
+                cand("left", "P_LEFT", "left_q"),
+                cand("right", "P_RIGHT", "right_q"),
+            ]}
+            validation = {"metrics": {
+                "phase_total_forward_us": {"decode": 1000.0},
+                "candidate_savings": [
+                    {"candidate_id": "left", "estimate_us": 2.0,
+                     "stack_estimate_us": 20.0},
+                    {"candidate_id": "right", "estimate_us": 1.0,
+                     "stack_estimate_us": 10.0},
+                ]}}
+            result, actions, _ = topk.rank(
+                self._write(tmp, "c.json", candidates),
+                self._write(tmp, "v.json", validation),
+                self._write(tmp, "t.json", table), 10)
+            self.assertEqual(len(actions), 2)
+            self.assertEqual(result["exclusive_groups"], [])
+            self.assertTrue(all(
+                not action["mutually_exclusive_with"] for action in actions))
 
 
 if __name__ == "__main__":

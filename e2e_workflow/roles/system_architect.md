@@ -70,7 +70,9 @@ admits*, not by the edit flag:
 ## PHASE=strategize  (after baseline profile, before any optimization)
 
 Inputs: `EVAL_DIR`, `PROFILE_TOPN` (path to profile_topN.json + inline top entries),
-`BASELINE_THROUGHPUT`, `WORKLOAD` (isl/osl/conc → tells you prefill vs decode regime mix),
+`BASELINE_THROUGHPUT` (throughput of the stack that produced `PROFILE_TOPN` — already
+includes accepted KernelFusion if any; not a frozen Setup-only number),
+`WORKLOAD` (isl/osl/conc → tells you prefill vs decode regime mix),
 `BUDGET` (max kernel-optimization tasks), `CONFIG_TUNE_ENABLED` (bool), `SKILL_DIR`.
 OPTIONAL profile-analysis prior (empty string = not provided): `ANALYSIS_SKILL`, `ANALYSIS_SKILL_DIR`
 (+ the Profiler's `profile_roofline_json`) — see step 1c.
@@ -542,7 +544,72 @@ attempt, win or not. REQUIRED sections, in order:
      still ✘. A **no-win** run closes with `✅ Validate  Director A/B <b>→<f> = 0.9997× · validated_no_win`
      (validated, no regression, NO win). Only `validated_win` earns a `🏁`+`⭐` final stack.
 
-3. **Head-kernel deep-dive** (the centerpiece) — for EACH head op a `####` sub-section titled
+3. **Stage attribution ladder + fusion track** — MANDATORY, always. Two tables built from
+   `STAGE_LADDER`, `ACCEPTED_FUSIONS` and `FUSION_DISPOSITION`.
+
+   **3a. Ladder.** One row per phase that RAN, in execution order. Each row's `stage Δ%` is measured
+   against the row ABOVE it (same box, same session); `cumulative Δ%` is against the TRUE baseline:
+
+   | stage | tok/s | stage Δ% | cumulative Δ% | what this stage covers |
+   |---|---|---|---|---|
+   | Baseline | … | — | — | TRUE baseline (Setup): no overlay, no flags |
+   | KernelFusion | … | +a% | +a% | tier-A flags/env + tier-B overlays (per-`exec_id`) |
+   | ConfigSweep | … | +b% | … | secondary config effects on the fused stack |
+   | HeadKernel | … | +c% | … | head ops, searched on the post-fusion reprofiled baseline |
+   | Milestone | … | +d% | … | editable-kernel loop |
+   | Finalize | … | +e% | … | assembled bundle (only if it moved the number) |
+   | **Validate — OFFICIAL** | … | — | **+T%** | Director same-session full-stack A/B |
+
+   Rules, all mandatory — a ladder that breaks any of them is worse than no ladder:
+   - **NEVER sum the stage rows, and never present a sum as the total.** The official headline is the
+     Director's single same-session number. Stage deltas **compound multiplicatively**
+     (1.20 × 1.20 = 1.44, not 1.40). Write the ladder as a *decomposition of* `+T%`, never as addends
+     that produce it. If the rows visibly do not compound to `+T%`, say so in one line and keep the
+     Director number as official — adjust neither.
+   - **Every stage that RAN gets a row, including one that won nothing** (`+0.0%`, note = why). An
+     absent row must mean "this phase did not run" and nothing else. A fusion track that ran and was
+     blocked end to end MUST be visible; before this section existed it was silently indistinguishable
+     from a run with no fusion at all.
+   - **State the position bias in one line.** KernelFusion runs first and reshapes
+     the formal Profile and all later search. ConfigSweep therefore measures only
+     secondary effects on the already-fused stack and may understate an axis whose
+     opportunity was consumed by fusion. These are **position-dependent
+     increments, not independent contributions**; an independent number would need a leave-one-out
+     re-measure, which this run did not do. Do not describe a stage row as "what fusion was worth".
+   - **Tier-A belongs to KernelFusion.** Do not attribute accepted tier-A flags to
+     ConfigSweep or count them twice.
+   - For each accepted fusion report `fusion_only_delta_pct` separately from
+     `secondary_effect_delta_pct`. A dtype/backend switch that changes the selected
+     kernel, batching, or unrelated memory pressure is a secondary/co-effect and
+     must not be credited wholly to fusion.
+
+   **3b. Fusion track.** MANDATORY whenever the fusion prior was supplied (`FUSION_DISPOSITION`
+   non-null) — **including when zero fusions were accepted.** Lead with a three-number summary
+   from `FUSION_DISPOSITION.entry_throughput_tok_s` / `exit_throughput_tok_s` plus
+   `BASELINE_THROUGHPUT` and `FINAL_THROUGHPUT` (do not invent a fourth runtime baseline):
+   Fusion gain = `exit/entry − 1` (also print `status`); post-fusion combined =
+   `FINAL/exit − 1`; official total = `FINAL/BASELINE − 1` (Director same-session A/B still
+   owns the headline). These compound; never add the percents. Then one row per execution-list
+   row, covering `applied` + `blocked` + `deferred`:
+
+   | exec_id | fusion | tier | rung | e2e Δ% | TPOT Δ% | non-overlap | gsm8k base→cand | engaged | disposition + reason |
+
+   - The **denominator is the execution list**, not the accepted set. `2 applied / 7 blocked /
+     3 deferred` is a real result AND an incomplete one; report both halves in the same sentence.
+     Lead 3b with that one-line coverage count.
+   - Every blocked/deferred row carries its **one-line reason verbatim** from the gate — never
+     paraphrased into "no win".
+   - Carry the **gate verdicts, not just the deltas**: if the apply-back drift gate came back red or
+     the round was voided, say so in the row and again in one line under the table. A large Δ% under a
+     red drift gate is not a win yet; do not launder it by quoting only the number.
+   - Note any **numeric-path change** an accepted fusion brought in (a dtype/quant the baseline did not
+     use, a different prebuilt kernel selected by dispatch). A fusion that also changes numerics is a
+     structural win *plus* a precision change, and the report must not merge the two.
+   - Link `applyback_report_md` and `applyback_gate_json` so the per-rung A/B evidence is reachable.
+   - If `FUSION_DISPOSITION` is null, write one line: "fusion apply-back did not run (no `args.fusion`
+     prior supplied)" — so an absent fusion track is always an explicit statement, never an omission.
+
+4. **Head-kernel deep-dive** (the centerpiece) — for EACH head op a `####` sub-section titled
    `<id> — <op> (<pct>% GPU) — RESULT: <ACCEPTED +X% | no win | flagged>`, containing:
    - **GPU-time-share table**: rows `stock baseline` vs `accepted config`; columns `live kernel | backend |
      %GPU | calls` — shows how the accepted config (e.g. aiter) already re-routed the op and its %GPU on the
@@ -565,19 +632,19 @@ attempt, win or not. REQUIRED sections, in order:
    - For the **accepted** op: the e2e integrate numbers (REF→CAND tok/s, delta%, non-overlap proof, engagement
      hits, parity) from `overlay/cand_*/integrate_result.json`.
 
-4. **Artifacts tree**: `tree -L 2 -I "__pycache__|*.pyc|.git|*.so"` of the eval dir, annotating `[P#]` per path.
+5. **Artifacts tree**: `tree -L 2 -I "__pycache__|*.pyc|.git|*.so"` of the eval dir, annotating `[P#]` per path.
 
-5. **Summary table** of all attempts (lever | what changed | isolated | e2e | verdict | root cause).
+6. **Summary table** of all attempts (lever | what changed | isolated | e2e | verdict | root cause).
    For every attempt record **WHAT optimization was applied and exactly WHICH params changed** (e.g.
    backend swap triton→flydsl, tile/block sizes, num_warps, dtype, fused epilogue, the flag/env value),
    not just the verdict — so the report explains *how* each gain/no-op happened.
 
-6. **⚠️ FLAGGED dominant heads** (from `FLAGGED_HEADS`): MANDATORY if non-empty. For each, list `pct_gpu_time`,
+7. **⚠️ FLAGGED dominant heads** (from `FLAGGED_HEADS`): MANDATORY if non-empty. For each, list `pct_gpu_time`,
    the stage it failed at (extract / bakeoff / no_candidate), whether it was a `harness_error` (bake-off could
    not measure — NOT a real no-win), and the `reason`. State plainly these dominant ops were NOT optimized and
    carry the LARGEST remaining headroom (top "next direction"). Never bury a flagged head in the no-ops.
 
-6b. **🔌 BACKEND ABSENT (env provisioning)** — MANDATORY if `EVAL_DIR/env_report.json` has a non-empty
+7b. **🔌 BACKEND ABSENT (env provisioning)** — MANDATORY if `EVAL_DIR/env_report.json` has a non-empty
    `absent_backends`, or any op's `opbench_result.json` carries `backend_absent[]`. A table
    `backend | mandated for | what's missing (probe) | remedy | fell back to`. State plainly that a
    strategy-mandated lever was UNAVAILABLE on this image (NOT a measured no-win), quote the actionable
@@ -585,7 +652,7 @@ attempt, win or not. REQUIRED sections, in order:
    build that ships `aiter/ops/flydsl/` — pip flydsl alone is insufficient), and note which language was
    authored instead. This makes a missing lever a re-runnable provisioning action, never a silent drop.
 
-7. **Final deliverable + measurement caveats** (box drift → trust ONLY same-session A/B; the official number
+8. **Final deliverable + measurement caveats** (box drift → trust ONLY same-session A/B; the official number
    is the Director's same-session value) **+ next directions to explore.** Quote the FINAL serving numbers
    — throughput (median + spread), **TTFT and TPOT** — next to the baseline numbers, so the report shows the
    full E2E throughput / TTFT / TPOT delta (not just throughput). At `report` time these come

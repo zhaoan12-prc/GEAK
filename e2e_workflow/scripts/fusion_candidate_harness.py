@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Validate Fusion 2.1 facts/coverage and render the mandatory total table."""
 import argparse
+import copy
 import json
 import math
 import os
@@ -604,6 +605,107 @@ def _region_dtype_tags(candidate):
 # author-track implementation classes: no existing kernel is CLAIMED, so the
 # catalog is exactly what falsifies that claim.
 AUTHOR_CLASSES = {"new_helper_kernel", "main_kernel_or_algorithmic"}
+_SEMANTIC_NAME_ROOTS = ("flatten", "reshape", "concat", "cat", "layout",
+                        "transpose", "shuffle")
+
+
+def _basename_api(name):
+    text = str(name or "").split("(", 1)[0].strip().lower()
+    tokens = re.findall(r"[a-z_][a-z0-9_]*", text.replace("::", " "))
+    distinctive = [
+        tok for tok in tokens
+        if ("fused" in tok or "quant" in tok or "norm" in tok or
+            "rope" in tok or "gemm" in tok or "topk" in tok)
+    ]
+    return (distinctive[-1] if distinctive else (tokens[-1] if tokens else ""))
+
+
+def _audit_cited_apis(payload, catalog_path, environment_path, errors, warnings):
+    """Post-generation gates for API truth, inventory closure and over-spread.
+
+    The catalog is authoritative for existence. The run-local environment
+    inventory is a ledger, so cited catalog APIs missing there are backfilled
+    rather than rejected. Spread/name-semantic checks are warnings: they expose
+    suspicious analyst behavior without turning a heuristic into a hard veto.
+    """
+    candidates = payload.get("candidates") or []
+    cited = {}
+    for cand in candidates:
+        for api in cand.get("existing_apis") or []:
+            name = str(api.get("name") or "")
+            if name:
+                cited.setdefault(_basename_api(name), {
+                    "display": name, "candidate_ids": [], "candidates": []})
+                cited[_basename_api(name)]["candidate_ids"].append(
+                    cand.get("candidate_id"))
+                cited[_basename_api(name)]["candidates"].append(cand)
+    if not cited:
+        return {"cited": 0, "backfilled": [], "spread_warnings": []}
+
+    catalog_names = set()
+    if catalog_path and fusion_catalog is not None:
+        try:
+            _meta, kernels = fusion_catalog.load_index(catalog_path)
+            catalog_names = {
+                _basename_api(k.get("name")) for k in kernels if k.get("name")}
+        except (OSError, ValueError) as exc:
+            warnings.append("cited-API truth gate could not load catalog: %r" % exc)
+    if catalog_names:
+        for base, info in sorted(cited.items()):
+            if base not in catalog_names:
+                errors.append(
+                    "unverified_api: cited API %r (candidates %s) is absent "
+                    "from the deterministic catalog"
+                    % (info["display"], info["candidate_ids"][:8]))
+
+    backfilled = []
+    if environment_path and os.path.exists(environment_path):
+        environment = _load(environment_path)
+        api_key = "apis" if isinstance(environment.get("apis"), list) else \
+            "available_apis"
+        inventory = environment.setdefault(api_key, [])
+        inventoried = {
+            _basename_api(item.get("name") if isinstance(item, dict) else item)
+            for item in inventory
+        }
+        for base, info in sorted(cited.items()):
+            if base not in inventoried and (not catalog_names or base in catalog_names):
+                inventory.append({
+                    "name": info["display"],
+                    "source": "cited_not_inventoried",
+                    "candidate_ids": sorted(set(info["candidate_ids"])),
+                })
+                backfilled.append(info["display"])
+        if backfilled:
+            with open(environment_path, "w") as fh:
+                json.dump(environment, fh, indent=2, ensure_ascii=False)
+
+    spread_warnings = []
+    denominator = max(1, len(candidates))
+    for _base, info in sorted(cited.items()):
+        ratio = len(set(info["candidate_ids"])) / float(denominator)
+        if ratio > 0.30:
+            message = (
+                "api_spread_warning: %s is cited by %d/%d candidates (%.1f%% > 30%%)"
+                % (info["display"], len(set(info["candidate_ids"])),
+                   denominator, ratio * 100.0))
+            warnings.append(message)
+            spread_warnings.append(message)
+        api_name = info["display"].lower()
+        for cand in info["candidates"]:
+            semantic = " ".join(str(cand.get(k) or "") for k in
+                                ("plan", "plan_detail", "rationale",
+                                 "live_call_seam")).lower()
+            roots = [root for root in _SEMANTIC_NAME_ROOTS if root in semantic]
+            if roots and not any(root in api_name for root in roots):
+                warnings.append(
+                    "api_semantic_mismatch_warning: candidate %s describes %s "
+                    "but cites %s"
+                    % (cand.get("candidate_id"), "/".join(roots), info["display"]))
+    return {
+        "cited": len(cited), "backfilled": backfilled,
+        "spread_warnings": spread_warnings,
+    }
 
 
 def _catalog_falsify(payload, catalog_path, errors, warnings,
@@ -738,6 +840,24 @@ def validate(semantic_table_path, candidates_path,
     tables, source_rows, table_order = _semantic_index(table)
     errors = []
     warnings = []
+    # SHAPE 透传 (2026-09-01). The 单侧 microbench and the split reference are both
+    # built from the members' `input_dims`, and NOTHING downstream can re-derive
+    # them: the only other source in reach is the run config, and multiplying
+    # config fields (`input_tokens` x `kv_lora_rank`) silently drops the batch axis
+    # and the 64 rope columns. The kernel then takes a degenerate path, so parity
+    # fails AND the timing is distorted -- a pair of symptoms indistinguishable
+    # from "this fusion is not worth it". DSR1 2026-08-31 lost +20.6% and +14.0%
+    # e2e exactly that way.
+    #
+    # So the harness GRAFTS the shapes from the semantic table by row_id rather
+    # than trusting the author to transcribe them. On 2026-08-30 the members
+    # happened to carry `shape` (155 of them) and every downstream gate worked; on
+    # 2026-08-31, following the documented member schema literally, they carried
+    # none (0), and the shape-provenance gate degraded to no gate at all. The
+    # difference between those two runs was luck, not process. Grafting removes
+    # the luck.
+    shape_graft = {"grafted": 0, "already_present": 0,
+                   "members_without_shape": [], "shapeless_candidates": []}
     bw_per_us = None  # HBM bytes/us for the roofline savings estimate
 
     # Entry gate: is the semantic evidence good enough to build candidates on?
@@ -829,6 +949,7 @@ def validate(semantic_table_path, candidates_path,
             "source_row_count": len(source_rows),
             "covered_source_row_count": 0,
             "source_row_coverage_pct": 0.0,
+            "member_shape_graft": shape_graft,
         }
 
     covered = set()
@@ -903,6 +1024,7 @@ def validate(semantic_table_path, candidates_path,
             continue
         member_ids = []
         member_total = 0.0
+        member_shape_hits = 0
         previous_pos = None
         is_boundary = bool(candidate.get("boundary"))
         for member_index, member in enumerate(members):
@@ -915,6 +1037,17 @@ def validate(semantic_table_path, candidates_path,
                     member_path, row_id))
                 continue
             member_ids.append(row_id)
+            src_shape = source.get("shape")
+            if isinstance(src_shape, dict) and src_shape.get("input_dims"):
+                member_shape_hits += 1
+                if member.get("shape") is None:
+                    member["shape"] = copy.deepcopy(src_shape)
+                    shape_graft["grafted"] += 1
+                else:
+                    shape_graft["already_present"] += 1
+            else:
+                shape_graft["members_without_shape"].append(
+                    "%s row_id=%s" % (member_path, row_id))
             member_total += float(source.get("duration_us", 0.0) or 0.0)
             for field in ("pos", "device_seq_index", "stream", "duration_us"):
                 if field == "duration_us":
@@ -932,6 +1065,24 @@ def validate(semantic_table_path, candidates_path,
                     and member.get("pos", -1) <= previous_pos):
                 errors.append("%s members are not in execution order" % path)
             previous_pos = member.get("pos")
+        if members and not member_shape_hits:
+            # Not one member resolved a shape in the semantic table, so Phase 3.0
+            # would have to invent one. It has exactly one place to invent it from
+            # (config fields), and that invention is the 08-31 failure. Fail here,
+            # where the cause is still legible, rather than three phases later as
+            # "parity fail + slow".
+            shape_graft["shapeless_candidates"].append(candidate_id)
+            msg = ("%s no member resolved an input_dims in the semantic table — "
+                   "Phase 3.0 would have to rebuild a shape from config fields, "
+                   "and a rebuilt shape puts the kernel on a degenerate path "
+                   "(parity fails, timing distorts, and the pair reads exactly "
+                   "like 'not worth it'). Fix the semantic capture, or re-run "
+                   "with --allow-partial-phase-coverage to accept it knowingly."
+                   % path)
+            if allow_partial_phase_coverage:
+                warnings.append(msg)
+            else:
+                errors.append(msg)
         candidate_member_ids[candidate_id] = tuple(member_ids)
         if not _close(
                 candidate.get("current_chain_us_per_layer"), member_total):
@@ -1542,6 +1693,9 @@ def validate(semantic_table_path, candidates_path,
     # can floor the tier at B instead of dropping the row to deferred_author.
     metrics["candidate_catalog_match"] = _catalog_falsify(
         payload, catalog_path, errors, warnings, strategies_path)
+    metrics["cited_api_audit"] = _audit_cited_apis(
+        payload, catalog_path, environment_path, errors, warnings)
+    metrics["member_shape_graft"] = shape_graft
     return payload, table, errors, warnings, metrics
 
 
@@ -1707,6 +1861,19 @@ def run(semantic_table_path, candidates_path, out_md, result_json,
         "warnings": warnings,
         "metrics": metrics,
     }
+    # Persist the grafted member shapes back into the candidates file. Phase 3.0
+    # re-reads THIS file and gates each verdict's `tested_shape` against the member
+    # shapes; if the graft stayed in memory the gate would again have nothing to
+    # check against, which is the whole failure being fixed here.
+    graft = metrics.get("member_shape_graft") or {}
+    if graft.get("grafted"):
+        with open(candidates_path, "w") as fh:
+            json.dump(payload, fh, indent=2)
+    result["member_shape_graft"] = {
+        "grafted": graft.get("grafted", 0),
+        "already_present": graft.get("already_present", 0),
+        "members_without_shape": len(graft.get("members_without_shape") or []),
+        "shapeless_candidates": graft.get("shapeless_candidates") or []}
     os.makedirs(os.path.dirname(os.path.abspath(result_json)), exist_ok=True)
     with open(result_json, "w") as fh:
         json.dump(result, fh, indent=2)

@@ -183,6 +183,47 @@ class FusionCandidateHarnessTest(unittest.TestCase):
             }],
         }
 
+    def test_cited_api_gate_backfills_inventory_and_warns_on_spread(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = self._write(tmp, "env.json", {
+                "image": "test", "inspection_evidence": ["source"]})
+            catalog_path = self._write(tmp, "catalog.json", {"kernels": [{
+                "name": "pkg.fused_flatten_quant",
+                "op_tags": ["layout", "quant"], "dtype_tags": [],
+            }]})
+            payload = {"candidates": [
+                {"candidate_id": "c0", "plan_detail": "flatten then quant",
+                 "existing_apis": [{"name": "pkg.fused_flatten_quant"}]},
+                {"candidate_id": "c1", "plan_detail": "flatten then quant",
+                 "existing_apis": [{"name": "pkg.fused_flatten_quant"}]},
+            ]}
+            errors, warnings = [], []
+            result = harness._audit_cited_apis(
+                payload, catalog_path, env_path, errors, warnings)
+            self.assertEqual(errors, [])
+            self.assertEqual(result["cited"], 1)
+            self.assertTrue(result["backfilled"])
+            self.assertTrue(any("api_spread_warning" in w for w in warnings))
+            with open(env_path) as fh:
+                inventory = json.load(fh)
+            self.assertEqual(
+                inventory["available_apis"][0]["source"],
+                "cited_not_inventoried")
+
+    def test_cited_api_absent_from_catalog_is_hard_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = self._write(tmp, "env.json", {})
+            catalog_path = self._write(tmp, "catalog.json", {"kernels": [{
+                "name": "pkg.real_fusion", "op_tags": [], "dtype_tags": []}]})
+            errors, warnings = [], []
+            harness._audit_cited_apis(
+                {"candidates": [{
+                    "candidate_id": "c0",
+                    "existing_apis": [{"name": "pkg.imagined_fusion"}],
+                }]},
+                catalog_path, env_path, errors, warnings)
+            self.assertTrue(any("unverified_api" in error for error in errors))
+
     # ---- collective fixtures (comm member present; comm->norm made
     # non-contiguous so the ①②③ collective-coverage requirement stays out of
     # the way and the size-guard logic can be tested in isolation) ----
@@ -1188,3 +1229,88 @@ class FusionCandidateHarnessTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MemberShapeGraftTest(FusionCandidateHarnessTest):
+    # only the four tests below belong to this class
+
+    """The harness copies member shapes out of the semantic table itself.
+
+    Phase 3.0 builds BOTH the microbench and the split reference from
+    `members[].shape.input_dims`, and the only other place a shape can come from is
+    the run config -- where multiplying `input_tokens` x `kv_lora_rank` yields a
+    plausible-looking wrong shape with no batch axis and no rope columns. On DSR1
+    2026-08-30 the members happened to carry `shape` (155 of them) and every gate
+    worked; on 2026-08-31, following the documented schema literally, they carried
+    none (0), the shape-provenance gate degraded to no gate, and two fusions worth
+    +20.6% and +14.0% e2e were blocked on a degenerate-path parity fail. The
+    difference between those runs was luck. Grafting removes the luck.
+    """
+
+    def test_shapes_are_grafted_onto_members_from_the_table(self):
+        with tempfile.TemporaryDirectory() as root:
+            table = self._write(root, "table.json", self._table())
+            p = self._payload()
+            p["environment_api_inventory_json"] = self._env(root)
+            cands = self._write(root, "cands.json", p)
+            payload, _, errors, _, metrics = harness.validate(table, cands)
+            self.assertEqual(errors, [])
+            graft = metrics["member_shape_graft"]
+            self.assertEqual(graft["grafted"], 2)
+            self.assertEqual(graft["shapeless_candidates"], [])
+            members = payload["candidates"][0]["members"]
+            self.assertEqual([m["shape"]["input_dims"] for m in members],
+                             [[[8, 16]], [[8, 16]]])
+            self.assertEqual(members[0]["shape"]["input_types"], ["bf16"])
+
+    def test_an_author_supplied_shape_is_never_overwritten(self):
+        payload = self._payload()
+        payload["candidates"][0]["members"][0]["shape"] = {
+            "input_dims": [[1, 2]], "input_types": ["bf16"]}
+        with tempfile.TemporaryDirectory() as root:
+            table = self._write(root, "table.json", self._table())
+            payload["environment_api_inventory_json"] = self._env(root)
+            cands = self._write(root, "cands.json", payload)
+            out, _, errors, _, metrics = harness.validate(table, cands)
+            self.assertEqual(errors, [])
+            self.assertEqual(metrics["member_shape_graft"]["already_present"], 1)
+            self.assertEqual(metrics["member_shape_graft"]["grafted"], 1)
+            self.assertEqual(
+                out["candidates"][0]["members"][0]["shape"]["input_dims"], [[1, 2]])
+
+    def test_a_candidate_whose_rows_resolve_no_shape_is_an_error(self):
+        # A table with NO shapes at all is caught earlier, by the phase entry gate.
+        # This is the subtler one the entry gate cannot see: the table resolves
+        # shapes, but not on the rows THIS candidate is built from -- so Phase 3.0
+        # would still have to invent the only shape that matters.
+        tbl = self._table()
+        for row in tbl["tables"][0]["rows"]:
+            if row["row_id"] in ("r0", "r1"):
+                row.pop("shape", None)
+        with tempfile.TemporaryDirectory() as root:
+            table = self._write(root, "table.json", tbl)
+            p = self._payload()
+            p["environment_api_inventory_json"] = self._env(root)
+            cands = self._write(root, "cands.json", p)
+            _, _, errors, _, metrics = harness.validate(table, cands)
+            self.assertIn("c0", metrics["member_shape_graft"]["shapeless_candidates"])
+            self.assertTrue(any("no member resolved an input_dims" in e
+                                for e in errors))
+
+    def test_the_graft_is_persisted_so_phase_3_0_can_read_it(self):
+        # in-memory is not enough: fusion_unitside_harness re-reads THIS file and
+        # gates every verdict's tested_shape against these member shapes.
+        with tempfile.TemporaryDirectory() as root:
+            table = self._write(root, "table.json", self._table())
+            p = self._payload()
+            p["environment_api_inventory_json"] = self._env(root)
+            cands = self._write(root, "cands.json", p)
+            harness.run(table, cands, os.path.join(root, "out.md"),
+                        os.path.join(root, "res.json"))
+            with open(cands) as fh:
+                on_disk = json.load(fh)
+            self.assertEqual(
+                on_disk["candidates"][0]["members"][0]["shape"]["input_dims"],
+                [[8, 16]])
+            with open(os.path.join(root, "res.json")) as fh:
+                self.assertEqual(json.load(fh)["member_shape_graft"]["grafted"], 2)

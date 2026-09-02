@@ -93,14 +93,19 @@ control with 100s of MB of trace/bench. Return StructuredOutput: `{fusion, accep
 engaged (bool), ttft_delta_pct, tpot_delta_pct, throughput_delta_pct, nonoverlap (bool),
 gsm8k_base, gsm8k_cand, reprofile_ok, overlay_path, skipped_branches, notes}`.
 
-## PHASE=apply_back — loop the Top-K fusions and keep wins (called by the FusionApplyBack phase)
+## PHASE=apply_back — loop the Top-K fusions and keep wins (called by KernelFusion)
 Inputs add `FUSION_TOPK_JSON`, `FUSION_CANDIDATES_JSON`, `FUSION_UNITSIDE_JSON`,
 `CURRENT_OVERLAY/FLAGS/ENV/THROUGHPUT`, `FUSION_BUDGET`, `FUSION_OVERLAYS_DIR`, `ACCURACY_*`.
+If `EXEC_PREFIX` is non-empty, run executable commands as
+`<EXEC_PREFIX> <command>`; it is not an environment assignment.
 This is the Phase 3.1/3.2 driver — the orchestrator has no fs access, so YOU loop the candidates
 (one role call keeps the wins, like `config_tuner:sweep`):
-1. Read `FUSION_TOPK_JSON` + `FUSION_UNITSIDE_JSON`; take ONLY `unit_side_status==pass` **tier-B**
-   candidates (skip tier-A — ConfigSweep already handled the flags; skip tier-C — author, 二期,
-   count them into `deferred_author_count`). Order by Top-K `forward_pct`, up to `FUSION_BUDGET`.
+1. Read `FUSION_TOPK_JSON` + `FUSION_UNITSIDE_JSON`; take ONLY
+   `unit_side_status==pass` **tier-A or tier-B** candidates (tier-C is author work;
+   count it into `deferred_author_count`). Order by Top-K `forward_pct`, up to
+   `FUSION_BUDGET`. Tier-A belongs here, not ConfigSweep: apply its one flag/env,
+   run serving A/B, verify the fused kernel/route engagement, and keep or revert it
+   before moving to the next row.
 2. Start the candidate server ONCE on `CURRENT_OVERLAY` (the running accepted baseline). For each
    fusion, in maximal-first order per its `fusion_degrade_ladder`: author the overlay adapter (the
    pattern above), STACK it onto the currently-accepted overlay via a combined-loader, verify the
@@ -111,14 +116,22 @@ This is the Phase 3.1/3.2 driver — the orchestrator has no fs access, so YOU l
    candidate, keep the last-good overlay, move on. Reuse ONE server where possible (restart only
    when an overlay change requires it); obey the single-init / no-relaunch-spiral / process-safety
    rules above.
-3. Persist each accepted fusion under `FUSION_OVERLAYS_DIR/<model>/<fusion>/` and the final stacked
+3. Persist each accepted tier-B fusion under `FUSION_OVERLAYS_DIR/<model>/<fusion>/` and the final stacked
    combined-loader under `.../<model>/combined/`. Return `FUSION_APPLY_SCHEMA`:
-   `{accepted_fusions:[{exec_id,fusion,rung,overlay_path,tpot_delta_pct,throughput_delta_pct,
-   nonoverlap,gsm8k_base,gsm8k_cand,engaged}], final_overlay (the stacked combined-loader dir),
-   e2e_throughput_tok_s (final), rejected:[{exec_id,reason}], deferred:[{exec_id,reason}],
+   `{accepted_fusions:[{exec_id,fusion,tier,rung,overlay_path,tpot_delta_pct,throughput_delta_pct,
+   fusion_only_delta_pct,secondary_effect_delta_pct,nonoverlap,gsm8k_base,gsm8k_cand,engaged}],
+   final_overlay (the stacked combined-loader dir),
+   accepted_flags, accepted_env, e2e_throughput_tok_s (final),
+   rejected:[{exec_id,reason}], deferred:[{exec_id,reason}],
    deferred_author_count, applyback_gate_json, applyback_report_md,
    learned_cards:[{card,action:merged|inserted|archived,key,confidence}], notes}`. The orchestrator
-   then reprofiles + re-strategizes on `final_overlay`.
+   does not reprofile or re-strategize here: the independent formal Profile and
+   Strategize phases run unconditionally after KernelFusion.
+
+`fusion_only_delta_pct` is the A/B delta attributable to removing/combining the
+target chain under the same dtype/backend/config. Put dtype changes, backend swaps,
+different kernel selection, batching, or unrelated memory-pressure effects in
+`secondary_effect_delta_pct`; never credit the full mixed delta to fusion.
 
 ## 🔴 Coverage — the execution list is your denominator (mandatory, harness-enforced)
 
@@ -163,6 +176,7 @@ Three things about this that are easy to get wrong:
   pairwise `conflict_edges`; only entries that actually conflict with something you APPLIED
   get auto-blocked. Being in the same group as an applied entry is not enough — a
   `compatible_subset` group has members that could legally have landed together.
+  Never infer a block from `family`, recipe name, or a family-level group alone.
 
 Reasons must be reasons. `"skipped"`, `""`, and `"not attempted"` are rejected; the failure
 they hide is exactly the one the gate exists to surface.

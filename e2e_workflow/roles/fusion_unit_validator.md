@@ -16,14 +16,19 @@ This is the fusion analogue of `kernel_extractor` (extract_op) + `op_bench.py`: 
 isolated, oracle-checked bake-off. Reuse `SKILL_DIR/scripts/harness_lib.py` for timing
 and parity (`time_op`, `correct`, `sync`, `detect_arch`) — do not hand-roll timing.
 
-## Coverage — who owns the loop (read this before you start)
-One invocation of this role validates ONE candidate. **The loop over candidates is the
-CALLER's job, and it must cover every 单侧-testable candidate — not a subset you find
-convenient to microbench.** A candidate that cites an existing fused API but never gets a
-verdict is a coverage gap, not a skip.
+## PHASE=validate_one — one concrete Top-K candidate
+One invocation of this role validates ONE candidate. **The loop over concrete
+candidate ids in `FUSION_TOPK_JSON.execution_list` is the CALLER's job.** It must
+cover that entire ranked denominator, not a convenient family-level subset. Discovery
+candidates outside the execution list are explicitly `deferred_rank_budget` and do
+not fail unitside coverage.
 
-`fusion_unitside_harness.py` now enforces this: it walks `FUSION_CANDIDATES_JSON` and
-requires every in-scope candidate to end in a verdict, an explicit
+The caller supplies `FUSION_TOPK_JSON`, `EXEC_ID`, and `CANDIDATE_ID`.
+`CANDIDATE_ID` must occur in that execution-list row's `candidate_ids`; do not choose
+a family-level substitute or validate more than this one candidate.
+
+`fusion_unitside_harness.py --topk` enforces this: it expands concrete candidate ids
+from the execution list and requires every in-scope id to end in a verdict, an explicit
 `--waive <id>=<reason>`, or `not_validated` → **the gate FAILS**. tier-C
 (`new_helper_kernel`, no existing kernel) is reported `deferred_author` and is out of
 scope. The report leads with the denominator and a per-phase breakdown.
@@ -40,7 +45,18 @@ If a candidate genuinely cannot be benched this round, waive it WITH A REASON
 (`--waive d1_kv_rope_write_cluster="needs paged-KV cache state; deferred to round 2"`).
 "skipped" is not a reason and an empty reason is rejected.
 
-### The caller's aggregation step (after the last candidate)
+## PHASE=aggregate — publish the Top-K denominator
+
+Inputs: `FUSION_TOPK_JSON`, `FUSION_CANDIDATES_JSON`, `FUSION_DIR`, `EVAL_DIR`,
+`FUSION_UNITSIDE_BUDGET`, and any explicit budget deferrals/waivers from the caller.
+
+Run the harness with `--topk "$FUSION_TOPK_JSON"`. Its coverage denominator is the
+union of concrete `candidate_ids` in `fusion_topk.execution_list`, not every discovery
+candidate. Candidates outside that union are `deferred_rank_budget` and cannot fail
+Top-K coverage. If `FUSION_UNITSIDE_BUDGET` stops inside the execution list, every
+unrun concrete candidate id in `DEFERRED_EXECUTIONS` must become a reasoned harness
+argument such as `--waive <id>=deferred_rank_budget:<budget>` and be copied into
+the returned `deferred[]`; never silently omit it.
 
 One verdict per candidate is not a phase result. When the loop is done, the CALLER runs
 the harness once over the whole verdict dir and publishes the Phase 3.0 report at the
@@ -49,6 +65,7 @@ EVAL_DIR root, beside the other four phase reports:
 ```bash
 python3 "$SKILL_DIR/scripts/fusion_unitside_harness.py" \
   --candidates "$FUSION_CANDIDATES_JSON" \
+  --topk       "$FUSION_TOPK_JSON" \
   --verdicts   "$EVAL_DIR/verdict" \
   --out-md     "$EVAL_DIR/04_FUSION_UNITSIDE.md" \
   --out-json   "$FUSION_DIR/fusion_unitside.json" \
@@ -61,11 +78,25 @@ input). Run this even when the gate FAILS — especially then. A failing 3.0 rep
 root is how the coverage gap reaches Phase 3.1's denominator; a gate that fails and
 publishes nothing is indistinguishable from a phase that never ran.
 
+Return:
+```json
+{"status":"pass|partial|failed",
+ "fusion_unitside_json":"<absolute path>",
+ "fusion_unitside_md":"<absolute path>",
+ "validated_count":0,
+ "waived":[],"deferred":[],"notes":"..."}
+```
+
 ## Inputs
 - `FUSION_CANDIDATES_JSON` — the Phase 2.1 candidates.
 - `CANDIDATE_ID` — the single candidate to validate this run.
-- `IMAGE`, `MODEL_PATH`, `TP`, `CONTAINER` — the runtime (a FRESH dated container you
-  create from `IMAGE`; delete it when done). `GPU_IDS` — the cards to use.
+- `IMAGE`, `MODEL_PATH`, `TP`, `CONTAINER` — the runtime. `EXEC_PREFIX`, when
+  present, identifies a pre-provisioned runtime and every executable command must
+  run through that literal prefix. Otherwise create a FRESH dated container from
+  non-empty `IMAGE` and delete it when done. If neither is available, use the
+  current environment only after proving the required stack imports; otherwise
+  return an explicit unmeasured/waived reason rather than fabricating a verdict.
+  `GPU_IDS` — the cards to use.
 - `EVAL_DIR` — where to write `verdict/<CANDIDATE_ID>.json` and scratch.
 - `SKILL_DIR` — this workflow dir (harness_lib, server_teardown).
 
@@ -85,10 +116,12 @@ Read the candidate object for `CANDIDATE_ID` from `FUSION_CANDIDATES_JSON`:
   the real call signature.
 
 ## Procedure
-0. Create the FRESH container from `IMAGE` (dated name; e.g.
-   `geak_fusion_unitside_<model>_<date>`); do NOT reuse an existing container. Bind the
-   repo + model. Source `SKILL_DIR/scripts/server_teardown.sh` and follow PROCESS SAFETY
-   (only ever signal processes you started; never pattern-kill).
+0. Resolve the runtime as described above. With `EXEC_PREFIX`, do not create or
+   delete a nested container; use the supplied runtime. Without it, create the FRESH
+   container from `IMAGE` (dated name; e.g. `geak_fusion_unitside_<model>_<date>`),
+   bind the repo + model, and delete only that container when done. Source
+   `SKILL_DIR/scripts/server_teardown.sh` and follow PROCESS SAFETY (only ever signal
+   processes you started; never pattern-kill).
 1. **Find the real call signatures by INSPECTING the installed source** (the same source
    the candidate cited in `existing_apis`/`flag_routed_signature`) — do NOT hard-code a
    signature from memory. Read the installed aiter/sglang files to learn exactly how to
@@ -105,6 +138,27 @@ Read the candidate object for `CANDIDATE_ID` from `FUSION_CANDIDATES_JSON`:
    the live default (so the real incremental is ~0). A candidate whose fused kernel is
    already the live-default kernel for its op is `already_engaged` → report speedup≈1x /
    `engaged` accordingly; do NOT let a torch-oracle reference inflate it into a false pass.
+2c. **🔴 The reference must be as WIDE as what the fusion DELETES, not as wide as the
+   captured region.** `members` is a slice of ONE trace region and `removable_row_ids` is
+   required to be a subset of it — so per-step work the fused kernel makes unnecessary
+   but that lives OUTSIDE that slice is structurally invisible to a reference built from
+   members alone. Timing against a reference that omits work the fusion removes does not
+   give you "the speedup, slightly pessimistic"; it answers a different question, and it
+   reads exactly like a real loss. Observed on DSR1 2026-08-31: a V-absorb fusion
+   measured `0.698` against a reference that omitted the per-step weight dequant the
+   fusion deletes — the same fusion is worth **+10.34% e2e**. `0.698` was correctly
+   measured and wrong.
+
+   Before timing, ask at the seam: *what does the baseline do per step that the fused
+   kernel will not have to do?* Walk outward from the `live_call_seam` file:line — a
+   dequant hoisted into a neighbouring operator, a layout copy the caller performs, a
+   scale recomputed every step — and put every such op INTO the `ref` leg.
+
+   Then record BOTH answers, because the harness now requires them:
+   - `ref_ops` — the op names the ref leg actually executed. Must cover every removable
+     member op, or the harness errors.
+   - `outside_work_removed` — ops removed that are NOT members. `[]` is a legal answer;
+     leaving it unanswered is not. If non-empty, those ops must appear in `ref_ops` too.
 
 3. **Author the microbench**:
    - **collective family (`collective*`) → distributed TP microbench** (`torchrun
@@ -142,10 +196,32 @@ Read the candidate object for `CANDIDATE_ID` from `FUSION_CANDIDATES_JSON`:
        wrong group_size, fnuz-vs-fn fp8 variant, or comparing two independent fp8
        quantizations. Report which of these you eliminated. A candidate with a large
        isolated speedup and a parity failure you did NOT diagnose is an OPEN item, not a
-       closed `blocked`.
+       closed `blocked`. (Step 3b now enforces this for every family, at any speedup.)
    - **single-GPU family (norm/activation/quant/gemm-prologue) → 1-GPU microbench** on
      one `GPU_IDS` card: ref = the split member ops in sequence; cand = the fused API.
      `engaged=true` (no distributed guard).
+3b. **🔴 `parity != pass` ⇒ the timing is UNDEFINED, not bad.** A fused kernel whose
+   output diverges was, with high probability, FED WRONG — and a mis-fed kernel takes a
+   wrong branch and a wrong tile config, so its `cand_ms` is the time of something that
+   was never the candidate. "Parity failed AND it was slow" is not two independent
+   strikes against the fusion; it is one fault counted twice. Observed on DSR1
+   2026-08-31: a rope+KV fusion recorded `0.4849` with parity fail and was closed as a
+   `fail`; the KB records the same kernel, same shape, same arch at **1.11–1.12x,
+   parity-exact**.
+
+   This holds for EVERY family, not just collectives, and at any speedup — the
+   small-and-diverging case is the dangerous one, because it looks like a settled
+   refutation instead of a broken instrument.
+
+   The harness now renders such a row `needs_diagnosis` (never `fail`), nulls its
+   `isolated_speedup`, and FAILS until you supply `parity_diagnosis`: the mundane causes
+   you actually eliminated — non-contiguous weight views (pass `.contiguous()` in the
+   layout the kernel documents), transposed/row-vs-column scale layout, wrong
+   `group_size`, fnuz-vs-fn fp8 variant, two independent fp8 quantizations compared
+   against each other, a forced `q_out_dtype`, cos/sin caches taken from the wrong
+   object. A candidate at a high-cost seam must never be terminally closed on a number
+   produced by a kernel that was demonstrably not receiving what it expects.
+
 4. **Parity**: compute both outputs from the SAME inputs and call
    `harness_lib.correct(cand_out, ref_out, tol)`. Use `tol=2e-2` for a bf16/residual
    leg (fused vs split). For an **fp8/quant output leg**, do NOT compare the fused fp8
@@ -162,9 +238,35 @@ Read the candidate object for `CANDIDATE_ID` from `FUSION_CANDIDATES_JSON`:
    {"candidate_id": "...", "family": "...", "fused_fn": "<existing_apis[].name>",
     "tested_shape": [tokens, hidden], "dtypes": ["bf16", ...], "tol": 0.02,
     "parity": "pass|fail", "ref_ms": 0.0, "cand_ms": 0.0, "isolated_speedup": 0.0,
+    "ref_ops": ["<every op the ref leg ran>"], "outside_work_removed": [],
+    "parity_diagnosis": "<REQUIRED iff parity != pass: what you eliminated>",
     "engaged": true, "tp": 8, "notes": "how ref+cand were called; how engaged detected"}
    ```
-7. Tear down + DELETE the container.
+   From this the harness derives **two independent axes** — read them, because they
+   are what the board and the apply-back gate now consume:
+
+   | | 含义 | 取值 |
+   |---|---|---|
+   | `correctness_status` | 它算对了吗 | `pass` / `fail` / `not_engaged` |
+   | `perf_status` | 它更快吗 | `win` / `no_win` / `undefined` |
+   | `failure_kind` | **失败是哪一种** | `none` / `performance` / `functional` / `unmeasured` / `not_engaged` |
+
+   `perf_status` is `undefined` — and `isolated_speedup` is **nulled** — whenever
+   `correctness_status != pass`. That is not bookkeeping: a mis-fed kernel takes a
+   wrong branch and a wrong tile config, so its `cand_ms` timed something that was
+   never the candidate. Reporting "parity failed **and** it was slow" as two strikes
+   counts one fault twice, and that is precisely how DSR1 2026-08-31 closed a fusion
+   at `0.4849` that the KB records at **1.11–1.12x, parity-exact**.
+
+   So the only failure you may close on the spot is `performance` — 功能正确、就是不够
+   快, measured on the candidate's own captured shape, so the number means what it
+   says. `functional` requires that you first write `parity_diagnosis`; without it the
+   verdict is `unmeasured`, which is **not a result** and fails the gate. You do not
+   get to call a divergence a real functional failure until you have eliminated the
+   mundane causes.
+
+7. Tear down + DELETE only a container you created. Never delete the runtime
+   represented by `EXEC_PREFIX`.
 
 ## Rules
 - NEVER edit `fusion_unitside_harness.py` or weaken it. Your verdict is the input it

@@ -22,8 +22,8 @@ from collections import Counter, defaultdict
 # Difficulty tiers, ordered by build cost, mapped to the 3.1 routing.
 TIER_WEIGHT = {"A": 1.0, "B": 3.0, "C1": 6.0, "C2": 10.0, "C3": 20.0}
 TIER_ROUTE = {
-    "A": "ConfigSweep (flag/env)",
-    "B": "HeadKernel direct_light/code_patch (wire existing API)",
+    "A": "KernelFusion apply-back (flag/env)",
+    "B": "KernelFusion apply-back (wire existing API)",
     "C1": "kernel_workflow author — single helper, same language",
     "C2": "kernel_workflow author — single helper, cross language",
     "C3": "kernel_workflow author — main-body / algorithmic rewrite",

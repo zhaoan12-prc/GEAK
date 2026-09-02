@@ -10,7 +10,7 @@ sys.path.insert(0, SCRIPTS)
 import fusion_unitside_harness as uh
 
 
-class FusionUnitsideTest(unittest.TestCase):
+class _UnitsideFixture(object):
     def _candidates(self):
         # one collective (AR+norm) with a captured [4,7168] decode member shape, and
         # one single-GPU B (norm+quant).
@@ -34,12 +34,13 @@ class FusionUnitsideTest(unittest.TestCase):
              "fused_fn": "aiter fused_allreduce_rmsnorm", "tested_shape": [4, 7168],
              "dtypes": ["bf16"], "tol": 0.02, "parity": "pass",
              "ref_ms": 0.20, "cand_ms": 0.12, "isolated_speedup": 1.67,
-             "engaged": True, "tp": 8}
+             "engaged": True, "tp": 8,
+             "ref_ops": ["all_reduce", "rms_norm"], "outside_work_removed": []}
         v.update(over)
         return v
 
     def _run(self, candidates, verdicts, min_speedup=1.0,
-             require_coverage=False, waivers=None):
+             require_coverage=False, waivers=None, **kw):
         with tempfile.TemporaryDirectory() as tmp:
             cpath = os.path.join(tmp, "c.json")
             with open(cpath, "w") as fh:
@@ -51,7 +52,7 @@ class FusionUnitsideTest(unittest.TestCase):
                     json.dump(v, fh)
             return uh.validate(cpath, vdir, min_speedup,
                                require_coverage=require_coverage,
-                               waivers=waivers)
+                               waivers=waivers, **kw)
 
     def _status(self, result, cid):
         for r in result["results"]:
@@ -59,16 +60,41 @@ class FusionUnitsideTest(unittest.TestCase):
                 return r["unit_side_status"]
         return None
 
+    def _candidates_decode_bucket(self):
+        # decode collective with NO captured member dims (runtime_probe_wrapper),
+        # only selected_bucket.batch_size -> provenance falls back to the token count.
+        return {"candidates": [
+            {"candidate_id": "dc_probe", "family": "collective_norm",
+             "phase": "decode", "implementation_class": "existing_flag_or_env",
+             "selected_bucket": {"phase": "decode", "batch_size": 4,
+                                 "input_tokens": 0},
+             "existing_apis": [{"name": "aiter fused_allreduce_rmsnorm"}],
+             "members": [{"stage": "communication", "shape": {"input_dims": []}},
+                         {"stage": "norm", "shape": {"input_dims": []}}]}]}
+
+
+class FusionUnitsideTest(_UnitsideFixture, unittest.TestCase):
     def test_clean_pass(self):
         res = self._run(self._candidates(), [self._verdict()])
         self.assertEqual(res["status"], "pass")           # no errors
         self.assertEqual(self._status(res, "dc_ar"), "pass")
         self.assertEqual(res["counts"]["pass"], 1)
 
-    def test_parity_fail(self):
+    def test_parity_fail_is_needs_diagnosis_not_fail(self):
+        # A mis-fed kernel takes a wrong branch and mis-times, so `fail` (terminal
+        # on the board) would close a candidate that was never actually measured.
         res = self._run(self._candidates(), [self._verdict(parity="fail")])
-        self.assertEqual(res["status"], "pass")           # verdict trustworthy
-        self.assertEqual(self._status(res, "dc_ar"), "fail")
+        self.assertEqual(self._status(res, "dc_ar"), "needs_diagnosis")
+        self.assertEqual(res["status"], "fail")           # undiagnosed -> gate fails
+        self.assertTrue(any("elimination record" in e for e in res["errors"]))
+
+    def test_parity_fail_with_a_diagnosis_does_not_fail_the_gate(self):
+        res = self._run(self._candidates(),
+                        [self._verdict(parity="fail",
+                                       parity_diagnosis="ruled out layout, fnuz/fn, "
+                                                        "group_size, scale orient")])
+        self.assertEqual(res["status"], "pass")
+        self.assertEqual(self._status(res, "dc_ar"), "needs_diagnosis")
 
     def test_no_speedup_fails(self):
         res = self._run(self._candidates(), [self._verdict(isolated_speedup=0.98)])
@@ -105,27 +131,17 @@ class FusionUnitsideTest(unittest.TestCase):
         self.assertEqual(res["status"], "fail")
         self.assertTrue(any("missing fields" in e for e in res["errors"]))
 
-    def _candidates_decode_bucket(self):
-        # decode collective with NO captured member dims (runtime_probe_wrapper),
-        # only selected_bucket.batch_size -> provenance falls back to the token count.
-        return {"candidates": [
-            {"candidate_id": "dc_probe", "family": "collective_norm",
-             "phase": "decode", "implementation_class": "existing_flag_or_env",
-             "selected_bucket": {"phase": "decode", "batch_size": 4,
-                                 "input_tokens": 0},
-             "existing_apis": [{"name": "aiter fused_allreduce_rmsnorm"}],
-             "members": [{"stage": "communication", "shape": {"input_dims": []}},
-                         {"stage": "norm", "shape": {"input_dims": []}}]}]}
-
     def test_decode_bucket_provenance_pass(self):
         v = self._verdict(candidate_id="dc_probe", tested_shape=[4, 7168])
-        res = self._run(self._candidates_decode_bucket(), [v])
+        res = self._run(self._candidates_decode_bucket(), [v],
+                        allow_shapeless_candidate="runtime_probe_wrapper decode")
         self.assertEqual(res["status"], "pass")
         self.assertEqual(self._status(res, "dc_probe"), "pass")
 
     def test_decode_bucket_wrong_token_count_is_error(self):
         v = self._verdict(candidate_id="dc_probe", tested_shape=[16, 7168])
-        res = self._run(self._candidates_decode_bucket(), [v])
+        res = self._run(self._candidates_decode_bucket(), [v],
+                        allow_shapeless_candidate="runtime_probe_wrapper decode")
         self.assertEqual(res["status"], "fail")
         self.assertTrue(any("token count" in e for e in res["errors"]))
 
@@ -133,12 +149,144 @@ class FusionUnitsideTest(unittest.TestCase):
         v = {"candidate_id": "dc_nq", "family": "norm_quant",
              "fused_fn": "add_rmsnorm_quant", "tested_shape": [4, 7168],
              "parity": "pass", "isolated_speedup": 1.3, "ref_ms": 0.1,
-             "cand_ms": 0.077, "engaged": True, "tp": 1}
+             "cand_ms": 0.077, "engaged": True, "tp": 1,
+             "ref_ops": ["rms_norm", "quant"], "outside_work_removed": []}
         res = self._run(self._candidates(), [v])
         self.assertEqual(self._status(res, "dc_nq"), "pass")
         md = uh.render_markdown(res)
         self.assertIn("单侧 Gate", md)
         self.assertIn("dc_nq", md)
+
+
+class ShapeProvenanceTest(_UnitsideFixture, unittest.TestCase):
+    """A gate that vanishes when its input is missing is worse than no gate.
+
+    DSR1 2026-08-31: the candidates carried no member shapes, so `cand_shapes` was
+    empty and the strict check was skipped. A microbench on [4,512] (rebuilt from
+    config as input_tokens x kv_lora_rank -- no batch axis, no rope columns) was
+    accepted, the kernel took a degenerate path, and the resulting parity fail plus
+    distorted timing blocked two fusions worth +20.6% and +14.0% e2e."""
+
+    def test_shapeless_candidate_is_an_error_by_default(self):
+        v = self._verdict(candidate_id="dc_probe", tested_shape=[4, 7168])
+        res = self._run(self._candidates_decode_bucket(), [v])
+        self.assertEqual(res["status"], "fail")
+        self.assertTrue(any("no captured member shape" in e for e in res["errors"]))
+
+    def test_opt_in_restores_the_token_count_check(self):
+        v = self._verdict(candidate_id="dc_probe", tested_shape=[4, 7168])
+        res = self._run(self._candidates_decode_bucket(), [v],
+                        allow_shapeless_candidate="probe wrapper")
+        self.assertEqual(res["status"], "pass")
+
+
+class StatusAxesTest(_UnitsideFixture, unittest.TestCase):
+    """correctness and perf are independent; collapsing them double-counts a fault."""
+
+    def test_win_is_pass_on_both_axes(self):
+        r = self._run(self._candidates(), [self._verdict()])["results"][0]
+        self.assertEqual((r["correctness_status"], r["perf_status"]), ("pass", "win"))
+        self.assertEqual(r["failure_kind"], "none")
+
+    def test_slow_but_correct_is_a_performance_failure(self):
+        r = self._run(self._candidates(),
+                      [self._verdict(isolated_speedup=0.98)])["results"][0]
+        self.assertEqual(r["unit_side_status"], "fail")
+        self.assertEqual((r["correctness_status"], r["perf_status"]),
+                         ("pass", "no_win"))
+        self.assertEqual(r["failure_kind"], "performance")
+
+    def test_divergence_without_a_diagnosis_is_unmeasured_not_functional(self):
+        r = self._run(self._candidates(), [self._verdict(parity="fail")])["results"][0]
+        self.assertEqual((r["correctness_status"], r["perf_status"]),
+                         ("fail", "undefined"))
+        self.assertEqual(r["failure_kind"], "unmeasured")
+        self.assertIsNone(r["isolated_speedup"])
+
+    def test_divergence_with_a_diagnosis_is_a_functional_failure(self):
+        r = self._run(self._candidates(),
+                      [self._verdict(parity="fail",
+                                     parity_diagnosis="ruled out fnuz/fn, layout, "
+                                                      "group_size, scale orientation")
+                       ])["results"][0]
+        self.assertEqual(r["failure_kind"], "functional")
+        self.assertEqual(r["perf_status"], "undefined")
+
+    def test_collective_not_engaged_is_neither_kind_of_failure(self):
+        r = self._run(self._candidates(), [self._verdict(engaged=False)])["results"][0]
+        self.assertEqual(r["unit_side_status"], "blocked")
+        self.assertEqual(r["failure_kind"], "not_engaged")
+
+    def test_both_axes_are_rendered(self):
+        res = self._run(self._candidates(),
+                        [self._verdict(isolated_speedup=0.98)])
+        md = uh.render_markdown(res)
+        self.assertIn("correctness", md)
+        self.assertIn("performance", md)
+
+
+class PhaseGeneralizationTest(unittest.TestCase):
+    """A kernel that wins in one phase must be ANSWERED FOR in every other phase.
+
+    DSR1 2026-08-31: fused_qk_rope_concat_and_cache_mla passed 单侧 at 2.76x
+    parity-exact -- in prefill only, because the candidate that claimed it was a
+    prefill candidate. prefill is 2.48% of wall clock, so both rows were correctly
+    deferred. The same kernel in decode was worth +20.61% e2e. Coverage was counted
+    per CANDIDATE, every candidate had a verdict, so no cell ever went red."""
+
+    def _cands(self):
+        common = {"family": "norm_quant",
+                  "implementation_class": "existing_api_needs_adapter",
+                  "existing_apis": [{"name": "aiter add_rmsnorm_quant"}],
+                  "members": [{"stage": "norm",
+                               "shape": {"input_dims": [[4, 7168]]}}]}
+        return {"candidates": [dict(common, candidate_id="d0", phase="decode"),
+                               dict(common, candidate_id="p0", phase="prefill")]}
+
+    def _verdict(self, cid, **over):
+        v = {"candidate_id": cid, "family": "norm_quant",
+             "fused_fn": "aiter add_rmsnorm_quant", "tested_shape": [4, 7168],
+             "parity": "pass", "isolated_speedup": 1.3, "ref_ms": 0.1,
+             "cand_ms": 0.077, "engaged": True, "tp": 1,
+             "ref_ops": ["rms_norm", "quant"], "outside_work_removed": []}
+        v.update(over)
+        return v
+
+    def _run(self, verdicts, **kw):
+        with tempfile.TemporaryDirectory() as tmp:
+            cpath = os.path.join(tmp, "c.json")
+            with open(cpath, "w") as fh:
+                json.dump(self._cands(), fh)
+            vdir = os.path.join(tmp, "verdicts")
+            os.makedirs(vdir)
+            for i, v in enumerate(verdicts):
+                with open(os.path.join(vdir, "v%d.json" % i), "w") as fh:
+                    json.dump(v, fh)
+            kw.setdefault("require_coverage", False)
+            return uh.validate(cpath, vdir, 1.0, **kw)
+
+    def test_a_winner_unbenched_in_the_other_phase_is_a_gap(self):
+        res = self._run([self._verdict("d0")])
+        self.assertEqual(res["status"], "fail")
+        gaps = res["phase_generalization"]["open_gaps"]
+        self.assertEqual([(g["fused_fn"], g["phase"]) for g in gaps],
+                         [("aiter add_rmsnorm_quant", "prefill")])
+
+    def test_benching_it_in_both_phases_closes_the_gap(self):
+        res = self._run([self._verdict("d0"), self._verdict("p0")])
+        self.assertEqual(res["status"], "pass")
+        self.assertEqual(res["phase_generalization"]["open_gaps"], [])
+
+    def test_a_waiver_closes_the_gap_with_a_reason_on_the_record(self):
+        res = self._run(
+            [self._verdict("d0")],
+            phase_waivers={"aiter add_rmsnorm_quant@prefill": "no norm+quant seam"})
+        self.assertEqual(res["status"], "pass")
+
+    def test_a_loser_generates_no_gap(self):
+        # only a WINNER has to be answered for elsewhere
+        res = self._run([self._verdict("d0", isolated_speedup=0.9)])
+        self.assertEqual(res["phase_generalization"]["open_gaps"], [])
 
 
 class CoverageGateTest(unittest.TestCase):
@@ -169,7 +317,8 @@ class CoverageGateTest(unittest.TestCase):
         return {"candidate_id": cid, "family": "norm_quant",
                 "fused_fn": "aiter add_rmsnorm_quant", "tested_shape": [4, 7168],
                 "parity": "pass", "isolated_speedup": 1.3, "ref_ms": 0.1,
-                "cand_ms": 0.077, "engaged": True, "tp": 1}
+                "cand_ms": 0.077, "engaged": True, "tp": 1,
+                "ref_ops": ["rms_norm", "quant"], "outside_work_removed": []}
 
     def _run(self, cands, verdicts, **kw):
         with tempfile.TemporaryDirectory() as tmp:
@@ -226,7 +375,8 @@ class CoverageGateTest(unittest.TestCase):
 
     def test_waiver_with_reason_is_accepted(self):
         res = self._run(self._cands(2), [self._verdict("c0")],
-                        waivers={"c1": "needs paged-KV state, deferred to round 2"})
+                        waivers={"c1": "needs paged-KV state, deferred to round 2"},
+                        require_phase_generalization=False)
         self.assertEqual(res["status"], "pass")
         self.assertEqual(self._status(res, "c1"), "waived")
         self.assertIn("paged-KV", self._reason(res, "c1"))
@@ -261,7 +411,8 @@ class CoverageGateTest(unittest.TestCase):
 
     def test_allow_partial_reports_gap_without_failing(self):
         res = self._run(self._cands(3), [self._verdict("c0")],
-                        require_coverage=False)
+                        require_coverage=False,
+                        require_phase_generalization=False)
         self.assertEqual(res["status"], "pass")
         self.assertEqual(res["coverage"]["not_validated"], 2)   # still reported
         self.assertIn("覆盖率缺口", uh.render_markdown(res))     # still loud
@@ -288,6 +439,28 @@ class CoverageGateTest(unittest.TestCase):
         self.assertEqual(res["coverage"]["validated"], 16)
         self.assertEqual(res["coverage"]["not_validated"], 24)
         self.assertEqual(res["coverage"]["deferred_author"], 2)
+
+    def test_topk_limits_coverage_to_execution_list_candidates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cpath = os.path.join(tmp, "c.json")
+            with open(cpath, "w") as fh:
+                json.dump(self._cands(3), fh)
+            topk_path = os.path.join(tmp, "topk.json")
+            with open(topk_path, "w") as fh:
+                json.dump({"execution_list": [{
+                    "exec_id": "e01", "candidate_ids": ["c0"]}]}, fh)
+            vdir = os.path.join(tmp, "verdicts")
+            os.makedirs(vdir)
+            with open(os.path.join(vdir, "c0.json"), "w") as fh:
+                json.dump(self._verdict("c0"), fh)
+            res = uh.validate(
+                cpath, vdir, 1.0, topk_path=topk_path,
+                require_phase_generalization=False)
+            self.assertEqual(res["status"], "pass")
+            self.assertEqual(res["coverage"]["in_scope"], 1)
+            self.assertEqual(res["coverage"]["not_validated"], 0)
+            self.assertEqual(res["coverage"]["deferred_rank_budget"], 2)
+            self.assertEqual(res["counts"]["deferred_rank_budget"], 2)
 
 
 if __name__ == "__main__":

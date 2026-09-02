@@ -15,7 +15,8 @@ deterministic harness owns format, row/duration facts, and coverage checks.
 
 Required:
 
-- `EVAL_DIR`, `MODEL_NAME`, `ROUND`
+- `EVAL_DIR`, `MODEL_NAME`, `ROUND` (number or a collision-free label such as
+  `fusion_capture`; do not coerce it to an integer)
 - `SEMANTIC_TABLE_JSON`: final Semantics 1.2
   `pattern_layer_kernel_table.json`
 - `STRUCTURAL_PATTERNS_JSON`
@@ -388,7 +389,7 @@ and 3.1 routing, so it must be evidence-backed (harness-enforced):
 - If a **server flag/env** engages the existing fused path with **no code**
   (e.g. `--enable-aiter-allreduce-fusion` gating the
   `forward_with_allreduce_fusion` seam), classify `existing_flag_or_env`
-  (A / ConfigSweep) and put the flag/env name in `live_call_seam`.
+  (A / KernelFusion apply-back) and put the flag/env name in `live_call_seam`.
 - If the fused kernel exists but is **not wired** into this model's forward and
   needs a code patch, classify `existing_api_needs_adapter`/`reference_path_port`
   and put the concrete wiring site in `live_call_seam`.
@@ -665,6 +666,34 @@ python3 "$SKILL_DIR/scripts/fusion_candidate_harness.py" \
   --priors-index "${LEARNED_INDEX:-$SKILL_DIR/knowledge/learned/INDEX.md}"
 ```
 
+### 🔴 枚举覆盖率闸门（inventory ∩ trace）— 与 KB 无关，换 workload 一样跑
+
+上面那个 harness 审的是**你已经提出来的候选**站不站得住。它看不见一个「装在 provider 里、
+trace 里确实有那对相邻算子、但你压根没想到」的核——那种核不在任何分母里，所以一次只枚举了
+12 个相关 API 的 run，和枚举全了的 run，长得一模一样。DSR1 2026-08-31 盲测就是这么漏掉
+`fused_flatten_fp8_group_quant` 的（每层都跑，值 +1.6%/+2.1% e2e，全程没有一个格子变红）。
+
+所以再跑一个闸门，它的分母是 **provider inventory ∩ trace 的相邻算子窗口**：
+
+```bash
+python3 "$SKILL_DIR/scripts/fusion_inventory_coverage.py" \
+  --inventory "$EVAL_DIR/profile/round_${ROUND}/fusion/available_fusion_kernels.json" \
+  --candidates "$EVAL_DIR/profile/round_${ROUND}/fusion/fusion_candidates.json" \
+  --table "$SEMANTIC_TABLE_JSON" \
+  --budget 8 \
+  --out-md "$EVAL_DIR/02b_INVENTORY_COVERAGE.md" \
+  --out-json "$EVAL_DIR/profile/round_${ROUND}/fusion/fusion_inventory_coverage.json"
+```
+
+- `--table` **必须给**。不给的话相关性退化成「trace 里有没有这类活儿」，几乎全放行且排不出序。
+- 排序 = **这个核能删掉的那部分**（它覆盖到的行，减去其中最贵的一行——那行是它删不掉的主计算）
+  × `pattern_layer_count`。「优先选层覆盖最广的缝」是**算出来的**，不是记住的。
+- 每个在范围内的核必须落到 `enumerated`（有候选引用它）或 `--dispose NAME=REASON`
+  （写明为什么不做）。闸门**从不要求你去融合它，只要求你回答**。
+- `--budget N` 按 **primary stage 分层**取前 N（不是全局前 N），否则最贵的那个 stage 会把别的
+  stage 的核全挤出可答复窗口。预算外的尾巴照样打印——**切口是你选的一个数字，不是一次隐形的意外**。
+- 不要用 `--allow-undispositioned` 把红色消掉，理由同 `--allow-partial-coverage`。
+
 **报告写根目录，中间产物留工作目录。** `--out-md` 是给人看的，和其他四个阶段的报告并排放
 在 `$EVAL_DIR` 根下（`01_SEMANTIC.md` … `05_FUSION_APPLYBACK.md`）；`--result-json` 是给
 下一阶段读的，留在 `profile/round_${ROUND}/fusion/`。写完刷新索引：
@@ -780,7 +809,8 @@ environment/API evidence, blockers, risks, and validation requirements.
           "kernel": "...",
           "parent_operator": "...",
           "duration_us": 0.0,
-          "evidence_level": "K|P|U"
+          "evidence_level": "K|P|U",
+          "shape": {"source": "...", "input_dims": [[]], "input_types": []}
         }
       ],
       "donor_row_ids": [],
@@ -845,6 +875,22 @@ environment/API evidence, blockers, risks, and validation requirements.
 Candidate IDs must be stable for unchanged
 `trace_sha256 + phase + pattern_id + member row_ids + family`.
 
+`members[].shape` is **grafted by the harness**, not authored by you: it joins each
+`row_id` back to the semantic table and copies `input_dims` / `input_types` verbatim.
+Do not invent it, do not derive it, and do not "clean it up" — if a member's shape
+looks wrong, the semantic capture is wrong and that is where to fix it.
+
+Why it is a hard field and not a nicety: Phase 3.0 builds **both** the microbench and
+the split reference from these dims, and there is exactly one other place a shape can
+come from — the run config. Multiplying config fields (`input_tokens` ×
+`kv_lora_rank`) yields something shaped plausibly and wrong: no batch axis, and for
+MLA no `qk_rope_head_dim` columns (512 instead of 512+64=576). The kernel then takes
+a degenerate path, so parity fails *and* the timing distorts, and that pair is
+indistinguishable from an honest "this fusion is not worth it". On DSR1 2026-08-31 it
+cost two fusions worth **+20.6%** and **+14.0%** e2e. A candidate whose members
+resolve no shape at all is now a hard error here, not a problem discovered three
+phases later.
+
 Do not rank candidates in `PHASE=generate_plans`. Ranking is `PHASE=rank_topk`.
 
 ## PHASE=rank_topk (Phase 2.2)
@@ -873,11 +919,11 @@ The ranker is deterministic and encodes these rules — do not hand-rank:
 - **实现难度 tier** — three levels by realization cost (authoritative), keyed by
   `implementation_class` (现成算子 follows: A/B=有, C=无):
   - `A` — **env var / flag only, no code** (`existing_flag_or_env`) →
-    ConfigSweep.
+    KernelFusion apply-back.
   - `B` — **integrate an existing kernel (code)**: an installed fused kernel
     wired in / adapted / re-configured to cover this chain
     (`existing_api_integrated`, `existing_api_needs_adapter`,
-    `reference_path_port`) → HeadKernel direct_light/code_patch. B is not
+    `reference_path_port`) → KernelFusion apply-back. B is not
     sub-shaded by adapter-vs-drop-in — either the kernel exists (B) or it does
     not (C).
   - `C` — **author a new kernel** (`new_helper_kernel`,
@@ -941,7 +987,7 @@ After the ranker passes, augment `fusion_topk.json`/the report narrative with,
 per top recipe: concrete implementation difficulty notes the taxonomy cannot
 capture (dtype/scale-layout/graph contract, dual-output `emit_bf16` needs, GDN
 chunk-state residency, ABI/language bridging), the validation path for 3.1
-(ConfigSweep flag name / API call seam / kernel_workflow author brief), and the
+(KernelFusion flag name / API call seam / kernel_workflow author brief), and the
 key risk that could make the roofline estimate optimistic.
 
 Do not weaken or bypass the ranker; its tier weights are a `--`-tunable policy,
@@ -949,7 +995,18 @@ not a per-model constant.
 
 ## Return JSON
 
-Return only:
+For `PHASE=rank_topk`, return the board path and copy the deterministic
+`execution_list` into StructuredOutput so the filesystem-less workflow can iterate
+the concrete candidate ids:
+
+```json
+{"status":"pass|partial|failed","round":"fusion_capture",
+ "fusion_topk_json":"<absolute path>","fusion_topk_md":"<absolute path>",
+ "execution_list":[{"exec_id":"e01","candidate_ids":["c0"]}],
+ "notes":"..."}
+```
+
+For `PHASE=generate_plans`, return only:
 
 ```json
 {
