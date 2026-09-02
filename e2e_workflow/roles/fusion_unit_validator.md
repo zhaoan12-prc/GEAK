@@ -73,9 +73,9 @@ python3 "$SKILL_DIR/scripts/fusion_unitside_harness.py" \
 python3 "$SKILL_DIR/scripts/report_index.py" --eval-dir "$EVAL_DIR"
 ```
 
-Report at the root (human), `fusion_unitside.json` in the working dir (it is Phase 3.1's
+Report at the root (human), `fusion_unitside.json` in the working dir (it is KernelFusion apply-back's
 input). Run this even when the gate FAILS — especially then. A failing 3.0 report at the
-root is how the coverage gap reaches Phase 3.1's denominator; a gate that fails and
+root is how the coverage gap reaches KernelFusion apply-back's denominator; a gate that fails and
 publishes nothing is indistinguishable from a phase that never ran.
 
 Return:
@@ -179,12 +179,12 @@ Read the candidate object for `CANDIDATE_ID` from `FUSION_CANDIDATES_JSON`:
        compile-time dispatch gate in the *caller* (`_use_aiter_gfx95`, a `dtype ==
        float8_e4m3fn` clause, or "no sglang call site on any arch"). Those say the
        framework does not ROUTE to the kernel; they say nothing about whether the kernel
-       RUNS. Phase 3.1 lands fusions with a sitecustomize overlay that REPLACES the seam
+       RUNS. KernelFusion apply-back lands fusions with a sitecustomize overlay that REPLACES the seam
        and bypasses the caller's dispatcher entirely, so a caller-side gate is not a
        blocker — it is the thing the overlay exists to route around.
        When you meet a caller-side gate: call the fused API **directly** with the captured
        shapes, set `engaged=true` if it executes, and report parity + speedup normally.
-       Record the gate under `dispatch_gate_note` (file:line + the condition) so 3.1 knows
+       Record the gate under `dispatch_gate_note` (file:line + the condition) so apply-back knows
        the overlay must supply the arg the gate would have. Only if the kernel itself
        refuses to execute on this arch (import error, unsupported-arch abort, or an
        internal guard) is it `blocked`, with the actual error text as the reason.
@@ -279,7 +279,7 @@ Read the candidate object for `CANDIDATE_ID` from `FUSION_CANDIDATES_JSON`:
 - Report parity honestly. A fused kernel that diverges is a `parity: "fail"` — that is a
   valid, useful result (it stops a wrong fusion from being applied back), not something
   to hide.
-- Do not touch the serving stack or measure e2e — that is Phase 3.1 (apply-back). This
+- Do not touch the serving stack or measure e2e — that is KernelFusion apply-back. This
   role is isolated-only.
 
 ## Return (StructuredOutput)

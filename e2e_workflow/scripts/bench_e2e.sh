@@ -508,6 +508,20 @@ PY
     [ -n "${TPOT_MS:-}" ] && echo ">>> steady-state sizing: derived TPOT_MS=${TPOT_MS}ms from timed bench (vllm window auto-scale)"
   fi
   # ---- workload-aware steady-state window sizing (this is the ONLY sizing; adaptive re-capture is off) ----
+  # KernelFusion has a different evidence goal from the native Top-N profiler:
+  # it needs Python/module spans and one representative forward per sglang stage,
+  # not a long statistical sample.  Its caller sets GEAK_FUSION_TRACE=1 and
+  # PROFILE_NUM_STEPS=1. Do not inflate that stack-heavy sglang trace back to
+  # 40/64 steps. Other backends retain their existing adapter behavior.
+  _GEAK_FUSION_CAPTURE=0
+  case " ${EXTRA_ENV:-} " in
+    *" GEAK_FUSION_TRACE=1 "*) _GEAK_FUSION_CAPTURE=1 ;;
+  esac
+  [ "${GEAK_FUSION_TRACE:-0}" = "1" ] && _GEAK_FUSION_CAPTURE=1
+  if [ "$_GEAK_FUSION_CAPTURE" = "1" ] && [ "$BACKEND" = "sglang" ]; then
+    PROFILE_NUM_STEPS=1
+    echo ">>> Fusion semantic capture: preserving PROFILE_NUM_STEPS=${PROFILE_NUM_STEPS} (steady-state auto-sizing disabled)"
+  else
   # Reaching batch≈CONC = clear the prefill ramp, then sample steady decode:
   #   RAMP   = ceil(CONC*ISL / chunk)     forward passes to prefill all CONC in-flight requests
   #   STEADY = max(30, 5*ceil(OSL/CONC))  decode steps for a stable, representative sample
@@ -546,6 +560,7 @@ PY
       echo ">>> steady-state sizing: PROFILE_WINDOW_SEC ${PROFILE_WINDOW_SEC}->${_WSEC}s (TPOT=${TPOT_MS}ms x ${_TARGET_STEPS} steps x1.5, clamped [${PROFILE_WINDOW_SEC:-40},${_WMAX}]s)"
       PROFILE_WINDOW_SEC=$_WSEC
     fi
+  fi
   fi
   export PROFILE_NUM_STEPS PROFILE_NUM_PROMPTS PROFILE_WINDOW_SEC
   if declare -F adapter_profile_window >/dev/null; then

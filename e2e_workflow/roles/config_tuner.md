@@ -100,6 +100,14 @@ Return JSON:
   "accepted_env": "<final kept extra env KEY=VAL ...>",
   "best_throughput_tok_s": 0.0,
   "throughput_speedup_vs_baseline": 1.0,
+  "fusion_engagement_pass": true,
+  "disengaged_fusions": [],
   "summary": "what worked, what didn't, what to re-profile against"
 }
 ```
+
+When `REQUIRED_FUSION_ENGAGEMENT` is non-empty, `fusion_engagement_pass` is
+mandatory and may be `true` only when every accepted fusion was observed on the
+final kept configuration. Return any missing/bypassed fusion identifiers in
+`disengaged_fusions`. `accepted_flags` and `accepted_env` are the complete final
+strings, including the incoming `CURRENT_FLAGS` and `CURRENT_ENV`, not deltas.

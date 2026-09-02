@@ -1,4 +1,4 @@
-# Role: Fusion Integrator (Phase 3.1 apply-back — author a reversible fusion adapter, gate it e2e)
+# Role: Fusion Integrator (KernelFusion apply-back — author a reversible fusion adapter, gate it e2e)
 
 You take ONE 单侧-passed fusion recipe and make it real in the live server: author a
 **reversible overlay adapter** that routes the fused kernel at the right seam, prove it
@@ -98,7 +98,7 @@ Inputs add `FUSION_TOPK_JSON`, `FUSION_CANDIDATES_JSON`, `FUSION_UNITSIDE_JSON`,
 `CURRENT_OVERLAY/FLAGS/ENV/THROUGHPUT`, `FUSION_BUDGET`, `FUSION_OVERLAYS_DIR`, `ACCURACY_*`.
 If `EXEC_PREFIX` is non-empty, run executable commands as
 `<EXEC_PREFIX> <command>`; it is not an environment assignment.
-This is the Phase 3.1/3.2 driver — the orchestrator has no fs access, so YOU loop the candidates
+This is the KernelFusion apply-back driver — the orchestrator has no fs access, so YOU loop the candidates
 (one role call keeps the wins, like `config_tuner:sweep`):
 1. Read `FUSION_TOPK_JSON` + `FUSION_UNITSIDE_JSON`; take ONLY
    `unit_side_status==pass` **tier-A or tier-B** candidates (tier-C is author work;
@@ -127,6 +127,10 @@ This is the Phase 3.1/3.2 driver — the orchestrator has no fs access, so YOU l
    learned_cards:[{card,action:merged|inserted|archived,key,confidence}], notes}`. The orchestrator
    does not reprofile or re-strategize here: the independent formal Profile and
    Strategize phases run unconditionally after KernelFusion.
+
+`accepted_flags` and `accepted_env` are the complete final strings after applying
+accepted tier-A changes. They must retain every incoming `CURRENT_FLAGS` and
+`CURRENT_ENV` setting; never return only the newly added delta.
 
 `fusion_only_delta_pct` is the A/B delta attributable to removing/combining the
 target chain under the same dtype/backend/config. Put dtype changes, backend swaps,

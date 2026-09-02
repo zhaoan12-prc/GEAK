@@ -582,6 +582,7 @@ const FLYDSL_GATE_SCHEMA = obj({
 const SWEEP_SCHEMA = obj({
   trials: arrObj, accepted_flags: { type: 'string' }, accepted_env: { type: 'string' },
   best_throughput_tok_s: { type: 'number' }, throughput_speedup_vs_baseline: { type: 'number' },
+  fusion_engagement_pass: { type: 'boolean' }, disengaged_fusions: arrStr,
   summary: { type: 'string' },
 }, ['accepted_flags', 'best_throughput_tok_s']);
 
@@ -1197,15 +1198,6 @@ let curOverlay = ST.overlay || '';
 let curTput = ST.throughput || 0;
 const acceptedFusions = (ST.accepted_fusions || []).slice();
 let fusionDisposition = ST.fusion_disposition || null;
-const stageLadder = (ST.stage_ladder || []).slice();
-function stageMark(stage, tok, note) {
-  const prev = stageLadder.length ? stageLadder[stageLadder.length - 1].tok_s : 0;
-  const t = Number(tok) || 0;
-  const pct = (a, b) => (a > 0 && b > 0) ? Number((((b - a) / a) * 100).toFixed(3)) : null;
-  stageLadder.push({ stage, tok_s: t, delta_pct: pct(prev, t), cum_pct: pct(BASELINE_TPUT, t), note: note || '' });
-  log(`Stage ladder | ${stage}: ${t} tok/s (stage ${pct(prev, t)}%, cumulative ${pct(BASELINE_TPUT, t)}%)` +
-      `${note ? ' -- ' + note : ''}`);
-}
 
 if (want('setup')) {
   phase('Setup');
@@ -1226,8 +1218,6 @@ if (want('setup')) {
   curEnv = INIT_ENV || (setup.server_env || '');
   curTput = BASELINE_TPUT;
   log(`Setup done. EVAL_DIR=${EVAL_DIR}, baseline ${BASELINE_TPUT} tok/s (noise band ${NOISE_BAND}%)`);
-  stageMark('Baseline', BASELINE_TPUT,
-    'TRUE baseline recorded at Setup (initial accepted config, no GEAK fusion/kernel overlay)');
 
 // ===========================================================================
 // PHASE: KernelFusion. Discovery failures are explicitly non-fatal: the formal
@@ -1240,7 +1230,14 @@ if (!FAST_MODE && (FUSION_DISCOVERY_ON || fusionInputsComplete())) {
     log('KernelFusion: complete fusion prior/state supplied; skipping capture/discovery/shape completion.');
   } else if (FUSION_DISCOVERY_ON) {
     const fusionRound = 'fusion_capture';
-    const captureEnv = (curEnv ? curEnv + ' ' : '') + 'SGLANG_PROFILE_WITH_STACK=true';
+    // Fusion needs call/module hierarchy, not the long statistical window used by
+    // the native Top-N profiler. Keep this mode scoped to the dedicated sglang
+    // Fusion capture: one step per separately captured stage with Python stacks.
+    // bench_e2e.sh leaves normal Profile/reprofile sizing unchanged otherwise.
+    const captureEnv = BACKEND === 'sglang'
+      ? (curEnv ? curEnv + ' ' : '') +
+        'GEAK_FUSION_TRACE=1 PROFILE_NUM_STEPS=1 SGLANG_PROFILE_WITH_STACK=true'
+      : curEnv;
     fusionCapture = await safeAgent(
       roleAgent('fusion_trace_collector', 'capture',
         'Capture only the clean production graph trace and manifest for fusion discovery; do not build Top-N.', {
@@ -1359,10 +1356,11 @@ if (!FAST_MODE && (FUSION_DISCOVERY_ON || fusionInputsComplete())) {
 
   // Apply-back is best-effort. A discovery/validation failure leaves the inputs
   // empty and simply falls through to the unconditional formal Profile.
+  let fapply = null;
   if (FUSION_INPUTS.FUSION_TOPK_JSON && FUSION_INPUTS.FUSION_UNITSIDE_JSON) {
   const FUSION_BUDGET = parseInt(A.fusion_budget != null ? A.fusion_budget : 6, 10);
   log(`KernelFusion apply-back: integrating tier-A/B fusions, budget ${FUSION_BUDGET}.`);
-  const fapply = await safeAgent(
+  fapply = await safeAgent(
     roleAgent('fusion_integrator', 'apply_back',
       'Apply back the 单侧-passed tier-A flags/env and tier-B kernel fusions. Read FUSION_TOPK_JSON + the FUSION_UNITSIDE_JSON ' +
       'gate; take ONLY unit_side_status==pass candidates, in Top-K order, maximal-first per each ' +
@@ -1451,6 +1449,7 @@ if (!FAST_MODE && (FUSION_DISCOVERY_ON || fusionInputsComplete())) {
     if (appliedN > 0) fusionStatus = 'applied';
     else if (!FUSION_INPUTS.FUSION_TOPK_JSON) fusionStatus = 'discovery_failed';
     else if (!FUSION_INPUTS.FUSION_UNITSIDE_JSON) fusionStatus = 'validation_failed';
+    else if (!fapply) fusionStatus = 'applyback_failed';
     const fusionDeltaPct = fusionEntryTput > 0
       ? Number((((curTput - fusionEntryTput) / fusionEntryTput) * 100).toFixed(3)) : 0;
     fusionDisposition = Object.assign({
@@ -1462,10 +1461,6 @@ if (!FAST_MODE && (FUSION_DISCOVERY_ON || fusionInputsComplete())) {
       delta_pct: fusionDeltaPct,
     });
   }
-  stageMark('KernelFusion', curTput,
-    `tier-A/B fusions applied ${(fusionDisposition && fusionDisposition.applied.length) || 0} / ` +
-    `blocked ${(fusionDisposition && fusionDisposition.blocked.length) || 0} / ` +
-    `deferred ${(fusionDisposition && fusionDisposition.deferred.length) || 0}`);
 }
 
   phase('Profile');
@@ -1495,7 +1490,7 @@ if (!FAST_MODE && (FUSION_DISCOVERY_ON || fusionInputsComplete())) {
       // Same field name as native strategize; value is the profiled stack (post-Fusion curTput).
       BASELINE_THROUGHPUT: curTput, WORKLOAD, BUDGET, HEAD_THRESHOLD_PCT,
       CONFIG_TUNE_ENABLED, SKILL_DIR: WORKFLOW_DIR,
-      ...TRACELENS_INPUTS, ...ANALYSIS_SKILL_INPUTS,
+      ...profileTraceLensInputs, ...ANALYSIS_SKILL_INPUTS,
     }),
     { phase: 'Strategize', label: 'architect:strategize', schema: STRATEGY_SCHEMA });
   kernelQueue = (strategy && strategy.kernel_candidates) ? strategy.kernel_candidates.slice() : [];
@@ -1581,11 +1576,6 @@ if (!FAST_MODE && (FUSION_DISCOVERY_ON || fusionInputsComplete())) {
   log(`Loaded carried state: EVAL_DIR=${EVAL_DIR}, baseline ${BASELINE_TPUT}, flags='${curFlags}', env='${curEnv}', ${headQueue.length} head + ${kernelQueue.length} kernel candidates.`);
 }
 
-if (!stageLadder.length && BASELINE_TPUT > 0) {
-  stageMark('Baseline', BASELINE_TPUT,
-    'TRUE baseline recorded at Setup (initial accepted config, no GEAK fusion/kernel overlay)');
-}
-
 // ===========================================================================
 // PHASE: Config sweep (Config Tuner)
 // ===========================================================================
@@ -1601,7 +1591,10 @@ if (want('config') && CONFIG_TUNE_ENABLED && strategy && (strategy.config_direct
       REQUIRED_FUSION_ENGAGEMENT: acceptedFusions, SKILL_DIR: WORKFLOW_DIR,
     }),
     { phase: 'ConfigSweep', label: 'config_tuner:sweep', schema: SWEEP_SCHEMA });
-  if (sweep && sweep.best_throughput_tok_s > curTput) {
+  const sweepHasWin = !!(sweep && sweep.best_throughput_tok_s > curTput);
+  const fusionEngagementOk = !acceptedFusions.length ||
+    !!(sweep && sweep.fusion_engagement_pass === true);
+  if (sweepHasWin && fusionEngagementOk) {
     curFlags = sweep.accepted_flags || curFlags;
     curEnv = sweep.accepted_env || curEnv;
     curTput = sweep.best_throughput_tok_s;
@@ -1628,9 +1621,12 @@ if (want('config') && CONFIG_TUNE_ENABLED && strategy && (strategy.config_direct
     // re-strategize may have (re)routed flydsl -> provision it (idempotent; no-op if already done).
     await ensureFlydslGate();
   } else {
-    log(`Config sweep found no win above the noise band.`);
+    const disengaged = sweep && Array.isArray(sweep.disengaged_fusions)
+      ? sweep.disengaged_fusions.join(', ') : '';
+    log(sweepHasWin && !fusionEngagementOk
+      ? `Config sweep rejected: accepted Fusion engagement was not proven${disengaged ? ` (${disengaged})` : ''}.`
+      : `Config sweep found no win above the noise band.`);
   }
-  stageMark('ConfigSweep', curTput, 'flags/env/backends');
 }
 
 // ---------------------------------------------------------------------------
@@ -2544,9 +2540,6 @@ if (want('head') && headQueue.length && HEAD_BUDGET > 0) {
       flaggedHeads.map(f => `${f.short_name} [${(f.pct_gpu_time || 0).toFixed(1)}% GPU, ${f.gate}${f.harness_error ? '/harness' : ''}]`).join('; ') +
       `. These carry the most headroom — see the report's FLAGGED section.`);
   }
-  stageMark('HeadKernel', curTput,
-    `${acceptedHeads.length} head op(s) accepted, ${flaggedHeads.length} flagged` +
-    `${acceptedFusions.length ? ' (searched on the FUSED, reprofiled baseline)' : ''}`);
 }
 
 // ===========================================================================
@@ -2738,11 +2731,6 @@ while (want('kernel') && !TIME_DEADLINE_HIT && dispatched < BUDGET && (dispatche
   history.milestones.push({ milestone, accepted: acceptedKernels.length, throughput: curTput, improved: milestoneImproved });
   log(`Milestone ${milestone} done. throughput=${curTput} tok/s (${(curTput / BASELINE_TPUT).toFixed(3)}x), noImprove=${noImprove}`);
 }
-if (milestone > 0) {
-  stageMark('Milestone', curTput,
-    `${milestone} milestone(s), ${acceptedKernels.length} editable kernel(s) accepted, ${dispatched}/${BUDGET} budget used`);
-}
-
 // ===========================================================================
 // PHASE: Finalize + Report + Validate  (gated)
 // ===========================================================================
@@ -2866,23 +2854,12 @@ if (want('final')) {
     }),
     { phase: 'Finalize', label: 'e2e_integrator:finalize', schema: FINALIZE_SCHEMA });
   finalTput = (finalize && finalize.final_throughput_tok_s) || curTput;
-  // The Finalize gate (Fix C pending-win banking) and the bundle assembly can BOTH move the number
-  // after the Milestone row, so close the ladder here rather than leaving a stale last row.
-  {
-    const lastLadder = stageLadder.length ? stageLadder[stageLadder.length - 1].tok_s : 0;
-    if (finalTput > 0 && Math.abs(finalTput - lastLadder) > 1e-6) {
-      stageMark('Finalize', finalTput, 'final assembled bundle (incl. any pending win banked by the finalize gate)');
-    }
-  }
-
   phase('Report');
   report = await safeAgent(
     roleAgent('system_architect', 'report', 'Write architect_report.md AND the full final_report.md in English (with the Phases tree + artifacts tree modules).', {
       EVAL_DIR, HISTORY: history, BASELINE_THROUGHPUT: BASELINE_TPUT, FINAL_THROUGHPUT: finalTput,
       ACCEPTED_CONFIG: { flags: curFlags, env: curEnv }, ACCEPTED_KERNELS: allAccepted,
-      // Fusion attribution: STAGE_LADDER is the DECOMPOSITION of the headline (never addends);
-      // FUSION_DISPOSITION carries blocked/deferred so a 0-accepted fusion track is still reported.
-      STAGE_LADDER: stageLadder, ACCEPTED_FUSIONS: acceptedFusions, FUSION_DISPOSITION: fusionDisposition,
+      ACCEPTED_FUSIONS: acceptedFusions, FUSION_DISPOSITION: fusionDisposition,
       ACCEPTED_HEADS: acceptedHeads, FLAGGED_HEADS: flaggedHeads, MILESTONES: milestone, BUDGET_USED: dispatched, BUDGET, MIN_KERNEL_TASKS,
       PROFILE_TOPN: profile ? profile.profile_topN_json : '', WORKLOAD, MODEL_NAME, SKILL_DIR: WORKFLOW_DIR,
       ...ANALYSIS_SKILL_INPUTS,
@@ -2926,9 +2903,8 @@ const carryState = {
   noise_band_pct: NOISE_BAND, flags: curFlags, env: curEnv, overlay: curOverlay, throughput: curTput,
   profile_topn_json: profile ? profile.profile_topN_json : '',
   config_directions: (strategy && strategy.config_directions) || [],
-  accepted_fusions: acceptedFusions,       // Phase 3.1/3.2 fusions banked into curOverlay
+  accepted_fusions: acceptedFusions,       // KernelFusion wins banked into curOverlay
   fusion_disposition: fusionDisposition,   // blocked/deferred/coverage — PHASE=report needs these
-  stage_ladder: stageLadder,               // per-phase attribution rows (decomposition, NEVER addends)
   semantics_mapping: semantics || { status: 'unavailable' },
   headQueue, kernelQueue, accepted_heads: acceptedHeads, flagged_heads: flaggedHeads, accepted_kernels: acceptedKernels,
   // Carry pending (verified-isolated, A/B-incomplete) wins WITH their inputs so a

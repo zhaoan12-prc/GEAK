@@ -12,7 +12,7 @@ under fixed, ordered names, and everything else stays where it was written:
     <EVAL_DIR>/02_FUSION_CANDIDATES.md    <- Phase 2.1  fusion_candidate_harness.py
     <EVAL_DIR>/03_FUSION_TOPK.md          <- Phase 2.2  fusion_topk_harness.py
     <EVAL_DIR>/04_FUSION_UNITSIDE.md      <- Phase 3.0  fusion_unitside_harness.py
-    <EVAL_DIR>/05_FUSION_APPLYBACK.md     <- Phase 3.1  fusion_applyback_harness.py
+    <EVAL_DIR>/05_FUSION_APPLYBACK.md     <- Apply-back fusion_applyback_harness.py
 
 The index is generated from what is actually on disk, never from what was supposed to
 run. A phase whose report is missing is listed as missing rather than omitted -- an
@@ -45,7 +45,7 @@ REPORTS = [
      ["fusion_topk.json"], "topk"),
     ("04_FUSION_UNITSIDE.md", "Phase 3.0 · 单侧 gate",
      ["fusion_unitside.json"], "unitside"),
-    ("05_FUSION_APPLYBACK.md", "Phase 3.1 · apply-back 最终结果",
+    ("05_FUSION_APPLYBACK.md", "Apply-back · 融合最终结果",
      ["fusion_applyback.json"], "applyback"),
 ]
 

@@ -444,7 +444,7 @@ path and its constraints.
 - **现成算子=`yes` is SOURCE-existence, not a guarantee of value.** Two things are
   verified DOWNSTREAM, not here: (a) whether the kernel is actually **prebuilt** in the
   image — a source-present-but-not-built variant (e.g. DSR1 MoE `preshuffle_off per_1x128`)
-  crashes at integration and must be routed around (Phase 3.1 `fusion_integrator`); and
+  crashes at integration and must be routed around (KernelFusion apply-back via `fusion_integrator`); and
   (b) whether fusing is actually **faster** than the split path — a fused kernel can be
   slower (e.g. a Triton act+quant losing to split CK/HIP), which the Phase 3.0 单侧 gate
   rejects. "有现成算子 ≠ 融了就快 ≠ 这镜像能直接接"; do not over-promise on existence alone.
@@ -968,7 +968,7 @@ The ranker now emits, alongside the ranked table:
   denominator on it reads as "this is the whole surface", and on DSR1
   2026-08-26 it was 12 rows drawn from 42 candidates.
 - `execution_list` — one `exec_id` per ranked row, carrying the concrete
-  `candidate_ids` it stands for. **Phase 3.0 and Phase 3.1 are accounted
+  `candidate_ids` it stands for. **UnitSide and KernelFusion apply-back are accounted
   against this list**: every entry must end `applied`, `blocked`, or
   `deferred_with_reason`. Not being mentioned is a coverage hole, not a skip.
 - `exclusive_groups` — overlap is reported as a pairwise CONFLICT GRAPH, not as
@@ -1023,4 +1023,3 @@ For `PHASE=generate_plans`, return only:
   "notes": "evidence and degradation summary"
 }
 ```
-

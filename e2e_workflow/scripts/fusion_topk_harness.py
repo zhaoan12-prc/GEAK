@@ -616,7 +616,7 @@ def _render_coverage(result):
 def _render_execution_list(result):
     """The board as an assignment list, not a suggestion list.
 
-    Phase 3.0 (单侧) and Phase 3.1 (apply-back) are accounted against these
+    UnitSide and KernelFusion apply-back are accounted against these
     entries: every one must end `applied`, `blocked`, or `deferred` WITH a
     reason. Silence is not a disposition.
     """

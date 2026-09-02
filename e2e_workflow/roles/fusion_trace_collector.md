@@ -14,8 +14,12 @@ When `EXEC_PREFIX` is non-empty, run executable commands as
 1. Reuse `TRACELENS_TRACE_FILE` only when it exists and contains a usable
    top-level serving trace. An analysis Markdown file is not a raw trace.
 2. Otherwise run the existing `EVAL_DIR/bench_e2e.sh` serving capture with
-   `PROFILE=1`, preserving the supplied overlay, flags, env, and
-   `SGLANG_PROFILE_WITH_STACK=true`.
+   `PROFILE=1`, preserving the supplied overlay, flags, env, and the supplied
+   Fusion-only profiler controls. For sglang, `GEAK_FUSION_TRACE=1` keeps the
+   capture at one step per separately captured stage instead of expanding it to
+   the native profiler's 40/64-step statistical window, while
+   `SGLANG_PROFILE_WITH_STACK=true` requests CPU/Python stack evidence. Other
+   backends retain their existing adapter behavior.
 3. Select the clean steady production graph trace for benefit/timing evidence.
    Warmup/capture and metadata-only eager traces may supplement semantics, but
    must not replace production timing.

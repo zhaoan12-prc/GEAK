@@ -22,9 +22,10 @@ straight to the kernel layer (single-kernel pass-through).
 ## Why a system layer at all (the doctrine)
 e2e throughput is **Amdahl-dominated**: only a speedup on a kernel that is a large share of GPU time,
 times how often that path runs, moves the headline number. A 5× on a 2%-of-time kernel is invisible.
-So the system layer always reasons in `pct_gpu_time × achievable_speedup`, tunes the cheap
-landscape-reshaping config knobs FIRST, and gates every kernel change on a measured end-to-end
-throughput delta that exceeds the noise band. See `knowledge/e2e_optimization.md`.
+So the system layer first applies validated KernelFusion opportunities, then reasons over the
+post-fusion profile in `pct_gpu_time × achievable_speedup`, tunes the remaining cheap config knobs,
+and gates every kernel change on a measured end-to-end throughput delta that exceeds the noise band.
+See `knowledge/e2e_optimization.md`.
 
 ## Roles → workflow mapping
 - **e2e Director** = setup (isolated eval dir + TRUE baseline throughput) + final independent
@@ -34,7 +35,7 @@ throughput delta that exceeds the noise band. See `knowledge/e2e_optimization.md
   (`knowledge/backend_playbook.md`, grown after every run).
 - **Profiler** = warm-server trace (torch + optional rocprofv3) → ONE standardized Top-N artifact via
   `scripts/parse_profile.py` (the "spec" contract).
-- **Config Tuner** = Tier-0 flag/env/backend sweep, runs FIRST (default ON), no source rewrite.
+- **Config Tuner** = Tier-0 flag/env/backend sweep on the post-fusion stack (default ON), no source rewrite.
 - **Kernel Extractor** = capture real shapes + a reference I/O oracle → an IMMUTABLE standalone
   unittest task dir the kernel layer consumes (anti-cheating).
 - **e2e Integrator/Validator** = reversible overlay reintegration + e2e throughput gate + final bundle.
@@ -42,8 +43,8 @@ throughput delta that exceeds the noise band. See `knowledge/e2e_optimization.md
 
 ## Pipeline
 ```
-Setup(preflight env-check + baseline throughput) → Baseline Profile(Top-N) → Strategize(Amdahl routing) →
-ConfigSweep(flags/env/backends, FIRST) → Re-profile →
+Setup(preflight env-check + original baseline throughput) → KernelFusion(capture → discover → validate → apply-back) →
+Profile(post-fusion Top-N) → Strategize(Amdahl routing) → ConfigSweep(remaining flags/env/backends) → Re-profile →
 LOOP milestone[ plan → per kernel: Extract → recursive kernel_workflow.js → Overlay+e2e gate → ] → Re-profile → grow playbook →
 Finalize(overlay+patch+launch bundle) → Architect Report → Director Validation
 ```
@@ -51,8 +52,9 @@ Setup runs a **preflight** (see `knowledge/preflight.md`) — a judgment-guided 
 rigid script): it confirms the chosen `backend` stack, the model, GPU visibility; detects gfx, trace
 sources, available op backends, and the model's arch class; degrades gracefully and writes
 `env_report.{md,json}` that every later phase routes on.
-Every accepted change compounds into the carried-forward overlay + config; throughput is always
-measured warm, repeated, median, vs the TRUE baseline.
+Every accepted change compounds into the carried-forward overlay + config. Candidate gates compare
+against the current accepted stack; the final official speedup compares the final stack against the
+original Setup baseline.
 
 ## Pluggable serving backend
 The serving stack is NOT baked in. `args.backend` (sglang|vllm, default sglang) selects
@@ -212,7 +214,7 @@ with the machine artifacts left in their working directories:
 | Phase 2.1 | `02_FUSION_CANDIDATES.md` | `scripts/fusion_candidate_harness.py` |
 | Phase 2.2 | `03_FUSION_TOPK.md` | `scripts/fusion_topk_harness.py` |
 | Phase 3.0 | `04_FUSION_UNITSIDE.md` | `scripts/fusion_unitside_harness.py` |
-| Phase 3.1 | `05_FUSION_APPLYBACK.md` | `scripts/fusion_applyback_harness.py` — the final fusion result |
+| Apply-back | `05_FUSION_APPLYBACK.md` | `scripts/fusion_applyback_harness.py` — the final fusion result |
 
 Two rules make the set readable. **A failing phase still publishes**: a gate that fails
 and writes nothing is indistinguishable from a phase that never ran, and the failure

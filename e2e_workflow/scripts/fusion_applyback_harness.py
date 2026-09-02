@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 3.1: the apply-back coverage gate for kernel fusion.
+"""Apply-back coverage gate for the KernelFusion stage.
 
 Deterministic validator of what the `fusion_integrator` role actually did with the
 Phase 2.2 Top-K board. It runs no server and measures nothing of its own; it answers
@@ -396,7 +396,7 @@ _DISP_LABEL = {
 
 
 def render_markdown(result):
-    lines = ["# Kernel Fusion Apply-back 结果 (Phase 3.1)", ""]
+    lines = ["# KernelFusion Apply-back 结果", ""]
     lines.append(
         "融合的**最终结果报告**：Phase 2.2 执行清单上的每一条，在这里都必须有一个明确去向。"
         "「没提到」不是「跳过」，是报告的漏洞——它会被标成 🔴 无交代并让本 gate fail。")

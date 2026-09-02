@@ -201,14 +201,6 @@ TRUE baseline with the tight 2-block protocol and decide if the COMBINED result 
      show the same status.
    - If validation produced **no usable number** (server crashed / degenerate), do NOT rewrite — leave the
      finalize fallback in place and add one line stating validation produced no number.
-   - **Stage attribution ladder** (`final_report.md` §3a, if present): fill in / overwrite the final
-     `Validate — OFFICIAL` row with your same-session numbers, and **leave every earlier stage row
-     exactly as written**. Those rows are intra-run snapshots on the run's own measurement basis; do
-     NOT rescale, re-derive, or drop them to make them compound to your total. If they visibly do not
-     compound to your `+T%`, add ONE line saying so and that the Director value is official — that gap
-     is box drift between the intra-run snapshots and your same-session A/B, and hiding it by editing
-     the rows would destroy the only per-phase attribution the run has. Never sum the rows, and never
-     let an edit turn the ladder into addends of the headline.
    - Confirm consistency: after the edit, the report's headline throughput/speedup/TTFT/TPOT MUST equal
      `director_e2e_validation.json`.
 
