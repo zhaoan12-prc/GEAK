@@ -10,10 +10,26 @@
 #   - profiling: vllm >=0.19 moved torch-profiler config from the VLLM_TORCH_PROFILER_DIR env var to the
 #     `--profiler-config` CLI flag. adapter_launch probes vllm.config.ProfilerConfig to pick the path:
 #     present -> --profiler-config; absent (<0.19) -> the env var (passing the flag would abort argparse).
+#   - fusion capture: GEAK_FUSION_TRACE=1 (via EXTRA_ENV) switches the profiler to the KernelFusion
+#     evidence mode: with_stack ON (module hierarchy for layer boundaries) and a short iteration-bounded
+#     window (GEAK_FUSION_MAX_ITERS). Ordinary Profile rounds keep with_stack OFF.
+#   - phase annotations are free: gpu_worker wraps every execute_model in annotate_profile()
+#     unconditionally, emitting `execute_context_<nreq>(<ntok>)_generation_<nreq>(<ntok>)` into
+#     gpu_user_annotation -- the dialect parse_profile._seg reads (measured on v0.27.1/gfx942).
 # The Director's preflight step should smoke-test these two commands on the target image and record
 # any needed EXTRA_SERVER_ARGS BEFORE the run relies on them. This adapter targets the current CLI.
 
 adapter_default_port() { echo 8000; }
+
+# ---------------------------------------------------------------------------
+# KernelFusion capture mode.  Set by the orchestrator via EXTRA_ENV
+# (GEAK_FUSION_TRACE=1).  Fusion has a DIFFERENT evidence goal from the native Top-N
+# profiler: it needs Python/module spans and a short window that contains BOTH serving
+# phases, not a long statistical sample.  See bench_e2e.sh's sizing block.
+_geak_fusion_capture() {
+  case " ${EXTRA_ENV:-} " in *" GEAK_FUSION_TRACE=1 "*) return 0 ;; esac
+  [ "${GEAK_FUSION_TRACE:-0}" = "1" ]
+}
 
 adapter_launch() {
   # Pin GPU_ARCHS so aiter's JIT skips rocm_agent_enumerator/_detect_native (see sglang.sh / gpu_lock.sh).
@@ -24,6 +40,18 @@ adapter_launch() {
   local -a _prof=()
   local -a _prof_env=()
   if [ -n "${PROFILE_DIR:-}" ]; then
+    # with_stack: off for ordinary Profile rounds (stacks are the biggest per-event cost), on for the
+    # KernelFusion capture (semantics needs the nn.Module hierarchy for layer boundaries).
+    # Override with VLLM_PROFILE_WITH_STACK=true|false.
+    local _stack="${VLLM_PROFILE_WITH_STACK:-false}"
+    local _max_iters="${PROFILE_MAX_ITERS:-64}"
+    if _geak_fusion_capture; then
+      _stack="${VLLM_PROFILE_WITH_STACK:-true}"
+      # vllm has no profile_by_stage, so ONE window must hold both phases. A saturated server
+      # interleaves them, but one iteration (the sglang setting) would capture a single phase.
+      # If Phase 1 reports a single phase, raise this.
+      _max_iters="${GEAK_FUSION_MAX_ITERS:-16}"
+    fi
     local _prof_fields
     _prof_fields="$(python3 - <<'PY' 2>/dev/null
 names=set()
@@ -44,10 +72,14 @@ PY
     _has() { case " $_prof_fields " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
     if [ -n "$_prof_fields" ]; then
       local _json="{\"profiler\":\"torch\",\"torch_profiler_dir\":\"$PROFILE_DIR\",\"torch_profiler_record_shapes\":true"
-      # stacks default on and are the biggest per-event cost; off keeps the event buffer small.
-      _has torch_profiler_with_stack && _json="$_json,\"torch_profiler_with_stack\":false"
+      _has torch_profiler_with_stack && _json="$_json,\"torch_profiler_with_stack\":$_stack"
       # 0.26+: max_iterations self-stops the profiler after N worker steps, bounding the buffer.
-      _has max_iterations   && _json="$_json,\"max_iterations\":${PROFILE_MAX_ITERS:-64}"
+      if _has max_iterations; then
+        _json="$_json,\"max_iterations\":$_max_iters"
+      elif _geak_fusion_capture; then
+        echo "!!! fusion capture: this build's ProfilerConfig has no max_iterations; the window" >&2
+        echo "!!! falls back to GEAK_FUSION_WINDOW_SEC timing (trace size is NOT iteration-bounded)" >&2
+      fi
       _has delay_iterations && _json="$_json,\"delay_iterations\":${PROFILE_DELAY_ITERS:-0}"
       _has ignore_frontend  && _json="$_json,\"ignore_frontend\":true"
       # 0.26+: per-iteration prefill/decode annotation the parser uses for the phase split. Cheap.
@@ -59,7 +91,9 @@ PY
       _json="$_json}"
       _prof=(--profiler-config "$_json")
     else
-      _prof_env=(VLLM_TORCH_PROFILER_DIR="$PROFILE_DIR")   # <0.19: no flag; the time window is the only bound
+      # <0.19: no flag; the time window is the only bound.
+      _prof_env=(VLLM_TORCH_PROFILER_DIR="$PROFILE_DIR"
+                 VLLM_TORCH_PROFILER_WITH_STACK="$([ "$_stack" = true ] && echo 1 || echo 0)")
     fi
   fi
   # Launch through $SERVER_LAUNCH_PREFIX (adapter contract): it puts the server in its
@@ -120,7 +154,11 @@ adapter_profile_window() {
     return 1
   fi
   # 0.26+ self-stops at max_iterations, so this sleep is a safety cap; on <0.26 it is the only bound.
-  sleep "${PROFILE_WINDOW_SEC:-20}"
+  if _geak_fusion_capture; then
+    sleep "${GEAK_FUSION_WINDOW_SEC:-20}"
+  else
+    sleep "${PROFILE_WINDOW_SEC:-20}"
+  fi
   # /stop_profile flushes the trace; the server waits for the flush, so give curl a generous timeout.
   curl -s --max-time "${PROFILE_WINDOW_TIMEOUT:-180}" -X POST "${BASE_URL}/stop_profile" \
     >/dev/null 2>&1 || echo "!!! /stop_profile request errored (checking for a trace anyway)" >&2
