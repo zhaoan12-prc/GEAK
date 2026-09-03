@@ -17,10 +17,61 @@
 #     fall back to the VLLM_TORCH_PROFILER_DIR env (old builds). This probe is device-independent (unlike
 #     `vllm serve --help[=all]`, which initializes config/device and CRASHES on a driver-less host -> empty
 #     output -> false-negative -> profiling silently lost) and far cheaper (no full server spin-up).
+#   - fusion capture: GEAK_FUSION_TRACE=1 (via EXTRA_ENV) switches the profiler to the KernelFusion
+#     evidence mode: with_stack ON (module hierarchy for layer boundaries) and an iteration-bounded
+#     window via ProfilerConfig.max_iterations. Ordinary Profile rounds keep with_stack OFF.
+#   - PHASE ANNOTATIONS ARE FREE, and this file used to claim otherwise. vllm's gpu_worker wraps every
+#     execute_model in annotate_profile() UNCONDITIONALLY; its default branch emits
+#     `execute_context_<nreq>(<ntok>)_generation_<nreq>(<ntok>)` as a record_function, which lands in
+#     gpu_user_annotation and is exactly the dialect parse_profile._seg reads. Measured on v0.27.1 /
+#     gfx942 / conc 8: 774 spans in a 25 s window -> a full serving block (steady=true,
+#     decode_batch_captured == CONC) and a per-kernel prefill/decode/both phase. Nothing to enable.
+#     `detailed_trace_annotation` is a RICHER opt-in (adds per-phase sq/sk/sqsq/sqsk roofline terms)
+#     that v0.27.1 does accept -- but it is still not passed by default: the plain annotation already
+#     gives the split, and every extra key is one more thing a strict schema can reject.
 # The Director's preflight step should smoke-test these two commands on the target image and record
 # any needed EXTRA_SERVER_ARGS BEFORE the run relies on them. This adapter targets the current CLI.
 
 adapter_default_port() { echo 8000; }
+
+# ---------------------------------------------------------------------------
+# KernelFusion capture mode.  Set by the orchestrator via EXTRA_ENV
+# (GEAK_FUSION_TRACE=1).  Fusion has a DIFFERENT evidence goal from the native Top-N
+# profiler: it needs Python/module spans and a short window that contains BOTH serving
+# phases, not a long statistical sample.  See bench_e2e.sh's sizing block.
+_geak_fusion_capture() {
+  case " ${EXTRA_ENV:-} " in *" GEAK_FUSION_TRACE=1 "*) return 0 ;; esac
+  [ "${GEAK_FUSION_TRACE:-0}" = "1" ]
+}
+
+# Which ProfilerConfig keys does THIS build accept?
+#
+# vllm's ProfilerConfig is a strict (pydantic extra=forbid) schema: passing ONE key it does
+# not know ABORTS the server at startup.  The old all-or-nothing probe (`import
+# ProfilerConfig` -> assume the whole current key set) is why `detailed_trace_annotation`
+# could kill a run.  Introspect the real field names instead and emit only what is present,
+# so a key that appears/disappears across releases degrades to "not passed" rather than to a
+# dead server.  Device-independent (no config/device init), so it is also safe on a
+# driver-less host, unlike `vllm serve --help`.
+_vllm_profiler_fields() {
+  python3 - <<'PY' 2>/dev/null
+try:
+    from vllm.config import ProfilerConfig
+except Exception:
+    raise SystemExit(1)
+names = []
+try:
+    import dataclasses
+    names = [f.name for f in dataclasses.fields(ProfilerConfig)]
+except Exception:
+    pass
+if not names:
+    names = list(getattr(ProfilerConfig, "model_fields", {}) or {})
+print(" ".join(names))
+PY
+}
+
+_vllm_has_field() { case " $1 " in *" $2 "*) return 0 ;; esac; return 1; }
 
 adapter_launch() {
   # Pin GPU_ARCHS so aiter's JIT skips rocm_agent_enumerator/_detect_native (see sglang.sh / gpu_lock.sh).
@@ -35,15 +86,53 @@ adapter_launch() {
   local -a _prof=()
   local -a _prof_env=()
   if [ -n "${PROFILE_DIR:-}" ]; then
-    if python3 -c 'from vllm.config import ProfilerConfig' 2>/dev/null; then
-      # We deliberately DO NOT pass detailed_trace_annotation: current vllm's ProfilerConfig is a strict
-      # (pydantic extra=forbid) schema that ABORTS the server on that key. When a build DOES accept it, it
-      # emits the execute_context_*_generation_* step spans (gpu_user_annotation, torch record_function —
-      # they DO appear on ROCm) that parse_profile.py uses to split prefill/decode; without it the split
-      # falls back to the analytic est_calls / shape path. record_shapes stays on for Input Dims.
-      _prof=(--profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"$PROFILE_DIR\",\"torch_profiler_record_shapes\":true}")
+    # with_stack: vllm's ProfilerConfig DEFAULTS torch_profiler_with_stack to TRUE, the exact
+    # OPPOSITE of the sglang adapter's default. Left implicit, every ordinary Profile round
+    # records python_function spans for the whole window -> a trace an order of magnitude
+    # larger, whose ROCm flush can block the scheduler (the failure sglang.sh documents at
+    # length). So state it EXPLICITLY in both directions rather than inheriting a default:
+    #   normal profile  -> false  (kernel timeline + Input Dims is all parse_profile needs)
+    #   fusion capture  -> true   (semantics needs the nn.Module hierarchy for layer boundaries)
+    # Override with VLLM_PROFILE_WITH_STACK=true|false.
+    local _stack="${VLLM_PROFILE_WITH_STACK:-false}"
+    local _max_iters=""
+    if _geak_fusion_capture; then
+      _stack="${VLLM_PROFILE_WITH_STACK:-true}"
+      # Iteration-bounded window. NOTE this contradicts the older comment in this file that
+      # "vllm's /start_profile takes NO num_steps": it does not, but ProfilerConfig carries
+      # delay_iterations/max_iterations and WorkerProfiler.step() counts engine iterations,
+      # auto-stopping (and flushing) at the limit. That is the vllm analogue of sglang's
+      # PROFILE_NUM_STEPS, and it is what keeps a stack-heavy fusion trace bounded.
+      #
+      # It must still be big enough to contain BOTH phases. Unlike sglang there is no
+      # profile_by_stage, so prefill and decode are only separable because a saturated
+      # continuous-batching server interleaves them within one window -- one iteration (the
+      # sglang setting) would capture one phase and silently halve coverage. If Phase 1
+      # reports a single phase, raise this.
+      _max_iters="${GEAK_FUSION_MAX_ITERS:-16}"
+    fi
+    local _fields
+    if _fields="$(_vllm_profiler_fields)" && [ -n "$_fields" ]; then
+      # Build the JSON from the keys this build actually declares.
+      local _json="{\"profiler\":\"torch\",\"torch_profiler_dir\":\"$PROFILE_DIR\""
+      _vllm_has_field "$_fields" torch_profiler_record_shapes \
+        && _json="$_json,\"torch_profiler_record_shapes\":true"
+      _vllm_has_field "$_fields" torch_profiler_with_stack \
+        && _json="$_json,\"torch_profiler_with_stack\":$_stack"
+      if [ -n "$_max_iters" ] && _vllm_has_field "$_fields" max_iterations; then
+        _json="$_json,\"max_iterations\":$_max_iters"
+      elif [ -n "$_max_iters" ]; then
+        echo "!!! fusion capture: this build's ProfilerConfig has no max_iterations; the window" >&2
+        echo "!!! falls back to PROFILE_WINDOW_SEC timing (trace size is NOT iteration-bounded)" >&2
+      fi
+      _json="$_json}"
+      _prof=(--profiler-config "$_json")
     else
-      _prof_env=(VLLM_TORCH_PROFILER_DIR="$PROFILE_DIR")
+      # Old (<0.19) builds: the CLI flag does not exist and argparse would abort the launch,
+      # so configure through the (now deprecated, but honored there) env vars instead.
+      _prof_env=(VLLM_TORCH_PROFILER_DIR="$PROFILE_DIR"
+                 VLLM_TORCH_PROFILER_RECORD_SHAPES=1
+                 VLLM_TORCH_PROFILER_WITH_STACK="$([ "$_stack" = true ] && echo 1 || echo 0)")
     fi
   fi
   # Launch through $SERVER_LAUNCH_PREFIX (adapter contract): it puts the server in its
@@ -110,8 +199,14 @@ adapter_profile_window() {
     echo "!!! /start_profile request failed (vllm torch profiler not enabled at launch?)" >&2
     return 1
   fi
-  # profile a steady-state window of this duration (no num_steps knob on vllm)
-  sleep "${PROFILE_WINDOW_SEC:-40}"
+  # Window duration. With max_iterations set (fusion capture) the worker self-stops at the
+  # iteration limit and this sleep is only an upper bound -- keep it short so we are not
+  # idling long after the profiler already flushed.
+  if _geak_fusion_capture; then
+    sleep "${GEAK_FUSION_WINDOW_SEC:-20}"
+  else
+    sleep "${PROFILE_WINDOW_SEC:-40}"
+  fi
   # /stop_profile flushes the trace; the server waits for the flush, so give curl a generous timeout.
   curl -s --max-time "${PROFILE_WINDOW_TIMEOUT:-180}" -X POST "${BASE_URL}/stop_profile" \
     >/dev/null 2>&1 || echo "!!! /stop_profile request errored (checking for a trace anyway)" >&2

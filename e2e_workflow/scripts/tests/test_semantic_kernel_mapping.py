@@ -542,6 +542,45 @@ class PhaseCoverageTest(unittest.TestCase):
         self.assertFalse(coverage["decode_sequence_covered"])
         self.assertEqual(coverage["decode_evidence"], "no_decode_trace_analysed")
 
+    def test_unannotated_single_file_trace_names_the_missing_annotation(self):
+        """vllm without the phase-annotation hook: NOTHING is phase-tagged.
+
+        Pinned because the old wording for this case was `no_decode_trace_analysed`, which
+        reads as "we did not look at a decode trace" and sends you to re-capture -- when the
+        actual fault is that the trace carries no step spans at all, so prefill is equally
+        untagged. The remedy is arming the hook, not another capture.
+        """
+        coverage = mapping._phase_coverage(
+            instances=[{"phase": None}],
+            tables=[{"phase": None, "rows": [{"shape": {"source": "unresolved"}}]}],
+            trace_paths=["vllm-instance-rank-0.1234.pt.trace.json.gz"],
+            adopted_siblings=[], table_phases=None, require_phases=None)
+        self.assertEqual(coverage["trace_phase_tags"], [])
+        self.assertFalse(coverage["phase_annotation_present"])
+        self.assertEqual(coverage["decode_evidence"], "no_phase_annotation_in_trace")
+
+    def test_annotated_single_file_trace_blames_the_window_not_the_capture(self):
+        """Annotation worked, but this window held only prefill steps."""
+        coverage = mapping._phase_coverage(
+            instances=[{"phase": "extend"}],
+            tables=[{"phase": "prefill", "rows": [
+                {"shape": {"source": "kernel_exact"}}]}],
+            trace_paths=["vllm-instance-rank-0.1234.pt.trace.json.gz"],
+            adopted_siblings=[], table_phases=None, require_phases=None)
+        self.assertTrue(coverage["phase_annotation_present"])
+        self.assertEqual(coverage["decode_evidence"],
+                         "mixed_trace_no_decode_steps_in_window")
+
+    def test_split_file_capture_keeps_its_original_verdict(self):
+        """sglang's per-phase filenames are conclusive; that arm must not shift."""
+        coverage = mapping._phase_coverage(
+            instances=[{"phase": "extend"}],
+            tables=[{"phase": "prefill", "rows": [
+                {"shape": {"source": "kernel_exact"}}]}],
+            trace_paths=["a-TP-0-EXTEND.trace.json.gz"],
+            adopted_siblings=[], table_phases=None, require_phases=None)
+        self.assertEqual(coverage["decode_evidence"], "no_decode_trace_analysed")
+
     def test_sequence_and_shape_coverage_fail_independently(self):
         """A replay DECODE trace gives the sequence but no shapes."""
         coverage = mapping._phase_coverage(

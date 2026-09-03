@@ -508,19 +508,33 @@ PY
     [ -n "${TPOT_MS:-}" ] && echo ">>> steady-state sizing: derived TPOT_MS=${TPOT_MS}ms from timed bench (vllm window auto-scale)"
   fi
   # ---- workload-aware steady-state window sizing (this is the ONLY sizing; adaptive re-capture is off) ----
-  # KernelFusion has a different evidence goal from the native Top-N profiler:
-  # it needs Python/module spans and one representative forward per sglang stage,
-  # not a long statistical sample.  Its caller sets GEAK_FUSION_TRACE=1 and
-  # PROFILE_NUM_STEPS=1. Do not inflate that stack-heavy sglang trace back to
-  # 40/64 steps. Other backends retain their existing adapter behavior.
+  # KernelFusion has a different evidence goal from the native Top-N profiler: it needs
+  # Python/module spans and a SHORT window, not a long statistical sample.  Its caller sets
+  # GEAK_FUSION_TRACE=1.  The auto-sizing below would inflate that stack-heavy trace back to
+  # a 40/64-step (sglang) or 40-60s (vllm) window, so it is skipped for BOTH backends -- the
+  # window is owned by the adapter in fusion mode.
+  #
+  # This used to be gated on `BACKEND = sglang`, which meant a vllm fusion capture fell into
+  # the else-branch and got the full statistical window WITH stacks on: a multi-GB trace that
+  # may never flush.  The two backends express the same intent differently, so the sizing is
+  # per-backend but the SKIP is not:
+  #   sglang -> PROFILE_NUM_STEPS=1, one representative forward per separately captured stage
+  #             (profile_by_stage splits EXTEND/DECODE into their own traces).
+  #   vllm   -> ProfilerConfig.max_iterations (GEAK_FUSION_MAX_ITERS, see adapters/vllm.sh).
+  #             There is NO profile_by_stage, so one window must contain BOTH phases; the
+  #             adapter sizes it, and Phase 1's report is what tells you if it did not.
   _GEAK_FUSION_CAPTURE=0
   case " ${EXTRA_ENV:-} " in
     *" GEAK_FUSION_TRACE=1 "*) _GEAK_FUSION_CAPTURE=1 ;;
   esac
   [ "${GEAK_FUSION_TRACE:-0}" = "1" ] && _GEAK_FUSION_CAPTURE=1
-  if [ "$_GEAK_FUSION_CAPTURE" = "1" ] && [ "$BACKEND" = "sglang" ]; then
-    PROFILE_NUM_STEPS=1
-    echo ">>> Fusion semantic capture: preserving PROFILE_NUM_STEPS=${PROFILE_NUM_STEPS} (steady-state auto-sizing disabled)"
+  if [ "$_GEAK_FUSION_CAPTURE" = "1" ]; then
+    if [ "$BACKEND" = "sglang" ]; then
+      PROFILE_NUM_STEPS=1
+      echo ">>> Fusion semantic capture (sglang): PROFILE_NUM_STEPS=${PROFILE_NUM_STEPS}, one forward per stage (steady-state auto-sizing disabled)"
+    else
+      echo ">>> Fusion semantic capture (${BACKEND}): window owned by the adapter (steady-state auto-sizing disabled)"
+    fi
   else
   # Reaching batch≈CONC = clear the prefill ramp, then sample steady decode:
   #   RAMP   = ceil(CONC*ISL / chunk)     forward passes to prefill all CONC in-flight requests
@@ -564,9 +578,20 @@ PY
   fi
   export PROFILE_NUM_STEPS PROFILE_NUM_PROMPTS PROFILE_WINDOW_SEC
   if declare -F adapter_profile_window >/dev/null; then
+    # Report the window the ADAPTER will actually use. In fusion mode the sizing above is skipped,
+    # so printing PROFILE_NUM_STEPS/PROFILE_WINDOW_SEC there would name knobs nobody reads -- a log
+    # line that misstates the capture is how a mis-sized window survives review.
+    _win_desc="${PROFILE_NUM_STEPS} steps / ${PROFILE_WINDOW_SEC}s"
+    if [ "${_GEAK_FUSION_CAPTURE:-0}" = "1" ]; then
+      case "$BACKEND" in
+        sglang) _win_desc="fusion: ${PROFILE_NUM_STEPS} step(s) per stage" ;;
+        vllm)   _win_desc="fusion: max_iterations=${GEAK_FUSION_MAX_ITERS:-16} iters, <=${GEAK_FUSION_WINDOW_SEC:-20}s" ;;
+        *)      _win_desc="fusion: adapter-owned window" ;;
+      esac
+    fi
     echo ">>> Profiling from load start (warmup ${PROFILE_WARMUP_SEC}s) on a saturated load " \
          "(${PROFILE_NUM_PROMPTS} prompts, conc ${CONC}${PROFILE_REQUEST_RATE:+, rate ${PROFILE_REQUEST_RATE}/s}); " \
-         "SINGLE capture of ${PROFILE_NUM_STEPS} steps / ${PROFILE_WINDOW_SEC}s (adaptive re-capture OFF) ..."
+         "SINGLE capture of ${_win_desc} (adaptive re-capture OFF) ..."
     # SINGLE deterministic capture (adaptive re-capture is off — see the sizing note above). Start the
     # sustained, replenishing background load (>CONC prompts, realistic prefill+decode mix; NOT timed, NOT
     # profiled). With PROFILE_WARMUP_SEC=0 the profiler is armed at load start so the capture includes the

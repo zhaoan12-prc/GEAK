@@ -31,22 +31,33 @@ classification semantics) and `SKILL_DIR/knowledge/sglang_internals.md` (profile
     the whole ramp). Override with `PREFILL_CHUNK` (chunk budget; raises RAMP so sglang's step budget doesn't
     get eaten by prefill at high CONC), `TPOT_MS`, `PROFILE_WINDOW_SEC_MAX`, or set
     `PROFILE_NUM_STEPS`/`PROFILE_WINDOW_SEC` explicitly.
-  - **Step-span annotations are OFF here — but not for the reason you'd guess.** vLLM's
-    `execute_context_*_generation_*` step spans ARE real torch `record_function` ranges that DO appear as
-    `gpu_user_annotation` in the ROCm torch trace (verified in real AMD traces — a steady conc64 decode
-    trace shows `generation_64(64)`), and `parse_profile` CAN split prefill/decode + verify decode batch ≈
-    CONC from them. They are OFF only because THIS vLLM build's strict `ProfilerConfig` (pydantic
-    `extra=forbid`) ABORTS the server on `detailed_trace_annotation`, so the adapter stopped passing it →
-    the trace has no step spans. sglang uses a different profiler and does NOT emit that vLLM-specific
-    `execute_context_*` format. Two gotchas when annotations ARE present: (i) `parse_profile` reads them
-    only from the `gpu_user_annotation` category — some captures put `execute_*` in `user_annotation` (CPU)
-    only, and those are silently missed; (ii) parse the rank0 WORKER trace (`dp0_pp0_tp0..._rank0`), NOT
-    the `*.async_llm.*` engine-process trace (python_function only, no kernels).
-  - Consequence on the current build: `parse_profile` CANNOT measure the decode batch or a per-kernel
-    `phase` from the trace (no `serving` block, no per-kernel `phase`), and the decode-step count is only a
-    COARSE shape-visibility proxy. Do NOT expect to verify steadiness from the trace — trust the up-front
-    analytic sizing + the saturated load. The prefill/decode split is recovered downstream ANALYTICALLY
-    (parse_profile's `analytic_calls` / `est_shape`), not from the trace.
+  - **Step-span annotations: PRESENT on vLLM, absent-by-default nowhere you need to configure.**
+    ⚠️ This section previously said they were OFF; that was measured on an older build and is **wrong for
+    vLLM ≥ 0.27**. Verified on `vllm/vllm-openai-rocm:v0.27.1`, gfx942, Qwen3.5-2B, conc 8: `gpu_worker.py`
+    wraps every `execute_model` in `annotate_profile()` **unconditionally**, and its DEFAULT branch (no
+    `detailed_trace_annotation` needed) emits `execute_context_<nreq>(<ntok>)_generation_<nreq>(<ntok>)`
+    as a `record_function` — 774 of them landed in `gpu_user_annotation` in a 25 s window.
+    `parse_profile._seg` already parses that dialect, so you get the full measured split:
+    `serving = {n_prefill_steps: 12, n_decode_steps: 762, decode_batch_captured: 8,
+    decode_batch_steady: 8, steady: true}` plus a per-kernel `phase` of `prefill`/`decode`/`both`.
+    **So DO read the trace's `serving` block and DO use it to verify steadiness** — the measured decode
+    batch should equal CONC. If it does not, the window or the load was wrong and re-profiling is the
+    right move.
+    `detailed_trace_annotation` is a separate, RICHER opt-in on builds that have it (it adds per-phase
+    `sq`/`sk`/`sqsq`/`sqsk` roofline terms). The adapter still does not pass it by default: it is a strict
+    (pydantic `extra=forbid`) schema, and the plain annotation above already gives the split.
+    sglang uses a different profiler and emits `step[EXTEND|DECODE ...]` instead; both dialects are
+    understood.
+    Two gotchas that DO still apply: (i) `parse_profile` reads annotations only from the
+    `gpu_user_annotation` category — a capture that puts `execute_*` in `user_annotation` (CPU) only is
+    silently missed; (ii) parse the rank0 WORKER trace (`rank0.*.pt.trace.json.gz`), NOT the
+    `*.async_llm.*` engine-process trace (python_function only, no kernels — it is ~1 KB and will look
+    like an empty profile).
+  - If a build genuinely emits no annotation, the fallback is
+    `scripts/vllm_phase_annotate.py` — a capture-only overlay hook (`overlay_setup.py
+    add-vllm-phase-annotation`, armed by `GEAK_VLLM_PHASE_ANNOTATE=1`) that makes vLLM emit sglang's
+    `step[...]` dialect. Only reach for it when `trace_capability.py` reports
+    `phase_annotation_count: 0`; on a build that already annotates it is redundant overhead.
   - The old adaptive "enlarge window + re-capture until N decode steps" gate is DISABLED — that proxy loop
     used to double the window until the trace bloated / OOMed the profiler buffer. `bench_e2e.sh` now
     captures ONCE with the up-front-sized window; trust the sizing.
@@ -178,9 +189,10 @@ degrade to whatever is available, and if both analysis.md and trace are unusable
    Pass `--isl/--osl/--conc` (the SAME values as the bench). IF the trace carries `gpu_user_annotation`
    `execute_*` step spans, each top kernel is annotated with its MEASURED serving **phase**
    (`prefill`/`decode`/`both`), per-phase `base_latency_ms`, and a top-level `serving` block with the
-   prefill/decode step counts + steady-state gate. On current vllm/sglang builds those spans are ABSENT
-   (see the steady-state note above), so these MEASURED fields will typically be MISSING — that is
-   EXPECTED, not a capture error; do not re-profile chasing them. Regardless, the parser ALWAYS emits
+   prefill/decode step counts + steady-state gate. On vLLM ≥ 0.27 those spans ARE present by default
+   (see the steady-state note above) — **check for them and report `serving.steady`**; their ABSENCE on
+   such a build means the capture went wrong (wrong trace file, profiler not configured), not that the
+   feature is unavailable. Where they really are missing, the parser ALWAYS emits
    `est_shape` (prefill M = token budget + remainders; decode M = concurrency snapped to a capture size)
    and `est_calls` (== the analytic `serving_weight_model.analytic_calls` the immutable unittest
    self-weights by), computed ANALYTICALLY from `--isl/--osl/--conc` — this is the prefill/decode split

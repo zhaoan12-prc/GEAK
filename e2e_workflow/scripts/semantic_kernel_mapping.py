@@ -2076,6 +2076,12 @@ def _phase_coverage(instances, tables, trace_paths, adopted_siblings,
         "decode_shapes_covered": decode_shapes,
         "decode_covered": decode_seq and decode_shapes,
         "trace_phase_tags": tags,
+        # A trace with NO step annotation at all cannot phase-tag a single row. On sglang
+        # that never happens (its profiler always writes step[...]); on vllm it is the
+        # DEFAULT unless the capture overlay's phase-annotation hook is armed, so make the
+        # distinction machine-readable instead of leaving it to be inferred from an empty
+        # phases_in_trace.
+        "phase_annotation_present": bool(in_trace),
         "traces_analysed": [os.path.abspath(p) for p in trace_paths],
         "siblings_auto_adopted": adopted_siblings,
         "filter_requested": sorted(table_phases) if table_phases else None,
@@ -2086,10 +2092,21 @@ def _phase_coverage(instances, tables, trace_paths, adopted_siblings,
         # nn.Module spans.  The ordered sequence survives; the shapes do not.
         # Only the shape half needs an eager probe.
         "decode_requires_eager_probe": decode_seq and not decode_shapes,
+        # Naming WHY decode is missing, because the remedies are different and only one of
+        # them is "capture again".  The last two arms exist for single-file mixed-phase
+        # captures: sglang's profile_by_stage puts the phase in the FILENAME, so an absent
+        # DECODE file is conclusive -- but vllm writes one un-split trace, where no phase
+        # tag is normal and "no_decode_trace_analysed" would libel a capture that did in
+        # fact cover decode.  Split that bucket by whether the trace carried step spans:
+        #   no spans   -> the annotation itself is missing (on vllm: the capture overlay's
+        #                 hook was not armed). Nothing is phase-tagged, prefill included.
+        #   spans, but no decode -> annotation worked; the WINDOW held no decode step.
         "decode_evidence": (
             "sequence_and_shapes" if (decode_seq and decode_shapes) else
             "sequence_only_shapes_unresolved" if decode_seq else
             "trace_present_but_no_decode_tables" if "DECODE" in tags else
+            "no_phase_annotation_in_trace" if (not tags and not in_trace) else
+            "mixed_trace_no_decode_steps_in_window" if not tags else
             "no_decode_trace_analysed"),
     }
 

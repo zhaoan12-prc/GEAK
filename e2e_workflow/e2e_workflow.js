@@ -124,6 +124,13 @@ const RUNTIME_IMAGE = String(A.runtime_image || A.image || '');
 const EXEC_PREFIX = String(A.exec_prefix || '');
 const FUSION_RUNTIME_INPUTS = EXEC_PREFIX ? { EXEC_PREFIX } : {};
 const BACKEND = String(A.backend != null ? A.backend : 'sglang').trim() || 'sglang';  // serving adapter
+// Fallback for a vLLM build that emits NO step annotation (pre-0.27, or a fork that dropped
+// annotate_profile). Arms scripts/vllm_phase_annotate.py in the fusion capture overlay so the
+// trace carries sglang-dialect step[...] spans. OFF by default: current vLLM annotates natively,
+// and wrapping execute_model on every step when it is not needed is pure capture overhead.
+// Decide it from evidence, not by guessing: `trace_capability.py` reporting
+// `phase_annotation_count: 0` on a profiled trace is what justifies turning this on.
+const VLLM_PHASE_ANNOTATE = String(A.vllm_phase_annotate != null ? A.vllm_phase_annotate : 'false') === 'true';
 const GPU_IDS = String(A.gpu_ids != null ? A.gpu_ids : '0');
 const GPU_LIST = GPU_IDS.split(',').map(s => s.trim()).filter(Boolean);
 // Serving tensor-parallel: TP size + the GPU set used for EVERY e2e SERVING launch (baseline, config
@@ -1230,20 +1237,48 @@ if (!FAST_MODE && (FUSION_DISCOVERY_ON || fusionInputsComplete())) {
     log('KernelFusion: complete fusion prior/state supplied; skipping capture/discovery/shape completion.');
   } else if (FUSION_DISCOVERY_ON) {
     const fusionRound = 'fusion_capture';
-    // Fusion needs call/module hierarchy, not the long statistical window used by
-    // the native Top-N profiler. Keep this mode scoped to the dedicated sglang
-    // Fusion capture: one step per separately captured stage with Python stacks.
-    // bench_e2e.sh leaves normal Profile/reprofile sizing unchanged otherwise.
-    const captureEnv = BACKEND === 'sglang'
-      ? (curEnv ? curEnv + ' ' : '') +
-        'GEAK_FUSION_TRACE=1 PROFILE_NUM_STEPS=1 SGLANG_PROFILE_WITH_STACK=true'
+    // Fusion needs call/module hierarchy and phase-tagged steps, not the long statistical
+    // window used by the native Top-N profiler. bench_e2e.sh leaves normal Profile/reprofile
+    // sizing unchanged; only this capture is switched into fusion evidence mode.
+    //
+    // The two stacks reach that mode differently and NEITHER can be left at its default:
+    //   sglang - profile_by_stage writes EXTEND and DECODE as separate traces, so one forward
+    //            per stage suffices; with_stack must be forced ON (the adapter defaults it off).
+    //   vllm   - has no profile_by_stage, so a SINGLE window has to contain both phases. It DOES
+    //            annotate natively: gpu_worker wraps every execute_model in annotate_profile(),
+    //            whose default branch emits execute_context_<n>(<t>)_generation_<n>(<t>) as a
+    //            record_function -- the legacy dialect parse_profile/semantic_kernel_mapping
+    //            already read. Measured on v0.27.1/gfx942: 774 spans in a 25s window, giving a
+    //            full serving block (steady=true, decode_batch==CONC) and a per-kernel phase.
+    //            So no annotation flag is needed; with_stack + the iteration bound are set by
+    //            scripts/adapters/vllm.sh. On an OLD build that emits nothing, set
+    //            args.vllm_phase_annotate:"true" to arm the capture overlay's post-import hook
+    //            (scripts/vllm_phase_annotate.py), which supplies sglang's step[...] dialect
+    //            instead. Opt-in, because on a build that already annotates it is pure overhead.
+    const FUSION_CAPTURE_ENV = {
+      sglang: 'GEAK_FUSION_TRACE=1 PROFILE_NUM_STEPS=1 SGLANG_PROFILE_WITH_STACK=true',
+      vllm: 'GEAK_FUSION_TRACE=1' + (VLLM_PHASE_ANNOTATE ? ' GEAK_VLLM_PHASE_ANNOTATE=1' : ''),
+    };
+    // An UNADAPTED backend keeps its previous env verbatim rather than being handed a
+    // fusion flag no adapter honors: it would disable bench_e2e.sh's window sizing and
+    // leave nothing in its place. Say so instead of degrading quietly.
+    const captureEnv = FUSION_CAPTURE_ENV[BACKEND]
+      ? (curEnv ? curEnv + ' ' : '') + FUSION_CAPTURE_ENV[BACKEND]
       : curEnv;
+    if (!FUSION_CAPTURE_ENV[BACKEND]) {
+      log(`KernelFusion: backend '${BACKEND}' has no fusion-capture profile; capturing with the ` +
+          'default profiler window (expect degraded module/phase evidence in Phase 1).');
+    }
+    // Only when the fallback is armed does the collector build the capture-only overlay that
+    // carries the hook (the orchestrator has no fs access, so the role does it).
+    const PHASE_ANNOTATION = (BACKEND === 'vllm' && VLLM_PHASE_ANNOTATE)
+      ? 'vllm_overlay_hook' : 'native';
     fusionCapture = await safeAgent(
       roleAgent('fusion_trace_collector', 'capture',
         'Capture only the clean production graph trace and manifest for fusion discovery; do not build Top-N.', {
           EVAL_DIR, MODEL_PATH, GPU_ID: GPU_LIST[0], WORKLOAD, ROUND: fusionRound,
           OVERLAY_PYTHONPATH: curOverlay, EXTRA_SERVER_ARGS: curFlags,
-          EXTRA_ENV: captureEnv, SKILL_DIR: WORKFLOW_DIR,
+          EXTRA_ENV: captureEnv, PHASE_ANNOTATION, SKILL_DIR: WORKFLOW_DIR,
           ...FUSION_RUNTIME_INPUTS, ...TRACELENS_INPUTS,
         }),
       { phase: 'KernelFusion', label: 'fusion-trace-collector:capture', schema: CAPTURE_SCHEMA }, 1);
