@@ -30,6 +30,11 @@ Commands:
                 imports eagerly at startup, which hangs the TP ranks)
                 --overlay O --module vllm.v1.worker.gpu_model_runner
                 --impl-module vllm_phase_annotate [--impl-attr install] [--impl-file F]
+  add-vllm-semantic-capture
+                wire scripts/vllm_semantic_capture.py (+ the capture engine and the shared
+                phase rule) so a vLLM run logs per-op shapes. This is the EAGER PROBE that
+                supplies decode shapes the cudagraph-replayed production trace cannot.
+                Inert unless GEAK_SEMANTICS_CAPTURE=1.   --overlay O
   add-vllm-phase-annotation
                 shorthand: wire scripts/vllm_phase_annotate.py so a vLLM trace carries the
                 sglang-dialect step[EXTEND|DECODE ...] spans the fusion semantics layer needs.
@@ -302,6 +307,33 @@ def cmd_add_vllm_phase_annotation(a):
     cmd_add_hook(a)
 
 
+def cmd_add_vllm_semantic_capture(a):
+    """Wire the vLLM eager shape probe (GEAK Semantics 1.2) as a post-import hook.
+
+    Unlike the phase-annotation overlay this needs THREE modules on the path -- the hook
+    entry, the shared capture engine it drives, and the phase rule both it and the trace
+    annotation read -- so copy them together. A partially-populated overlay fails at
+    import time inside the server, where the only symptom is an empty shape log.
+
+    Armed by the capture engine's own switch, GEAK_SEMANTICS_CAPTURE=1 (plus
+    GEAK_SEMANTICS_SHAPE_LOG / _LAYERS / _PHASES). Inert otherwise.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    needed = ["vllm_semantic_capture.py", "semantic_runtime_capture.py",
+              "vllm_phase_annotate.py"]
+    missing = [n for n in needed if not os.path.exists(os.path.join(here, n))]
+    if missing:
+        raise SystemExit("missing capture module(s) beside overlay_setup.py: %s"
+                         % ", ".join(missing))
+    _ensure_overlay(a.overlay)
+    for name in needed:
+        shutil.copy2(os.path.join(here, name), os.path.join(a.overlay, name))
+    a.impl_file = ""            # already copied, all three of them
+    a.impl_module = "vllm_semantic_capture"
+    a.impl_attr = "install"
+    cmd_add_hook(a)
+
+
 def cmd_check(a):
     f = module_file(a.module)
     print(f"{a.module} -> {f}")
@@ -357,6 +389,11 @@ def main():
     p.add_argument("--module", default="vllm.v1.worker.gpu_model_runner")
     p.add_argument("--impl-file", default="", dest="impl_file")
     p.set_defaults(func=cmd_add_vllm_phase_annotation)
+
+    p = sub.add_parser("add-vllm-semantic-capture")
+    p.add_argument("--overlay", required=True)
+    p.add_argument("--module", default="vllm.v1.worker.gpu_model_runner")
+    p.set_defaults(func=cmd_add_vllm_semantic_capture)
 
     p = sub.add_parser("check")
     p.add_argument("--module", required=True)
