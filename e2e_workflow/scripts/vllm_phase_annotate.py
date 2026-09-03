@@ -53,11 +53,17 @@ def _warn_once(key, message):
         sys.stderr.write("[GEAK_PHASE_ANNOTATE] %s\n" % message)
 
 
-def _step_name(runner, scheduler_output):
-    """Return the sglang-dialect annotation for this forward, or None if undeterminable.
+def classify_step(runner, scheduler_output):
+    """(phase, batch_size, input_tokens) for this forward, or None if undeterminable.
 
-    None is a deliberate outcome, not a failure path: an un-annotated step is recorded as
-    phase-unresolved downstream, which is recoverable. A mislabelled step is not.
+    THE single place vLLM's prefill/decode split is decided. Both consumers read it here:
+    the trace annotation below, and the eager shape probe (vllm_semantic_capture). A second
+    copy of this rule would be free to drift, and a phase split that disagrees with itself
+    across two capture paths is not detectable from either one's output.
+
+    `phase` uses sglang's vocabulary (EXTEND / DECODE) so downstream canonicalization is
+    shared too. None is a deliberate outcome, not a failure path: an unlabelled step is
+    recorded as phase-unresolved, which is recoverable. A mislabelled step is not.
     """
     per_req = getattr(scheduler_output, "num_scheduled_tokens", None)
     total = getattr(scheduler_output, "total_num_scheduled_tokens", None)
@@ -83,7 +89,16 @@ def _step_name(runner, scheduler_output):
     if is_decode is None:
         is_decode = (max_toks == query_len) and (total == max_toks * num_reqs)
 
-    if is_decode:
+    return ("DECODE" if is_decode else "EXTEND", num_reqs, total)
+
+
+def _step_name(runner, scheduler_output):
+    """Render classify_step() in sglang's annotation dialect, or None."""
+    classified = classify_step(runner, scheduler_output)
+    if classified is None:
+        return None
+    phase, num_reqs, total = classified
+    if phase == "DECODE":
         return "step[DECODE bs=%d]" % num_reqs
     return "step[EXTEND bs=%d toks=%d]" % (num_reqs, total)
 
