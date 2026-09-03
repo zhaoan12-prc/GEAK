@@ -31,6 +31,22 @@ Phase 1.2 additionally receives `STRUCTURAL_PATTERNS_JSON`, `SEMANTIC_TABLE_JSON
    - Include `attention_type`, `model_native_attention_name`, `attention_config_fields`,
      `runtime_attention_module_class`, `ffn_type`, `is_moe`, `num_experts`, `topk`,
      `shared_expert`, `router_family`, `special_layer_role`, and `runtime_dispatch_branch`.
+   - **`runtime_dispatch_branch` is load-bearing, not documentation.** Where the runtime
+     routes the layer through a NAMED custom op, put that op's exact registered name here
+     (e.g. `vllm::qwen_gdn_attention_core`, `vllm::unified_attention_with_output`). The
+     deterministic mapper uses it as a per-layer boundary anchor when the trace has no
+     `nn.Module` frames — which is the DEFAULT on vLLM, whose V1 engine compiles the model
+     so the per-layer python frames disappear into the compiled graph. Those ops survive
+     precisely because they are the graph's `splitting_ops`.
+     Two consequences worth stating plainly:
+     * **Every Pattern must declare one, or none is used.** The mapper refuses a partial
+       anchor set rather than half-mapping: on a hybrid model, anchoring only some layer
+       kinds is what produces layer "bodies" that silently span several real layers.
+     * **A wrong name is caught, not believed.** The mapper checks that the i-th anchor's
+       op is the one the Pattern owning layer i declared, and declines the whole step if
+       not. So write the name you verified in the source; do not guess a plausible one.
+     If the layer genuinely has no named dispatch op, leave the field as the descriptive
+     value it has always been — the mapper then falls back to its previous behavior.
    - Merge layers only when every signature dimension is identical.
    - Do not use initialization events, kernel names/counts/timings, or Trace sequence clustering to
      define or split a Pattern. Trace is validation evidence only.
@@ -67,6 +83,19 @@ Phase 1.2 additionally receives `STRUCTURAL_PATTERNS_JSON`, `SEMANTIC_TABLE_JSON
    Phase-1 presentation contract includes both phases in execution order:
    **Prefill tables first, then Decode tables**. Keep `--table-phases all`;
    the deterministic script owns this ordering.
+
+4b. **Read the boundary provenance before you trust the table.** In
+   `layer_instance_audit.json`, `boundary_partition_diagnostics[].partition_method` says
+   how each step's layers were cut, in descending order of trust:
+   `module_span_sequence_medoid` (real per-layer scopes — `nn.Module` frames, or the
+   declared dispatch-op anchors) > `anchor_repeat_segmentation` (a kernel-stage repeat was
+   INFERRED to mark layer starts). Report the mix in `notes`.
+   The `step_layer_order` gate is the objective check and it is **non-gating**, so a `fail`
+   there will NOT stop the run: `actual_instance_count` below `expected_instance_count`
+   means that step's layers were not really resolved. On vLLM the normal picture is prefill
+   steps mapped from dispatch anchors and DECODE steps failing this gate — decode replays
+   under a CUDA graph and emits no per-layer CPU op at all. Say so explicitly instead of
+   letting an overall `pass` imply both phases were resolved.
 
 5. Read `semantic_mapping_quality.json` and return its real status:
    - `pass`: structural coverage, measured phases, representative-layer integrity, and conservation

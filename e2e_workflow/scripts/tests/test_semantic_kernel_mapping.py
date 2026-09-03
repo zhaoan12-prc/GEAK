@@ -542,6 +542,142 @@ class PhaseCoverageTest(unittest.TestCase):
         self.assertFalse(coverage["decode_sequence_covered"])
         self.assertEqual(coverage["decode_evidence"], "no_decode_trace_analysed")
 
+    # ------------------------------------------------------------------ #
+    # declared dispatch-op layer anchors (the torch.compile / hybrid-model path)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _hybrid_pattern_doc(n=8, linear_branch="vllm::qwen_gdn_attention_core",
+                            full_branch="vllm::unified_attention_with_output"):
+        """n layers, every 4th one full-attention -- the Qwen3.5 hybrid shape."""
+        full = [i for i in range(n) if i % 4 == 3]
+        lin = [i for i in range(n) if i % 4 != 3]
+        def pat(pid, attn, layers, branch):
+            sig = {"attention_type": attn, "runtime_dispatch_branch": branch}
+            return {"pattern_id": pid, "attention_type": attn,
+                    "layer_ids": layers, "structural_signature": sig}
+        return {"num_hidden_layers_main": n,
+                "patterns": [pat("P_lin", "linear", lin, linear_branch),
+                             pat("P_full", "full", full, full_branch)]}
+
+    @staticmethod
+    def _step_and_anchors(doc, n=8, base=1000, step=10, swap=None, drop=0):
+        """One annotated step plus one cpu_op anchor per layer, in layer order."""
+        events = [{"cat": "gpu_user_annotation", "name": "step[EXTEND bs=1 toks=64]",
+                   "ts": base, "dur": step * (n + 2)},
+                  {"cat": "user_annotation", "name": "step[EXTEND bs=1 toks=64]",
+                   "ts": base, "dur": step * (n + 2)}]
+        by_layer = {}
+        for pattern in doc["patterns"]:
+            for layer in pattern["layer_ids"]:
+                by_layer[layer] = pattern["structural_signature"][
+                    "runtime_dispatch_branch"]
+        for layer in range(n - drop):
+            name = by_layer[layer]
+            if swap and layer in swap:
+                name = swap[layer]
+            events.append({"cat": "cpu_op", "name": name,
+                           "ts": base + step * (layer + 1), "dur": 1})
+        return events
+
+    def test_dispatch_anchors_resolve_every_layer_when_modules_are_compiled_away(self):
+        """The vllm case: no nn.Module frames, one splitting op per layer."""
+        doc = self._hybrid_pattern_doc()
+        events = self._step_and_anchors(doc)
+        spans = mapping._collect_step_spans(events)
+        scopes, diag = mapping._dispatch_anchor_scopes(events, spans, doc)
+
+        self.assertEqual(diag["status"], "mapped")
+        self.assertEqual(len(scopes), 8)
+        self.assertEqual([s["layer_id"] for s in scopes], list(range(8)))
+        # Pattern assignment must follow the declared layout, not the anchor order alone.
+        self.assertEqual([s["pattern_id"] for s in scopes],
+                         ["P_lin", "P_lin", "P_lin", "P_full"] * 2)
+        # Contiguous, non-overlapping partition.
+        for earlier, later in zip(scopes, scopes[1:]):
+            self.assertEqual(earlier["end"], later["ts"])
+        self.assertTrue(all(s["scope_source"] == "declared_dispatch_op" for s in scopes))
+
+    def test_dispatch_anchors_decline_when_a_pattern_declares_no_branch(self):
+        """A layer kind with no anchor is the 6-of-24 defect; refuse, do not part-map.
+
+        Half-anchoring is worse than not anchoring: it segments the layers it can see
+        and silently swallows the rest into whatever segment happens to be open.
+        """
+        doc = self._hybrid_pattern_doc()
+        doc["patterns"][1]["structural_signature"]["runtime_dispatch_branch"] = ""
+        events = self._step_and_anchors(doc)
+        spans = mapping._collect_step_spans(events)
+        scopes, diag = mapping._dispatch_anchor_scopes(events, spans, doc)
+        self.assertEqual(scopes, [])
+        self.assertEqual(diag["status"], "patterns_without_dispatch_branch")
+        self.assertEqual(diag["patterns_missing_branch"], ["P_full"])
+
+    def test_dispatch_anchors_decline_a_step_that_is_missing_anchors(self):
+        """CUDA-graph decode emits no per-layer cpu_op; that step must not be mapped."""
+        doc = self._hybrid_pattern_doc()
+        events = self._step_and_anchors(doc, drop=3)
+        spans = mapping._collect_step_spans(events)
+        scopes, diag = mapping._dispatch_anchor_scopes(events, spans, doc)
+        self.assertEqual(scopes, [])
+        self.assertEqual(diag["steps"][0]["status"], "anchor_count_mismatch")
+        self.assertEqual(diag["steps"][0]["anchor_count"], 5)
+
+    def test_dispatch_anchors_decline_when_order_disagrees_with_the_patterns(self):
+        """The check that makes this evidence: anchor kind must match the layer's Pattern."""
+        doc = self._hybrid_pattern_doc()
+        events = self._step_and_anchors(
+            doc, swap={0: "vllm::unified_attention_with_output"})
+        spans = mapping._collect_step_spans(events)
+        scopes, diag = mapping._dispatch_anchor_scopes(events, spans, doc)
+        self.assertEqual(scopes, [])
+        self.assertEqual(diag["steps"][0]["status"],
+                         "anchor_order_disagrees_with_patterns")
+        self.assertEqual(diag["steps"][0]["first_mismatch_layer"], 0)
+
+    def test_module_spans_still_win_over_dispatch_anchors(self):
+        """The fallback must not displace real module evidence when it exists."""
+        doc = self._hybrid_pattern_doc()
+        events = self._step_and_anchors(doc)
+        for layer in range(8):
+            events.append({"cat": "python_function",
+                           "name": "nn.Module: SomeDecoderLayer_%d" % layer,
+                           "ts": 1000 + 10 * (layer + 1) - 2, "dur": 8})
+        spans = mapping._collect_step_spans(events)
+        scopes, diag = mapping._module_layer_scopes(events, spans, doc)
+        self.assertEqual(len(scopes), 8)
+        self.assertNotIn("scope_source", scopes[0])
+        self.assertFalse(any(d.get("source", "").startswith("declared_dispatch")
+                             for d in diag))
+
+    # ------------------------------------------------------------------ #
+    # required stages per declared attention type
+    # ------------------------------------------------------------------ #
+    def test_linear_attention_pattern_does_not_require_an_attn_kernel(self):
+        """A gated-delta layer emits linear_attn, never attn.
+
+        Requiring `attn` of it made a CORRECTLY segmented hybrid layer fail the
+        plausibility gate -- and, before boundaries were accurate, made an INCORRECTLY
+        segmented one pass, because a 4-layer blob always contained a real attn kernel.
+        """
+        linear = {"pattern_id": "P_lin", "attention_type": "linear"}
+        self.assertEqual(mapping._required_stages(linear), {"linear_attn", "gemm"})
+
+    def test_full_attention_and_undeclared_patterns_keep_the_attn_requirement(self):
+        self.assertEqual(mapping._required_stages({"pattern_id": "P_full",
+                                                   "attention_type": "full"}),
+                         {"attn", "gemm"})
+        # Undeclared: attention_type is a REQUIRED signature field, so its absence is a
+        # malformed doc. Keep the historical requirement rather than weakening the gate.
+        self.assertEqual(mapping._required_stages({"pattern_id": "P_x"}),
+                         {"attn", "gemm"})
+
+    def test_moe_stages_are_added_on_top_of_the_attention_requirement(self):
+        self.assertEqual(
+            mapping._required_stages({"pattern_id": "P_lin_moe",
+                                      "attention_type": "linear",
+                                      "ffn_type": "moe"}),
+            {"linear_attn", "gemm", "moe", "topk"})
+
     def test_unannotated_single_file_trace_names_the_missing_annotation(self):
         """vllm without the phase-annotation hook: NOTHING is phase-tagged.
 

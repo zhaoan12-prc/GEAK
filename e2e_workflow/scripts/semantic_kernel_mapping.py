@@ -369,6 +369,169 @@ def _module_layer_scopes(events, spans, pattern_doc):
                 })
                 scopes.append(item)
     scopes.sort(key=lambda item: (item["ts"], item["end"]))
+    if not scopes:
+        # No module frame resolved a single layer. Before falling all the way through to
+        # the kernel-stage repeat heuristic (which MIS-SEGMENTS hybrid models -- see
+        # _dispatch_anchor_scopes), try the anchor the Patterns themselves declare.
+        fallback, fallback_diag = _dispatch_anchor_scopes(events, spans, pattern_doc)
+        diagnostics.append(dict(fallback_diag,
+                                source=("declared_dispatch_op_span" if fallback
+                                        else "declared_dispatch_op_span_declined")))
+        if fallback:
+            return fallback, diagnostics
+    return scopes, diagnostics
+
+
+# Evidence classes that count as an AUTHORITATIVE per-layer scope: one span per layer
+# instance, emitted by something the runtime itself produces, not inferred from a repeat.
+# `declared_dispatch_op_span` is the newest member -- see _dispatch_anchor_scopes.
+# The subset anchored per-EVENT (an External id, or a real op boundary) rather than
+# interpolated; stage templates and the medoid alignment are built only from these,
+# because an interpolated scope cannot say where a layer's core actually starts.
+EXACT_LAYER_SCOPE_EVIDENCE = ("python_module_span_external_id",
+                              "declared_dispatch_op_span")
+
+
+def _is_layer_scope_evidence(evidence):
+    evidence = str(evidence or "")
+    return (evidence.startswith("python_module_span")
+            or evidence in ("module_sequence_interpolation",
+                            "declared_dispatch_op_span"))
+
+
+def _declared_dispatch_branches(pattern_doc):
+    """{op_name: [pattern_id, ...]} from the AGENT's structural signatures.
+
+    `runtime_dispatch_branch` is a REQUIRED signature field (see
+    validate_structural_patterns.REQUIRED_SIGNATURE_FIELDS) that the agent fills from
+    runtime SOURCE analysis. Using it as a layer anchor therefore keeps the Phase-1
+    contract intact -- the agent defines structure, this code only validates it against
+    the trace; the trace never defines a Pattern.
+    """
+    branches = {}
+    for pattern in pattern_doc.get("patterns", []):
+        signature = pattern.get("structural_signature") or {}
+        branch = str(signature.get("runtime_dispatch_branch") or "").strip()
+        if branch:
+            branches.setdefault(branch, []).append(pattern.get("pattern_id"))
+    return branches
+
+
+def _dispatch_anchor_scopes(events, spans, pattern_doc):
+    """Per-layer scopes cut at the dispatch op each Pattern declares it routes through.
+
+    WHY THIS EXISTS. Under torch.compile the per-layer `nn.Module` python frames are
+    gone -- the layer stack lives inside a compiled graph. vLLM's V1 engine compiles by
+    default, so on vllm the module-span path finds NOTHING and everything falls through
+    to `_anchor_runs`, which infers an anchor from how regularly a KERNEL STAGE repeats.
+    On a HYBRID model that inference is not merely incomplete, it is WRONG: measured on
+    Qwen3.5-2B (24 layers = 18 gated-delta + 6 full-attention, full_attention_interval 4)
+    the `attn` stage fires only in the 6 full-attention layers -- at a perfectly regular
+    spacing, so it passed the regularity test and produced 6 "layer bodies" each holding
+    FOUR real layers. The step_layer_order gate saw it (6 vs 24) but is non-gating, so
+    Phase 1 still reported `pass` on a table whose every layer boundary was wrong.
+
+    The dispatch ops do not have that problem: they survive compilation precisely BECAUSE
+    they are the graph's splitting points, and every layer kind has one. On that same
+    trace `vllm::qwen_gdn_attention_core` (x18) + `vllm::unified_attention_with_output`
+    (x6) = exactly 24 anchors per step.
+
+    DECLINES rather than guesses. Returns [] unless ALL of:
+      * every Pattern declares a dispatch branch -- one that does not is a layer kind with
+        no anchor, which is precisely the 6-of-24 failure above;
+      * the step carries exactly `num_hidden_layers_main` anchor events;
+      * the anchor ORDER agrees with the declared per-layer Patterns (the i-th anchor's op
+        is the one the Pattern owning layer i declared).
+    That last check is what makes this evidence rather than an assumption: it fails loudly
+    on a model whose layers do not execute in config order.
+
+    Boundary semantics: layer i spans [anchor_i, anchor_i+1). Like the existing
+    anchor_stage_rotation path this is phase-shifted within the layer (the segment holds
+    layer i's core and tail plus layer i+1's head), so it is a partition into N correctly
+    ORDERED and correctly CLASSIFIED segments -- not a claim about where nn.Module would
+    have opened. Downstream reads it as `declared_dispatch_op_span`, never as a module span.
+    """
+    expected_count = int(pattern_doc.get("num_hidden_layers_main", 0) or 0)
+    patterns = pattern_doc.get("patterns", [])
+    if expected_count <= 0 or not patterns:
+        return [], {"status": "no_pattern_doc"}
+    undeclared = [p.get("pattern_id") for p in patterns
+                  if not str((p.get("structural_signature") or {}).get(
+                      "runtime_dispatch_branch") or "").strip()]
+    if undeclared:
+        return [], {"status": "patterns_without_dispatch_branch",
+                    "patterns_missing_branch": undeclared}
+    branches = _declared_dispatch_branches(pattern_doc)
+    branch_by_pattern = {
+        p.get("pattern_id"): str(
+            (p.get("structural_signature") or {})["runtime_dispatch_branch"]).strip()
+        for p in patterns}
+    pattern_by_layer = _pattern_index(pattern_doc)
+
+    cpu_spans, span_starts = _cpu_step_index(spans)
+    if not cpu_spans:
+        cpu_spans, span_starts = spans, [span[0] for span in spans]
+    by_step = {}
+    for event in events:
+        if not isinstance(event, dict) or event.get("cat") != "cpu_op":
+            continue
+        name = event.get("name")
+        if not isinstance(name, str) or name not in branches:
+            continue
+        if event.get("ts") is None:
+            continue
+        step = _cpu_step_at(event["ts"], cpu_spans, span_starts)
+        if step is None:
+            continue
+        by_step.setdefault(step[5], []).append((event["ts"], name, step))
+
+    scopes = []
+    diagnostics = {"status": "mapped", "anchor_ops": sorted(branches),
+                   "expected_layer_count": expected_count, "steps": []}
+    for step_id, anchors in sorted(by_step.items()):
+        anchors.sort(key=lambda item: item[0])
+        record = {"step_id": step_id, "anchor_count": len(anchors)}
+        if len(anchors) != expected_count:
+            record["status"] = "anchor_count_mismatch"
+            diagnostics["steps"].append(record)
+            continue
+        step = anchors[0][2]
+        # The CPU-side step window closes the last layer; indices 7,8 carry it when the
+        # trace has a CPU annotation, otherwise the GPU window end is the best available.
+        step_end = step[8] if len(step) >= 9 else step[1]
+        ordered = []
+        for layer_id, (ts, name, _step) in enumerate(anchors):
+            pattern = pattern_by_layer.get(layer_id) or {}
+            if branch_by_pattern.get(pattern.get("pattern_id")) != name:
+                ordered = None
+                record["status"] = "anchor_order_disagrees_with_patterns"
+                record["first_mismatch_layer"] = layer_id
+                break
+            end = anchors[layer_id + 1][0] if layer_id + 1 < len(anchors) else step_end
+            ordered.append({
+                "name": name,
+                "class_local_id": layer_id,
+                "ts": ts,
+                "end": end,
+                "event_index": layer_id,
+                "step_id": step_id,
+                "phase": _phase_name(step[2]),
+                "layer_id": layer_id,
+                "pattern_id": pattern.get("pattern_id"),
+                "pass_index": 0,
+                "layer_instance_id": "%s:pass-0:layer-%d" % (step_id, layer_id),
+                "type_validation": "pass",
+                "scope_source": "declared_dispatch_op",
+            })
+        if ordered is None:
+            diagnostics["steps"].append(record)
+            continue
+        record["status"] = "mapped"
+        diagnostics["steps"].append(record)
+        scopes.extend(ordered)
+    scopes.sort(key=lambda item: (item["ts"], item["end"]))
+    if not scopes:
+        diagnostics["status"] = "no_usable_step"
     return scopes, diagnostics
 
 
@@ -480,7 +643,13 @@ def _event_rows(events, pattern_doc):
         if module_scope is not None:
             layer_id = module_scope["layer_id"]
             layer_instance_id = module_scope["layer_instance_id"]
-            layer_evidence = "python_module_span_external_id"
+            # Do not call a dispatch-op cut a python module span. Both are authoritative
+            # per-layer scopes, but only one of them is a module frame, and a reader
+            # auditing boundary provenance has to be able to tell them apart.
+            layer_evidence = (
+                "declared_dispatch_op_span"
+                if module_scope.get("scope_source") == "declared_dispatch_op"
+                else "python_module_span_external_id")
         elif flow_scope is not None:
             layer_id = flow_scope["layer_id"]
             layer_instance_id = flow_scope["layer_instance_id"]
@@ -653,10 +822,9 @@ def _module_pattern_templates(rows):
         if not instance_id or row.get("assignment") != "layer_body":
             continue
         evidence = row.get("layer_evidence", "")
-        if (evidence.startswith("python_module_span")
-                or evidence == "module_sequence_interpolation"):
+        if _is_layer_scope_evidence(evidence):
             full_groups.setdefault(instance_id, []).append(row)
-        if evidence == "python_module_span_external_id":
+        if evidence in EXACT_LAYER_SCOPE_EVIDENCE:
             core_groups.setdefault(instance_id, []).append(row)
 
     def collect(groups):
@@ -730,7 +898,28 @@ def _pattern_is_moe(pattern):
 
 
 def _required_stages(pattern):
-    required = {"attn", "gemm"}
+    """Stages a correctly-segmented body of THIS Pattern must contain.
+
+    The attention stage is derived from the Pattern's declared `attention_type`, not
+    assumed to be `attn`. A linear-attention / gated-delta layer never emits an `attn`
+    kernel -- it emits `linear_attn` -- so requiring `attn` of every Pattern makes a
+    structurally correct hybrid layer look implausible.
+
+    This was masked until layer boundaries got accurate. With the old kernel-stage repeat
+    anchor, a hybrid model's "layer body" spanned several real layers (see
+    _dispatch_anchor_scopes) and therefore always swept in some full-attention layer's
+    `attn` kernels, so the requirement was satisfied for the wrong reason. Once each body
+    held exactly one layer, every linear-attention representative failed the
+    representative_pattern_plausibility gate -- correct segmentation, wrong requirement.
+    """
+    # Only the case that is PROVABLY wrong is special-cased. An undeclared attention
+    # type keeps the historical {attn, gemm} requirement: `attention_type` is a required
+    # signature field, so its absence means a malformed Pattern doc, and relaxing the
+    # gate there would weaken it for every model to accommodate one that is broken.
+    if _expected_layer_type(pattern) == "linear":
+        required = {"linear_attn", "gemm"}
+    else:
+        required = {"attn", "gemm"}
     if _pattern_is_moe(pattern):
         required = required | {"moe", "topk"}
     return required
@@ -1185,7 +1374,7 @@ def _module_guided_segments(
     for row in step_rows:
         instance_id = row.get("layer_instance_id")
         if (instance_id and
-                row.get("layer_evidence") == "python_module_span_external_id"):
+                row.get("layer_evidence") in EXACT_LAYER_SCOPE_EVIDENCE):
             groups.setdefault(instance_id, []).append(row)
     candidates = []
     for instance_id, group in groups.items():
@@ -1249,9 +1438,8 @@ def _stage_sequence_partition(rows, pattern_doc):
         step_rows.sort(key=lambda row: row["device_seq_index"])
         module_instances = set(
             row["layer_instance_id"] for row in step_rows
-            if row.get("layer_instance_id") and row.get("layer_evidence") and (
-                row["layer_evidence"].startswith("python_module_span")
-                or row["layer_evidence"] == "module_sequence_interpolation"))
+            if row.get("layer_instance_id")
+            and _is_layer_scope_evidence(row.get("layer_evidence")))
         runs = _stage_runs(step_rows)
         if len(runs) < layer_count:
             # This is physically impossible to split into non-empty layers
@@ -1906,9 +2094,11 @@ def _representative_plausibility(pattern_doc, tables, rows):
         for row in table.get("rows", []):
             if row.get("stage"):
                 stages.add(row["stage"])
-        declared = {"attn", "gemm"}
-        if _pattern_is_moe(pattern):
-            declared = declared | {"moe", "topk"}
+        # Share the requirement with the segmentation path instead of restating it.
+        # These two had drifted into two copies of `{"attn","gemm"}`; fixing one left
+        # this gate still demanding an `attn` kernel from linear-attention layers,
+        # which structurally never emit one.
+        declared = _required_stages(pattern)
         required = declared & stages_in_trace
         missing = sorted(required - stages)
         audits.append({
