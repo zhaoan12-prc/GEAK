@@ -1345,8 +1345,11 @@ if (!FAST_MODE && (FUSION_DISCOVERY_ON || fusionInputsComplete())) {
                 SKILL_DIR: WORKFLOW_DIR, ...FUSION_RUNTIME_INPUTS,
               }),
             { phase: 'KernelFusion', label: 'fusion-unit:aggregate', schema: FUSION_UNIT_AGG_SCHEMA }, 1);
-          if (aggregate && aggregate.status === 'pass' &&
-              aggregate.fusion_unitside_json) {
+          // Preserve partial/failed aggregate artifacts too. Individual verdicts
+          // retain their own pass/fail status; apply-back applies only proven
+          // passes and explicitly disposes the rest. Dropping this path discarded
+          // valid wins and silently skipped the entire apply-back phase.
+          if (aggregate && aggregate.fusion_unitside_json) {
             FUSION_INPUTS.FUSION_UNITSIDE_JSON = aggregate.fusion_unitside_json;
           }
         }
@@ -1490,6 +1493,10 @@ if (!FAST_MODE && (FUSION_DISCOVERY_ON || fusionInputsComplete())) {
       // Same field name as native strategize; value is the profiled stack (post-Fusion curTput).
       BASELINE_THROUGHPUT: curTput, WORKLOAD, BUDGET, HEAD_THRESHOLD_PCT,
       CONFIG_TUNE_ENABLED, SKILL_DIR: WORKFLOW_DIR,
+      FUSION_TOPK_JSON: FUSION_INPUTS.FUSION_TOPK_JSON,
+      FUSION_UNITSIDE_JSON: FUSION_INPUTS.FUSION_UNITSIDE_JSON,
+      ACCEPTED_FUSIONS: acceptedFusions,
+      FUSION_DISPOSITION: fusionDisposition,
       ...profileTraceLensInputs, ...ANALYSIS_SKILL_INPUTS,
     }),
     { phase: 'Strategize', label: 'architect:strategize', schema: STRATEGY_SCHEMA });
@@ -1613,6 +1620,10 @@ if (want('config') && CONFIG_TUNE_ENABLED && strategy && (strategy.config_direct
         EVAL_DIR, PROFILE_TOPN: profile ? profile.profile_topN_json : '',
         BASELINE_THROUGHPUT: curTput, WORKLOAD, BUDGET, HEAD_THRESHOLD_PCT,
         CONFIG_TUNE_ENABLED: false, SKILL_DIR: WORKFLOW_DIR,
+        FUSION_TOPK_JSON: FUSION_INPUTS.FUSION_TOPK_JSON,
+        FUSION_UNITSIDE_JSON: FUSION_INPUTS.FUSION_UNITSIDE_JSON,
+        ACCEPTED_FUSIONS: acceptedFusions,
+        FUSION_DISPOSITION: fusionDisposition,
         ...ANALYSIS_SKILL_INPUTS,
       }),
       { phase: 'Strategize', label: 'architect:re-strategize', schema: STRATEGY_SCHEMA });
@@ -2527,6 +2538,8 @@ if (want('head') && headQueue.length && HEAD_BUDGET > 0) {
           EVAL_DIR, PROFILE_TOPN: profile ? profile.profile_topN_json : '',
           BASELINE_THROUGHPUT: curTput, WORKLOAD, BUDGET,
           HEAD_THRESHOLD_PCT, CONFIG_TUNE_ENABLED: false, SKILL_DIR: WORKFLOW_DIR,
+          ACCEPTED_FUSIONS: acceptedFusions,
+          FUSION_DISPOSITION: fusionDisposition,
           ...ANALYSIS_SKILL_INPUTS, ...FUSION_INPUTS,
         }),
       { phase: 'Strategize', label: 'architect:post-head-re-strategize', schema: STRATEGY_SCHEMA });

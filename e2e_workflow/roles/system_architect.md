@@ -74,6 +74,14 @@ Inputs: `EVAL_DIR`, `PROFILE_TOPN` (path to profile_topN.json + inline top entri
 includes accepted KernelFusion if any; not a frozen Setup-only number),
 `WORKLOAD` (isl/osl/conc → tells you prefill vs decode regime mix),
 `BUDGET` (max kernel-optimization tasks), `CONFIG_TUNE_ENABLED` (bool), `SKILL_DIR`.
+OPTIONAL KernelFusion ownership handoff: `FUSION_TOPK_JSON`,
+`FUSION_UNITSIDE_JSON`, `ACCEPTED_FUSIONS`, `FUSION_DISPOSITION`.
+An applied fusion is already present in the profiled stack and must not be
+scheduled again. A unit-side-passed fusion that was not applied (apply-back
+failed, did not run, or was explicitly deferred) must be routed to an
+actionable fallback track or explicitly dropped with a reason. Never suppress
+a candidate merely because KernelFusion nominated it; suppress it only when
+`ACCEPTED_FUSIONS` proves that ownership was successfully completed.
 OPTIONAL profile-analysis prior (empty string = not provided): `ANALYSIS_SKILL`, `ANALYSIS_SKILL_DIR`
 (+ the Profiler's `profile_roofline_json`) — see step 1c.
 OPTIONAL upstream TraceLens prior (may be empty strings — treat empty/missing as "not provided"):

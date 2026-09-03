@@ -275,8 +275,6 @@ def _phase_generalization(results, candidate_list, phase_waivers):
     observation that a kernel proven good somewhere deserves an explicit answer
     everywhere. `--phase-waiver <fused_fn>@<phase>=<reason>` is the answer when the
     seam genuinely does not exist in that phase."""
-    phases = sorted({str(c.get("phase")) for c in candidate_list
-                     if c.get("phase")})
     tested = {}
     winners = {}
     for row in results:
@@ -289,7 +287,17 @@ def _phase_generalization(results, candidate_list, phase_waivers):
             winners.setdefault(short, []).append(row.get("candidate_id"))
     gaps = []
     for fn, cids in sorted(winners.items()):
-        for phase in phases:
+        # Generalize only across phases where THIS fused function has a concrete
+        # candidate seam. The old global phase set required every winning decode
+        # kernel to be benched in prefill merely because some unrelated prefill
+        # candidate existed, making valid runs fail without a possible test.
+        applicable_phases = sorted({
+            str(candidate.get("phase"))
+            for candidate in candidate_list
+            if candidate.get("phase") and
+            _fn_matches_api(fn, candidate.get("existing_apis"))
+        })
+        for phase in applicable_phases:
             if phase in tested.get(fn, set()):
                 continue
             key = "%s@%s" % (fn, phase)
@@ -301,7 +309,8 @@ def _phase_generalization(results, candidate_list, phase_waivers):
                 "open": key not in phase_waivers,
             })
     return {
-        "phases": phases,
+        "phases": sorted({str(c.get("phase")) for c in candidate_list
+                           if c.get("phase")}),
         "winning_kernels": sorted(winners),
         "gaps": gaps,
         "open_gaps": [g for g in gaps if g["open"]],

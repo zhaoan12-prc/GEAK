@@ -1040,7 +1040,10 @@ def validate(semantic_table_path, candidates_path,
             src_shape = source.get("shape")
             if isinstance(src_shape, dict) and src_shape.get("input_dims"):
                 member_shape_hits += 1
-                if member.get("shape") is None:
+                # Candidate generators commonly preserve a placeholder
+                # {input_dims: []}. That is not an authored shape and must not
+                # block the authoritative row-id graft from the semantic table.
+                if not ((member.get("shape") or {}).get("input_dims")):
                     member["shape"] = copy.deepcopy(src_shape)
                     shape_graft["grafted"] += 1
                 else:

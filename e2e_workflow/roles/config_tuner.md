@@ -69,6 +69,11 @@ For EACH direction, in the Architect's order:
 7. (GEMM tuning is NOT a config axis — it lives in the head-kernel track now.)
 
 Record every trial (kept + rejected) in `EVAL_DIR/config/sweep_results.json`.
+This file is also the crash-recovery checkpoint: its top level MUST contain the
+same complete `accepted_flags`, `accepted_env`, `best_throughput_tok_s`,
+`fusion_engagement_pass`, and `disengaged_fusions` values returned by this
+phase. Write/update it before returning so a later interruption cannot erase an
+already accepted config win.
 
 ### Scope: service-level switches ONLY (GEMM tuning is NOT done here)
 You handle pure server-level env/flags that need NO op isolation. **GEMM tuning (aiter per-shape DB,

@@ -149,6 +149,10 @@ class SemanticShapeMergeTest(unittest.TestCase):
             self.assertEqual(rows[1]["semantic_evidence"]["level"], "P")
             self.assertEqual(
                 rows[1]["semantic_evidence"]["probe_scope"], "wrapper")
+            self.assertEqual(rows[1]["shape"]["input_dims"],
+                             [[4, 8], [16, 8], [4, 16]])
+            self.assertEqual(rows[1]["shape"]["input_types"],
+                             ["bf16", "fp8", "bf16"])
             linear = rows[1]["semantic_evidence"]["schema"]["linear_interface"]
             self.assertEqual(linear["M"]["value"], 4)
             self.assertEqual(linear["M"]["source"], "clean_trace")

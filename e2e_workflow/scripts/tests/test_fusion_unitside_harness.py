@@ -288,6 +288,22 @@ class PhaseGeneralizationTest(unittest.TestCase):
         res = self._run([self._verdict("d0", isolated_speedup=0.9)])
         self.assertEqual(res["phase_generalization"]["open_gaps"], [])
 
+    def test_unrelated_candidate_in_other_phase_is_not_a_gap(self):
+        cands = self._cands()
+        cands["candidates"][1]["existing_apis"] = [
+            {"name": "aiter unrelated_prefill_fusion"}]
+        with tempfile.TemporaryDirectory() as tmp:
+            cpath = os.path.join(tmp, "c.json")
+            with open(cpath, "w") as fh:
+                json.dump(cands, fh)
+            vdir = os.path.join(tmp, "verdicts")
+            os.makedirs(vdir)
+            with open(os.path.join(vdir, "v.json"), "w") as fh:
+                json.dump(self._verdict("d0"), fh)
+            res = uh.validate(cpath, vdir, 1.0, require_coverage=False)
+        self.assertEqual(res["status"], "pass")
+        self.assertEqual(res["phase_generalization"]["open_gaps"], [])
+
 
 class CoverageGateTest(unittest.TestCase):
     """Recall, not precision: a candidate nobody benched must not render as done.

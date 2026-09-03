@@ -1278,6 +1278,21 @@ class MemberShapeGraftTest(FusionCandidateHarnessTest):
             self.assertEqual(
                 out["candidates"][0]["members"][0]["shape"]["input_dims"], [[1, 2]])
 
+    def test_empty_shape_placeholder_is_grafted_from_the_table(self):
+        payload = self._payload()
+        payload["candidates"][0]["members"][0]["shape"] = {
+            "input_dims": [], "input_types": []}
+        with tempfile.TemporaryDirectory() as root:
+            table = self._write(root, "table.json", self._table())
+            payload["environment_api_inventory_json"] = self._env(root)
+            cands = self._write(root, "cands.json", payload)
+            out, _, errors, _, metrics = harness.validate(table, cands)
+            self.assertEqual(errors, [])
+            self.assertEqual(metrics["member_shape_graft"]["grafted"], 2)
+            self.assertEqual(
+                out["candidates"][0]["members"][0]["shape"]["input_dims"],
+                [[8, 16]])
+
     def test_a_candidate_whose_rows_resolve_no_shape_is_an_error(self):
         # A table with NO shapes at all is caught earlier, by the phase entry gate.
         # This is the subtler one the entry gate cannot see: the table resolves

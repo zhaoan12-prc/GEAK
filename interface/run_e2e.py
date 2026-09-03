@@ -1397,6 +1397,7 @@ def normalize_result(h: dict, wf: dict) -> dict:
         # What the kernel phase actually did (req: report must carry this).
         "accepted_kernels": wf.get("accepted_kernels") or [],
         "accepted_heads": wf.get("accepted_heads") or [],
+        "accepted_fusions": wf.get("accepted_fusions") or [],
         "accepted_config": wf.get("accepted_config") or {},
         # Self-describing baseline measurement-protocol + Hyperloom cross-check (see baseline_basis above).
         "baseline_basis": baseline_basis,
@@ -1405,7 +1406,13 @@ def normalize_result(h: dict, wf: dict) -> dict:
         # Cold/hot speedup cross-checks (double-check only; see alignment_metrics above).
         # Does NOT change the promoted final_throughput_tok_s / throughput_speedup.
         "alignment_metrics": alignment_metrics,
-        "report_path": wf.get("report_path") or str(eval_dir / "final_report.md"),
+        # Never advertise a report which was not written (notably when a run is
+        # interrupted before Report/Validate and reconstructed from disk).
+        "report_path": next((str(p) for p in (
+            Path(str(wf.get("report_path"))) if wf.get("report_path") else None,
+            eval_dir / "final_report.md",
+            eval_dir / "architect_report.md",
+        ) if p is not None and p.is_file()), ""),
     }
 
 
@@ -1827,14 +1834,34 @@ def _recover_best_intermediate_win(eval_dir: Path) -> dict | None:
     ref_med = _ir_float(best, "ref_med", "ref_median_tok_s")
     final_tput = best_tput
     delta_pct = _ir_float(best, "e2e_delta_pct", "delta_pct")
-    speedup = (final_tput / ref_med) if ref_med > 0 else (1.0 + delta_pct / 100.0)
+    # ref_med is the CURRENT accepted stack at this candidate's A/B gate. It is
+    # not necessarily the original Setup baseline (e.g. a config win may already
+    # be banked). Preserve the original denominator whenever it is on disk.
+    baseline_summary = _read_json(eval_dir / "baseline" / "bench_summary.json")
+    original_baseline = _positive_finite_float(
+        baseline_summary.get("output_throughput_tok_s_median")
+        or baseline_summary.get("throughput_tok_s_median")
+    ) or ref_med
+    speedup = ((final_tput / original_baseline) if original_baseline > 0
+               else (1.0 + delta_pct / 100.0))
+
+    # ConfigSweep is required to persist this ledger. Recover its final complete
+    # config so a later accepted kernel does not make an interrupted run forget
+    # the config changes already present in the candidate's reference leg.
+    sweep = _read_json(eval_dir / "config" / "sweep_results.json")
+    recovered_flags = str(
+        sweep.get("accepted_flags")
+        or _ir_get(best, "apply_flags", "accepted_flags") or "")
+    recovered_env = str(
+        sweep.get("accepted_env")
+        or _ir_get(best, "apply_env", "accepted_env") or "")
     name = str(best.get("short_name") or "")
     # winner_kind in {"env","config","flags"} => config-only (no authored kernel).
     is_kernel = _ir_get(best, "winner_kind") not in ("env", "config", "flags")
     return {
         "eval_dir": str(eval_dir),
         "throughput_speedup": speedup,
-        "baseline_throughput_tok_s": ref_med,
+        "baseline_throughput_tok_s": original_baseline,
         "final_throughput_tok_s": final_tput,
         "output_parity": best.get("output_parity"),
         "validation_status": "recovered_intermediate",
@@ -1854,8 +1881,8 @@ def _recover_best_intermediate_win(eval_dir: Path) -> dict | None:
             # empty accepted_config and every downstream reuse (sweep /
             # conc_sweep) relaunches an UN-optimized server. General across every
             # env/flags/config winner, not model-specific.
-            "flags": str(_ir_get(best, "apply_flags", "accepted_flags") or ""),
-            "env": str(_ir_get(best, "apply_env", "accepted_env") or ""),
+            "flags": recovered_flags,
+            "env": recovered_env,
         },
         "accepted_kernels": (
             [{"short_name": name, "kind": "authored", "backend": "geak",
@@ -1863,6 +1890,10 @@ def _recover_best_intermediate_win(eval_dir: Path) -> dict | None:
             if is_kernel and name else []
         ),
         "accepted_heads": [],
+        "accepted_fusions": (
+            _read_json(eval_dir / "fusion" / "fusion_applyback.json")
+            .get("accepted_fusions") or []
+        ),
         "recovered_from_disk": True,
         "recovered_intermediate": True,
     }

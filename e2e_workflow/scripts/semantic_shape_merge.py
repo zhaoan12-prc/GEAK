@@ -869,6 +869,19 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir):
                             "runtime_probe_kernel"
                             if probe_scope == "kernel"
                             else "runtime_probe_wrapper"),
+                        # Publish P-level probe shapes through the same canonical
+                        # contract consumed by candidate grafting and unitside
+                        # provenance. `logger_schema` remains the rich evidence.
+                        "input_dims": [
+                            tensor.get("effective_shape") or tensor.get("shape")
+                            for tensor in evidence["schema"].get("tensors", [])
+                            if (tensor.get("effective_shape") or tensor.get("shape"))
+                        ],
+                        "input_types": [
+                            tensor.get("dtype") or "Tensor"
+                            for tensor in evidence["schema"].get("tensors", [])
+                            if (tensor.get("effective_shape") or tensor.get("shape"))
+                        ],
                         "logger_schema": evidence["schema"],
                     }
                 else:
