@@ -45,12 +45,26 @@ adapter_launch() {
     # Override with VLLM_PROFILE_WITH_STACK=true|false.
     local _stack="${VLLM_PROFILE_WITH_STACK:-false}"
     local _max_iters="${PROFILE_MAX_ITERS:-64}"
+    local _delay_iters="${PROFILE_DELAY_ITERS:-0}"
     if _geak_fusion_capture; then
       _stack="${VLLM_PROFILE_WITH_STACK:-true}"
       # vllm has no profile_by_stage, so ONE window must hold both phases. A saturated server
       # interleaves them, but one iteration (the sglang setting) would capture a single phase.
       # If Phase 1 reports a single phase, raise this.
       _max_iters="${GEAK_FUSION_MAX_ITERS:-16}"
+      # Skip this many engine iterations before the profiler actually starts.
+      #
+      # Landing the window in DECODE by wall-clock warmup is a race, and it is one you
+      # lose quietly: at ISL 8192 / CONC 64 the prefill ramp is ~32 steps, so a short
+      # warmup captures 24 iterations of pure prefill (Phase 1 then reports
+      # `mixed_trace_no_decode_steps_in_window`), while a warmup long enough to clear the
+      # ramp can outlive the background load entirely and fall back to a cold-start
+      # capture -- prefill again, by a different route. Both were observed on MiniMax-M3.
+      #
+      # delay_iterations counts ENGINE STEPS, so it clears the ramp deterministically
+      # regardless of how slow those steps are. Set it to at least
+      # ceil(CONC*ISL/max_num_batched_tokens) to skip the prefill ramp.
+      _delay_iters="${GEAK_FUSION_DELAY_ITERS:-$_delay_iters}"
     fi
     local _prof_fields
     _prof_fields="$(python3 - <<'PY' 2>/dev/null
@@ -80,7 +94,7 @@ PY
         echo "!!! fusion capture: this build's ProfilerConfig has no max_iterations; the window" >&2
         echo "!!! falls back to GEAK_FUSION_WINDOW_SEC timing (trace size is NOT iteration-bounded)" >&2
       fi
-      _has delay_iterations && _json="$_json,\"delay_iterations\":${PROFILE_DELAY_ITERS:-0}"
+      _has delay_iterations && _json="$_json,\"delay_iterations\":$_delay_iters"
       _has ignore_frontend  && _json="$_json,\"ignore_frontend\":true"
       # 0.26+: per-iteration prefill/decode annotation the parser uses for the phase split. Cheap.
       _has detailed_trace_annotation && _json="$_json,\"detailed_trace_annotation\":true"
