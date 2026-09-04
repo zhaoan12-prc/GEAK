@@ -593,6 +593,79 @@ class PhaseCoverageTest(unittest.TestCase):
             self.assertEqual(earlier["end"], later["ts"])
         self.assertTrue(all(s["scope_source"] == "declared_dispatch_op" for s in scopes))
 
+    @staticmethod
+    def _dispatch_rows(layers=2, per_layer=3, phase="decode"):
+        rows = []
+        for layer in range(layers):
+            for pos in range(per_layer):
+                rows.append({
+                    "row_id": "r%d-%d" % (layer, pos),
+                    "step_id": "step-0",
+                    "device_seq_index": layer * per_layer + pos,
+                    "layer_id": layer,
+                    "layer_instance_id": "step-0:pass-0:layer-%d" % layer,
+                    "layer_evidence": "declared_dispatch_op_span",
+                    "stage": ("attn", "gemm", "norm")[pos % 3],
+                    "assignment": "layer_body", "phase": phase,
+                })
+        return rows
+
+    def test_dispatch_scoped_rows_keep_their_ownership_verbatim(self):
+        """An exact op boundary must not be re-cut.
+
+        On fix/vllm a medoid refinement meant for module spans applied a PREFILL template
+        to a decode step and pushed the attention run into the previous segment -- the
+        decode P_full_attn representative came back with no `attn` kernel. Mainline's
+        partition only accepts scope ownership, so each layer must still open on its own
+        attention kernel.
+        """
+        rows = self._dispatch_rows()
+        doc = {"num_hidden_layers_main": 2, "patterns": [
+            {"pattern_id": "P0", "layer_ids": [0]},
+            {"pattern_id": "P1", "layer_ids": [1]}]}
+        diagnostics, _ = mapping._authoritative_layer_partition(rows, doc)
+        self.assertEqual(diagnostics[0]["status"], "mapped")
+        self.assertEqual(diagnostics[0]["mapped_event_count"], 6)
+        self.assertEqual(rows[0]["stage"], "attn")
+        self.assertEqual(rows[0]["boundary_role"], "body_start_kernel")
+        self.assertEqual(rows[2]["boundary_role"], "end_kernel")
+        self.assertEqual(rows[3]["stage"], "attn")
+        self.assertEqual(rows[3]["boundary_role"], "body_start_kernel")
+
+    def test_unclaimed_rows_before_the_first_layer_stay_global(self):
+        """An event no scope claimed is not folded into a neighbour.
+
+        Folding it in would inflate that layer's measured cost, which is the number the
+        fusion ranking is built on.
+        """
+        rows = self._dispatch_rows()
+        for row in rows:
+            row["device_seq_index"] += 1
+        rows.insert(0, {"row_id": "pre", "step_id": "step-0", "device_seq_index": 0,
+                        "layer_id": None, "layer_instance_id": None,
+                        "layer_evidence": "unresolved", "stage": "memory",
+                        "assignment": "transition_global", "phase": "decode"})
+        doc = {"num_hidden_layers_main": 2, "patterns": []}
+        diagnostics, _ = mapping._authoritative_layer_partition(rows, doc)
+        self.assertEqual(diagnostics[0]["status"], "mapped")
+        self.assertEqual(rows[0]["assignment"], "transition_global")
+        self.assertIsNone(rows[0]["layer_id"])
+
+    def test_unclaimed_row_inside_a_dispatch_scope_leaves_the_step_unresolved(self):
+        """Fail closed: a hole inside a layer breaks ownership contiguity.
+
+        fix/vllm tolerated this (the hole became transition_global and the step still
+        mapped). Mainline requires every authoritative instance to be contiguous, so the
+        step is reported boundary_unresolved instead. Pinned so that a real vLLM trace
+        which trips it is seen as this case, not as a regression elsewhere.
+        """
+        rows = self._dispatch_rows()
+        rows[1].update(layer_id=None, layer_instance_id=None,
+                       layer_evidence="unresolved", assignment="transition_global")
+        doc = {"num_hidden_layers_main": 2, "patterns": []}
+        diagnostics, _ = mapping._authoritative_layer_partition(rows, doc)
+        self.assertEqual(diagnostics[0]["status"], "boundary_unresolved")
+
     def test_dispatch_anchors_decline_when_a_pattern_declares_no_branch(self):
         """A layer kind with no anchor is the 6-of-24 defect; refuse, do not part-map.
 

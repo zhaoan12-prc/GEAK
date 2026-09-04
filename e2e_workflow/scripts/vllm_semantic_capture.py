@@ -28,6 +28,29 @@ kernel SEQUENCE but none of its SHAPES (`decode_evidence = sequence_only_shapes_
 GENERATION and the unit-side microbench cannot -- they need real dims to build tensors from.
 This probe supplies them by running the same workload with cuda graphs off.
 
+WHEN TO USE THIS AT ALL
+-----------------------
+⚠️ On vLLM >= 0.27 you probably should NOT. Two things were learned by running it:
+
+  1. These hooks are INCOMPATIBLE WITH torch.compile. They sit inside the compiled region,
+     and dynamo cannot trace `torch.autograd._profiler_enabled()` through a forward
+     pre-hook -- `aot_compile_fullgraph` raises during `profile_run` and the engine never
+     starts. So this module only works with `--enforce-eager`.
+  2. `--enforce-eager` disables torch.compile as well as cuda graphs, so the captured
+     shapes describe the UNFUSED graph. Measured against the production decode trace on
+     Qwen3.5-2B: 1113 vs 375 kernels per step, 13 kernels present in only one of them,
+     sequence similarity 0.063. Those shapes do not belong to the kernels being optimized.
+
+The supported way to get decode shapes on vLLM is instead
+`--compilation-config.cudagraph_mode=NONE` on the fusion capture (see
+roles/fusion_trace_collector.md): it stops graph REPLAY while keeping compilation, which
+restores the per-layer dispatch ops AND `record_shapes` dims at 0.989 sequence similarity
+to production -- no hooks, no shape log, no merge.
+
+This module remains for stacks where that does not apply: a build without per-layer
+dispatch ops, or a non-compiled runtime where the eager trace IS the production graph
+(sglang's case, which is what it was written for).
+
 CONTRACT
 --------
 - Installed as a lazy post-import hook (`overlay_setup.py add-hook --module
