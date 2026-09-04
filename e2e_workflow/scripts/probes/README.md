@@ -28,3 +28,14 @@ Edit the seam list in `install()` for the seam you are about to fuse. Running it
 candidate seam BEFORE authoring the real fusion is cheap and tells you whether the seam is
 reachable at all — see the measured table in `roles/fusion_integrator.md`, where the banner
 reported ENGAGED for a seam that never executed.
+
+## geak_engage_sentinel3.py
+
+Same question, but for code inside a **compiled** region. v1/v2 marked seams with
+`torch.profiler.record_function`; dynamo drops those from a compiled graph, so a missing
+marker could not distinguish "never ran" from "ran, inlined, marker elided". This version
+registers `geak::sentinel_mark`, a no-op custom op — opaque to dynamo, preserved as a call
+in the graph — and calls it from the patched seam. Now an absent marker IS conclusive.
+
+Use v3 whenever the seam is anywhere near a torch.compile region, which on vLLM is
+everything inside the model forward.
