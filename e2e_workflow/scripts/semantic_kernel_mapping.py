@@ -1364,6 +1364,51 @@ def _refine_cuts_with_stable_transition_context(runs, cuts, chain):
     return refined
 
 
+def _direct_scope_segments(step_rows, patterns):
+    """Keep the per-row layer assignment the scopes already made, verbatim.
+
+    Used when the scopes came from declared dispatch ops, whose boundaries are exact.
+    Rows outside any scope stay `transition_global` rather than being folded into a
+    neighbour -- an event that no layer claimed is real information (setup/teardown work
+    between layers), and inventing a home for it would inflate a layer's cost.
+    """
+    mapped, cuts = 0, []
+    by_instance = {}
+    for row in step_rows:
+        instance_id = row.get("layer_instance_id")
+        if (instance_id
+                and row.get("layer_evidence") == "declared_dispatch_op_span"):
+            by_instance.setdefault(instance_id, []).append(row)
+    if not by_instance:
+        return None
+    for row in step_rows:
+        if row.get("layer_instance_id") in by_instance:
+            continue
+        row["assignment"] = "transition_global"
+        row["layer_id"] = None
+        row["layer_instance_id"] = None
+        row["pattern_id"] = None
+        row["layer_evidence"] = "sequence_outside_layer"
+        row["layer_region"] = "transition_global"
+        row["boundary_role"] = None
+    for instance_id, group in sorted(
+            by_instance.items(), key=lambda item: item[1][0]["device_seq_index"]):
+        group.sort(key=lambda row: row["device_seq_index"])
+        pattern = patterns.get(group[0]["layer_id"]) or {}
+        for index, row in enumerate(group):
+            row["assignment"] = "layer_body"
+            row["pattern_id"] = pattern.get("pattern_id")
+            row["layer_region"] = "layer_body"
+            row["boundary_role"] = (
+                "body_start_kernel" if index == 0
+                else "end_kernel" if index == len(group) - 1 else None)
+        mapped += len(group)
+        cuts.append({"layer_id": group[0]["layer_id"],
+                     "body_start_event": group[0]["row_id"],
+                     "body_end_event": group[-1]["row_id"]})
+    return {"mapped": mapped, "cuts": cuts}
+
+
 def _module_guided_segments(
         step_rows, runs, patterns, core_templates, core_prefixes, layer_count):
     row_to_run = {}
@@ -1452,6 +1497,39 @@ def _stage_sequence_partition(rows, pattern_doc):
                 "observed_stage_run_count": len(runs),
             })
             continue
+        # A dispatch-op scope IS the boundary; do not re-cut it.
+        #
+        # `_module_guided_segments` exists because an `nn.Module` span opens at the
+        # module's PYTHON entry, which can precede the layer's first kernel, so the cut is
+        # refined against a stage-sequence medoid. A declared dispatch op has no such slack
+        # -- it is an exact operator boundary, and the device events under it were already
+        # attributed by External id.
+        #
+        # Refining it anyway actively corrupts the result: the medoid prefers PREFILL
+        # sequences, and applying a prefill template to a decode step moved the attention
+        # run into the previous segment. Measured on Qwen3.5-2B, the decode P_full_attn
+        # representative came back with 9 rows and no `attn` kernel at all -- caught by
+        # representative_pattern_plausibility, whose whole job is spotting a layer body
+        # that cannot be one.
+        dispatch_scoped = bool(module_instances) and all(
+            row.get("layer_evidence") == "declared_dispatch_op_span"
+            for row in step_rows
+            if row.get("layer_instance_id") in module_instances)
+        if len(module_instances) >= layer_count and dispatch_scoped:
+            direct = _direct_scope_segments(step_rows, patterns)
+            if direct:
+                diagnostics.append({
+                    "step_id": step_id,
+                    "status": "mapped",
+                    "partition_method": "declared_dispatch_op_span",
+                    "configured_layer_count": layer_count,
+                    "module_instance_count": len(module_instances),
+                    "observed_stage_run_count": len(runs),
+                    "mapped_event_count": direct["mapped"],
+                    "layer_boundaries": direct["cuts"],
+                    "boundary_reference": "declared_dispatch_op",
+                })
+                continue
         if len(module_instances) >= layer_count:
             guided = _module_guided_segments(
                 step_rows, runs, patterns, core_templates, core_prefixes,

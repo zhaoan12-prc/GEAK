@@ -597,6 +597,69 @@ class PhaseCoverageTest(unittest.TestCase):
             self.assertEqual(earlier["end"], later["ts"])
         self.assertTrue(all(s["scope_source"] == "declared_dispatch_op" for s in scopes))
 
+    def test_dispatch_scoped_rows_are_not_re_cut_by_the_medoid(self):
+        """An exact op boundary must survive the refinement meant for module spans.
+
+        `_module_guided_segments` re-cuts a step against a stage-sequence medoid because an
+        nn.Module span opens at the module's python entry, ahead of the layer's first
+        kernel. A dispatch op has no such slack. Refining it anyway CORRUPTS the result:
+        the medoid prefers prefill sequences, and on Qwen3.5-2B applying a prefill template
+        to a decode step pushed the attention run into the previous segment -- the decode
+        P_full_attn representative came back with no `attn` kernel at all.
+        """
+        rows = []
+        for layer in range(2):
+            for pos in range(3):
+                rows.append({
+                    "row_id": "r%d-%d" % (layer, pos),
+                    "device_seq_index": layer * 3 + pos,
+                    "layer_id": layer,
+                    "layer_instance_id": "step-0:pass-0:layer-%d" % layer,
+                    "layer_evidence": "declared_dispatch_op_span",
+                    "stage": ("attn", "gemm", "norm")[pos],
+                    "assignment": None, "phase": "decode",
+                })
+        patterns = {0: {"pattern_id": "P0"}, 1: {"pattern_id": "P1"}}
+        result = mapping._direct_scope_segments(rows, patterns)
+
+        self.assertEqual(result["mapped"], 6)
+        self.assertEqual([c["layer_id"] for c in result["cuts"]], [0, 1])
+        # The first row of each layer keeps its attention kernel -- the exact defect.
+        self.assertEqual(rows[0]["stage"], "attn")
+        self.assertEqual(rows[0]["boundary_role"], "body_start_kernel")
+        self.assertEqual(rows[2]["boundary_role"], "end_kernel")
+        self.assertTrue(all(r["assignment"] == "layer_body" for r in rows))
+        self.assertEqual([r["pattern_id"] for r in rows], ["P0"] * 3 + ["P1"] * 3)
+
+    def test_direct_segments_leave_unclaimed_rows_outside_any_layer(self):
+        """An event no scope claimed is evidence, not something to fold into a neighbour.
+
+        Folding it in would inflate that layer's measured cost, which is the number the
+        fusion ranking is built on.
+        """
+        rows = [
+            {"row_id": "pre", "device_seq_index": 0, "layer_id": None,
+             "layer_instance_id": None, "layer_evidence": "unresolved",
+             "stage": "memory", "assignment": None},
+            {"row_id": "in", "device_seq_index": 1, "layer_id": 0,
+             "layer_instance_id": "step-0:pass-0:layer-0",
+             "layer_evidence": "declared_dispatch_op_span", "stage": "attn",
+             "assignment": None},
+        ]
+        result = mapping._direct_scope_segments(rows, {0: {"pattern_id": "P0"}})
+        self.assertEqual(result["mapped"], 1)
+        self.assertEqual(rows[0]["assignment"], "transition_global")
+        self.assertEqual(rows[0]["layer_evidence"], "sequence_outside_layer")
+        self.assertIsNone(rows[0]["layer_id"])
+        self.assertEqual(rows[1]["assignment"], "layer_body")
+
+    def test_direct_segments_decline_when_no_dispatch_scope_is_present(self):
+        rows = [{"row_id": "a", "device_seq_index": 0, "layer_id": 0,
+                 "layer_instance_id": "s:pass-0:layer-0",
+                 "layer_evidence": "python_module_span_external_id",
+                 "stage": "attn", "assignment": None}]
+        self.assertIsNone(mapping._direct_scope_segments(rows, {}))
+
     def test_dispatch_anchors_decline_when_a_pattern_declares_no_branch(self):
         """A layer kind with no anchor is the 6-of-24 defect; refuse, do not part-map.
 
