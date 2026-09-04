@@ -133,6 +133,18 @@ class VllmProfilerConfigTest(unittest.TestCase):
         self.assertNotIn('"max_iterations":48', argv)
         self.assertIn('"detailed_trace_annotation":true', argv)
 
+    def test_fusion_capture_delays_by_engine_steps(self):
+        # GEAK_FUSION_DELAY_ITERS clears the prefill ramp in ENGINE STEPS; unset, the
+        # ordinary PROFILE_DELAY_ITERS (default 0) still applies.
+        self._run("adapter_launch", probe_fields=FIELDS_026,
+                  EXTRA_ENV="GEAK_FUSION_TRACE=1", GEAK_FUSION_DELAY_ITERS="45")
+        self.assertIn('"delay_iterations":45', self._argv())
+        self._run("adapter_launch", probe_fields=FIELDS_026, EXTRA_ENV="GEAK_FUSION_TRACE=1")
+        self.assertIn('"delay_iterations":0', self._argv())
+        self._run("adapter_launch", probe_fields=FIELDS_019,
+                  EXTRA_ENV="GEAK_FUSION_TRACE=1", GEAK_FUSION_DELAY_ITERS="45")
+        self.assertNotIn("delay_iterations", self._argv())
+
     def test_fusion_capture_without_max_iterations_warns(self):
         proc = self._run("adapter_launch", probe_fields=FIELDS_019,
                          EXTRA_ENV="GEAK_FUSION_TRACE=1")
