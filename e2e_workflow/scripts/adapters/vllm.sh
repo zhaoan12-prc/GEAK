@@ -110,6 +110,19 @@ adapter_launch() {
       # sglang setting) would capture one phase and silently halve coverage. If Phase 1
       # reports a single phase, raise this.
       _max_iters="${GEAK_FUSION_MAX_ITERS:-16}"
+      # Skip this many engine iterations before the profiler actually starts.
+      #
+      # Landing the window in DECODE by wall-clock warmup is a race, and it is one you
+      # lose quietly: at ISL 8192 / CONC 64 the prefill ramp is ~32 steps, so a short
+      # warmup captures 24 iterations of pure prefill (Phase 1 then reports
+      # `mixed_trace_no_decode_steps_in_window`), while a warmup long enough to clear the
+      # ramp can outlive the background load entirely and fall back to a cold-start
+      # capture -- prefill again, by a different route. Both were observed on MiniMax-M3.
+      #
+      # delay_iterations counts ENGINE STEPS, so it clears the ramp deterministically
+      # regardless of how slow those steps are. Set it to at least
+      # ceil(CONC*ISL/max_num_batched_tokens) to skip the prefill ramp.
+      _delay_iters="${GEAK_FUSION_DELAY_ITERS:-0}"
     fi
     local _fields
     if _fields="$(_vllm_profiler_fields)" && [ -n "$_fields" ]; then
@@ -119,6 +132,10 @@ adapter_launch() {
         && _json="$_json,\"torch_profiler_record_shapes\":true"
       _vllm_has_field "$_fields" torch_profiler_with_stack \
         && _json="$_json,\"torch_profiler_with_stack\":$_stack"
+      if [ -n "${_delay_iters:-}" ] && [ "${_delay_iters:-0}" -gt 0 ] \
+           && _vllm_has_field "$_fields" delay_iterations; then
+        _json="$_json,\"delay_iterations\":$_delay_iters"
+      fi
       if [ -n "$_max_iters" ] && _vllm_has_field "$_fields" max_iterations; then
         _json="$_json,\"max_iterations\":$_max_iters"
       elif [ -n "$_max_iters" ]; then

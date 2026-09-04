@@ -84,6 +84,22 @@ When `EXEC_PREFIX` is non-empty, run executable commands as
      - The capture is still a SEPARATE server from the measured one — cudagraph off changes
        throughput. It supplies structure and shapes only; timing comes from the production
        capture, and every fusion is still gated by an A/B on the untouched stack.
+       **Budget for it.** On MiniMax-M3 (60L MoE, TP8, gfx942) decode fell from ~410 to
+       ~18 tok/s with graph replay off — ~3.5 s per step. Size the capture workload for the
+       WINDOW, not for a throughput measurement: a short OSL and a small prompt count are
+       fine, because decode shapes depend on the batch, so only CONC has to match the
+       workload you are optimizing.
+     - **Warm past the prefill ramp before the window opens.** `PROFILE_WARMUP_SEC` must
+       exceed `ceil(CONC*ISL/chunk)` steps of ramp or the whole window lands in prefill.
+       Measured: at ISL 8192 / CONC 64 the ramp is ~32 steps, so a 25 s warmup produced a
+       24-iteration window with ZERO decode steps. Phase 1 reports that exactly —
+       `decode_evidence: mixed_trace_no_decode_steps_in_window` — which means the annotation
+       worked and the WINDOW was mis-placed; it is not the same as
+       `no_phase_annotation_in_trace`, and the fix is warmup, not a different capture mode.
+     - **with_stack is expensive at scale.** The same run wrote 8 x ~158 MB of gzipped trace
+       (1.2 GB) and the flush pinned every worker at 100% CPU for minutes after the profiler
+       self-stopped. Lower `GEAK_FUSION_MAX_ITERS` before anything else if the flush is
+       hurting; the layer boundaries need only a few complete steps.
    - Any other backend retains its existing adapter behavior.
 4. Select the clean steady production graph trace for benefit/timing evidence.
    Warmup/capture and metadata-only eager traces may supplement semantics, but
