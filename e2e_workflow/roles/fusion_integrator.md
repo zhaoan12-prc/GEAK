@@ -57,6 +57,47 @@ dir may be passed to STACK on top of.
 - **Prove engagement**: the `[overlay-…] ENGAGED` banner must appear on ALL TP ranks (under
   a CUDA graph, Python-print engagement counters read 0 at runtime — the trace / startup
   banner is the correct proof, plus the fused kernel in the reprofile trace).
+
+  **🔴 ON vLLM THE BANNER ALONE IS NOT PROOF, AND IT HAS BEEN MEASURED LYING.** The banner
+  only says a Python rebind happened. Whether that rebind reaches the executed code is a
+  separate question, and for the seam `kernel_extractor.md` names for vLLM the answer was no.
+
+  Measured on v0.27.1 / gfx942 / Qwen3.5-2B, wrapping three attributes of
+  `vllm.model_executor.layers.utils` with a numerically-inert `record_function` and looking
+  for each marker in the trace:
+
+  | rebound attribute | banner | in trace |
+  |---|---|---|
+  | `rocm_unquantized_gemm` (python wrapper) | ENGAGED | 12 CPU + 12 GPU annotations |
+  | `dispatch_unquantized_gemm` | ENGAGED | 12 CPU, 0 GPU |
+  | `rocm_unquantized_gemm_impl` (the actual kernel) | **ENGAGED** | **ABSENT — never ran** |
+
+  The cause is not subtle once seen: `direct_register_custom_op(op_func=..._impl)` captures
+  the function **by value at import time**. Rebinding the module attribute afterwards renames
+  a module global; `torch.ops.vllm.rocm_unquantized_gemm` still dispatches to the original.
+  Confirmed directly — after the rebind, calling the op invoked the replacement **0 times**.
+  And the compiled graph calls `torch.ops.*`, not the python wrapper, so wrapping the wrapper
+  catches only the handful of calls that still come from Python (12 here, against 244
+  `vllm::rocm_unquantized_gemm` in a production trace).
+
+  Consequences for apply-back on vLLM, all of them load-bearing:
+  1. **Never accept an attribute rebind of a `direct_register_custom_op` target as wired.**
+     Check whether the seam is a registered op before choosing it: `grep
+     direct_register_custom_op` next to the function.
+  2. **Re-registering the impl is not a drop-in either.** `torch.library.Library("vllm",
+     "FRAGMENT").impl("<op>", fn, "CUDA")` raises `RuntimeError: there's already a kernel
+     registered from python` — vLLM holds that dispatch key. Redirect above the op (its call
+     site / the owning `nn.Module`, patched BEFORE `load_model`, hence before compilation) or
+     take over the registration deliberately; do not assume either works without proving it.
+  3. **The proof is the MARKER IN THE TRACE, not the banner.** Wrap the candidate seam in a
+     uniquely-named `record_function`, reprofile, and require the name to appear with GPU
+     annotations under it. A banner with no marker means the overlay is inert, and an inert
+     overlay makes the A/B measure the baseline against itself — which reads as "no
+     regression" and can be mistaken for a safe change.
+  4. Torch-compile ordering also matters: a rebind that lands after the graph was captured is
+     inert for the same reason. vLLM caches compiled artifacts under
+     `~/.cache/vllm/torch_compile_cache`, so use `VLLM_DISABLE_COMPILE_CACHE=1` on candidate
+     servers rather than trusting that a cache entry was built with your overlay in place.
 - **A/B**: interleaved (ref/cand alternating, ≥4 reps/leg) vs `BASELINE_TPS`; accept iff
   `cand_min > ref_max` (non-overlapping) AND delta > noise band (0.5%). Report TTFT, TPOT,
   ITL, and output_throughput — decode-path fusions move TPOT/throughput, NOT TTFT
