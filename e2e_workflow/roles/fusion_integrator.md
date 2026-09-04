@@ -84,16 +84,46 @@ dir may be passed to STACK on top of.
   1. **Never accept an attribute rebind of a `direct_register_custom_op` target as wired.**
      Check whether the seam is a registered op before choosing it: `grep
      direct_register_custom_op` next to the function.
-  2. **Re-registering the impl is not a drop-in either.** `torch.library.Library("vllm",
-     "FRAGMENT").impl("<op>", fn, "CUDA")` raises `RuntimeError: there's already a kernel
-     registered from python` — vLLM holds that dispatch key. Redirect above the op (its call
-     site / the owning `nn.Module`, patched BEFORE `load_model`, hence before compilation) or
-     take over the registration deliberately; do not assume either works without proving it.
-  3. **The proof is the MARKER IN THE TRACE, not the banner.** Wrap the candidate seam in a
-     uniquely-named `record_function`, reprofile, and require the name to appear with GPU
-     annotations under it. A banner with no marker means the overlay is inert, and an inert
-     overlay makes the A/B measure the baseline against itself — which reads as "no
-     regression" and can be mistaken for a safe change.
+  2. **Re-registering the impl is not a drop-in, and neither is patching above it.**
+     `torch.library.Library("vllm","FRAGMENT").impl("<op>", fn, "CUDA")` raises
+     `RuntimeError: there's already a kernel registered from python` — vLLM holds that
+     dispatch key.
+     Patching ABOVE the op was then tested directly, with a marker that survives compilation
+     (a registered no-op custom op; `record_function` is DROPPED from a compiled graph, so an
+     absent record_function marker proves nothing — see probes/README.md). Wrapping
+     `UnquantizedLinearMethod.apply` on the class, before `load_model` and therefore before
+     compilation, produced **zero** markers. The same trace explains why:
+
+     | trace entry | count |
+     |---|---|
+     | `vllm::rocm_unquantized_gemm` (cpu_op) | 240 |
+     | `utils.py(122): rocm_unquantized_gemm_impl` (python_function) | 240 |
+     | `utils.py(209): rocm_unquantized_gemm` (python wrapper) | 12 |
+     | `geak::sentinel_mark` from the patched `apply` | **0** |
+
+     The compiled graph calls `torch.ops.vllm.*` directly; `apply` is not on the per-forward
+     path at all, and the ORIGINAL `_impl` is what runs, 240 times. So for a seam registered
+     with `direct_register_custom_op` there is no attribute anywhere on the call chain that a
+     rebind can reach.
+     What is left is to replace the module BEFORE it registers — `overlay_setup.py
+     add-module` injects a patched submodule under its dotted name ahead of the real import,
+     so the registration happens with your implementation. That is the mechanism to reach for
+     here; it is NOT yet proven on this seam, so prove it with the marker before trusting it.
+  3. **The proof is the MARKER IN THE TRACE, not the banner — and the marker must survive
+     compilation.** A `record_function` marker is fine for code that runs eagerly, but dynamo
+     ELIDES it from a compiled graph, so its absence there is ambiguous. Use a registered
+     custom op as the marker inside a compiled region (`scripts/probes/geak_engage_sentinel3.py`).
+     A banner with no marker means the overlay is inert, and an inert overlay makes the A/B
+     measure the baseline against itself — which reads as "no regression" and can be mistaken
+     for a safe change.
+
+  5. **Check what inductor already fused before proposing a fusion.** In that same trace, 216
+     of the 240 GEMMs were already inside
+     `triton_poi_fused__to_copy__unsafe_view_add_clone_mean_mul_pow_rocm_unquantized_gemm_rsqrt_silu_view_2`
+     — inductor had fused norm + GEMM + silu + add into ONE Triton kernel. A hand-authored
+     fusion that duplicates that wins nothing, and one that forces the op out of the fused
+     region can REGRESS by breaking it up. Grep the post-fusion trace for `triton_..._fused_...`
+     names covering your candidate's ops before spending a budget slot on it.
   4. Torch-compile ordering also matters: a rebind that lands after the graph was captured is
      inert for the same reason. vLLM caches compiled artifacts under
      `~/.cache/vllm/torch_compile_cache`, so use `VLLM_DISABLE_COMPILE_CACHE=1` on candidate
