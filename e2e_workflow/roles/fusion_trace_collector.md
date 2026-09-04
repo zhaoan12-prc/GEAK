@@ -89,13 +89,23 @@ When `EXEC_PREFIX` is non-empty, run executable commands as
        WINDOW, not for a throughput measurement: a short OSL and a small prompt count are
        fine, because decode shapes depend on the batch, so only CONC has to match the
        workload you are optimizing.
-     - **Warm past the prefill ramp before the window opens.** `PROFILE_WARMUP_SEC` must
-       exceed `ceil(CONC*ISL/chunk)` steps of ramp or the whole window lands in prefill.
-       Measured: at ISL 8192 / CONC 64 the ramp is ~32 steps, so a 25 s warmup produced a
-       24-iteration window with ZERO decode steps. Phase 1 reports that exactly —
-       `decode_evidence: mixed_trace_no_decode_steps_in_window` — which means the annotation
-       worked and the WINDOW was mis-placed; it is not the same as
-       `no_phase_annotation_in_trace`, and the fix is warmup, not a different capture mode.
+     - **Place the window with `GEAK_FUSION_DELAY_ITERS`, not with wall-clock warmup.**
+       It maps to `ProfilerConfig.delay_iterations`, which counts ENGINE STEPS, so it clears
+       the prefill ramp no matter how slow a step is. Set it to at least
+       `ceil(CONC*ISL/max_num_batched_tokens)`.
+       Both wall-clock attempts failed on MiniMax-M3, in opposite directions: a 25 s warmup
+       left all 24 captured iterations inside the ~32-step ramp, and a 180 s warmup outlived
+       the background load, so bench_e2e fell back to a fresh profiled bench that armed the
+       profiler at ITS start — prefill again. With `GEAK_FUSION_DELAY_ITERS=45` and
+       `PROFILE_WARMUP_SEC=0` the window landed on 12 steps, all decode.
+       When a window IS mis-placed, Phase 1 says so precisely:
+       `decode_evidence: mixed_trace_no_decode_steps_in_window` means the annotation worked
+       and only the window was wrong — not the same as `no_phase_annotation_in_trace`, and
+       not a reason to change capture mode.
+     - **One phase per capture is normal here, and fine.** A delayed window lands entirely
+       in decode; an undelayed one entirely in prefill. Phase 1 accepts either
+       (`status: pass` with only that phase's tables), so capture the phase you need — or
+       capture twice — rather than trying to tune one window to straddle both.
      - **with_stack is expensive at scale.** The same run wrote 8 x ~158 MB of gzipped trace
        (1.2 GB) and the flush pinned every worker at 100% CPU for minutes after the profiler
        self-stopped. Lower `GEAK_FUSION_MAX_ITERS` before anything else if the flush is
