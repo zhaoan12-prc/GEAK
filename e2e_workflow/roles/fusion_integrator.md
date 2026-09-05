@@ -105,10 +105,36 @@ dir may be passed to STACK on top of.
      path at all, and the ORIGINAL `_impl` is what runs, 240 times. So for a seam registered
      with `direct_register_custom_op` there is no attribute anywhere on the call chain that a
      rebind can reach.
-     What is left is to replace the module BEFORE it registers — `overlay_setup.py
-     add-module` injects a patched submodule under its dotted name ahead of the real import,
-     so the registration happens with your implementation. That is the mechanism to reach for
-     here; it is NOT yet proven on this seam, so prove it with the marker before trusting it.
+     **The mechanism that DOES work is the one the original pipeline already uses.**
+     `overlay_setup.py add-module` injects a patched submodule under its dotted name from
+     sitecustomize, i.e. BEFORE anything imports it, so `direct_register_custom_op` registers
+     YOUR implementation, from-imports copy YOUR names, and torch.compile traces YOUR code.
+     All three barriers are bypassed by construction. This is what `e2e_integrator.md`'s
+     **patch** winner_kind has always done; the fusion path diverged from it by choosing a
+     lazy attribute rebind, and that divergence is what fails on vLLM.
+
+     Measured on the same seam (v0.27.1 / gfx942 / Qwen3.5-2B), shadowing
+     `vllm.model_executor.layers.utils` with a copy whose `rocm_unquantized_gemm_impl` calls a
+     marker op:
+
+     | trace entry | count |
+     |---|---|
+     | `vllm::rocm_unquantized_gemm` | 240 |
+     | `geak::sentinel_mark` (from the patched impl) | **240** |
+     | `_patched/…utils.py(140): rocm_unquantized_gemm_impl` | 240 |
+     | the ORIGINAL `utils.py(122)` impl | **0 — gone** |
+
+     Inductor's `triton_poi_fused_…` kernel still fired 216 times, so shadowing the module did
+     not cost the existing fusion.
+
+     **The eager-import cost is real but was measured, not fatal.** `add-module` execs the
+     shadowed module body at interpreter startup, which is the pattern this file warns HANGS
+     TP=8 init — so it was tested: Qwen3.5-2B at **TP8** with this overlay reached
+     `Server up after ~245s`, 11 shadow banners (API server + engine + 8 workers), NCCL up,
+     CUDA graphs captured, and benched at 670.3 tok/s. Distributed init did not hang.
+     That result is for a leaf-ish layers module; a shadowed module that pulls the distributed
+     stack in at import could still deadlock, so keep the shadow as NARROW as possible (one
+     submodule, never a package subtree) and re-check the banner count equals ranks+2.
   3. **The proof is the MARKER IN THE TRACE, not the banner — and the marker must survive
      compilation.** A `record_function` marker is fine for code that runs eagerly, but dynamo
      ELIDES it from a compiled graph, so its absence there is ambiguous. Use a registered
