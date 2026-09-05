@@ -30,11 +30,41 @@ dir may be passed to STACK on top of.
    - Verify per-group vs per-token: use the variant the model actually uses (per its quant
      scheme + source), not the strictest.
 
-3. **Author a reversible overlay (NOT a source edit).** Write a `sitecustomize.py` that:
-   - **Lazy-loads** — a `sys.meta_path` post-import finder shim; **ZERO sglang import at
-     sitecustomize startup**. Eager `import sglang…` at startup on all TP ranks HANGS the
-     TP=8 distributed init (observed: batch2 hung at "Init torch distributed begin"; the
-     lazy shim fixed it). Patch only after the target module is naturally imported.
+3. **Author a reversible overlay (NOT a source edit). PICK THE MECHANISM BY WHETHER IT CAN
+   REACH THE SEAM — this is backend-dependent and getting it wrong fails SILENTLY.**
+
+   There are two mechanisms and they are not interchangeable:
+
+   | | how | reaches | cost |
+   |---|---|---|---|
+   | **lazy rebind** | `sys.meta_path` post-import finder rebinds an attribute AFTER the module imports | attributes still looked up at call time | nothing imported at startup |
+   | **`add-module`** | `overlay_setup.py add-module` injects a patched submodule under its dotted name from sitecustomize, BEFORE anything imports it | everything, including registration-time captures | execs that module body at startup |
+
+   **Choose by the seam, not by habit:**
+   - The seam is registered with `direct_register_custom_op` (`grep direct_register_custom_op`
+     next to the function), OR its callers use `from … import <name>`, OR it is called from
+     inside a `torch.compile` region → **`add-module` is the only thing that works.** A lazy
+     rebind is inert at every level of such a chain; measured 0 calls (see the tables under
+     "Prove engagement").
+   - Otherwise (a plain method/function resolved per call, no registration) → lazy rebind is
+     fine and is the cheaper choice.
+
+   **On sglang, prefer lazy.** Eager `import sglang…` at sitecustomize startup on all TP ranks
+   HANGS TP=8 distributed init (observed: batch2 hung at "Init torch distributed begin"; the
+   lazy shim fixed it). Patch only after the target module is naturally imported.
+
+   **On vLLM, `add-module` is normally required and its startup cost was measured, not
+   assumed.** Nearly every interesting seam sits inside the compiled model, and vLLM's V1
+   engine compiles by default. Qwen3.5-2B at **TP8** with an `add-module` overlay on
+   `vllm.model_executor.layers.utils` reached `Server up after ~245s` with 11 shadow banners
+   (API server + engine + 8 workers), NCCL up and CUDA graphs captured — distributed init did
+   NOT hang. Keep the shadow to **ONE submodule** (never a package subtree — that shadows the
+   whole install) and assert the banner count equals **ranks + 2**; a module that pulls the
+   distributed stack in at import could still deadlock, and a short banner count is how you
+   would see it.
+
+   This is the same mechanism `e2e_integrator.md`'s **patch** winner_kind has always used. The
+   fusion path originally mandated lazy for every backend, which is why it fails on vLLM.
    - Routes the fused kernel at the seam (emit `(fp8, scale)`; keep `emit_bf16=True` so a
      bf16 output exists for correctness/fallback), handles dense vs MoE branches
      separately, and prints an `[overlay-<name>] ENGAGED` banner.
