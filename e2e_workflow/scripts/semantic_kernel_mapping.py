@@ -158,7 +158,7 @@ def _cpu_step_at(ts, spans, starts):
     return None
 
 
-STAGE_RULESET_VERSION = "semantic-stage-v2"
+STAGE_RULESET_VERSION = "semantic-stage-v3"
 STAGE_RULES = (
     ("communication.collective", "communication",
      r"all.?reduce|reduce.?scatter|all.?gather|nccl|rccl|quickreduce|cross_device"),
@@ -189,6 +189,16 @@ def _stage_detail(name, category, parent_name=""):
     parent_value = parent_name.lower()
     if re.search(r"gated.?delta|linear.?attention|causal.?conv", parent_value):
         return "linear_attn", "attention.linear.parent", "parent_operator"
+    # The kernel-name rules key off names like fmha/paged/mla_. A backend whose
+    # kernel is generically named slips through: vLLM's TRITON_ATTN launches
+    # `_fwd_kernel` under `vllm::unified_attention_with_output`, and that landed
+    # as `unknown` -- so the model's LARGEST prefill row (298.5us on Qwen3.5-2B)
+    # was not a donor, and Phase 2.1's escalation gate then demanded a fusion
+    # candidate for the attention operator itself. The parent op is authoritative
+    # evidence: it is the registered op the kernel actually ran under.
+    if re.search(r"unified.?attention|attention.?with.?output|paged.?attention"
+                 r"|flash.?attn|fmha", parent_value):
+        return "attn", "attention.full.parent", "parent_operator"
     return "unknown", "unresolved", "unresolved"
 
 
