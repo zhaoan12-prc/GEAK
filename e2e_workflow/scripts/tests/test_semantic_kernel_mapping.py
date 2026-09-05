@@ -715,6 +715,32 @@ class PhaseCoverageTest(unittest.TestCase):
     # ------------------------------------------------------------------ #
     # required stages per declared attention type
     # ------------------------------------------------------------------ #
+    def test_generically_named_attention_kernel_resolves_from_its_parent_op(self):
+        """vLLM's TRITON_ATTN launches `_fwd_kernel`, which matches no name rule.
+
+        It landed as `unknown`, so the LARGEST prefill row on Qwen3.5-2B (298.5 us, the
+        attention operator itself) was not a donor -- and Phase 2.1's escalation gate then
+        demanded a fusion candidate for the model's own attention. The parent op is
+        authoritative: it is the registered op the kernel ran under.
+        """
+        stage, rule, source = mapping._stage_detail(
+            "_fwd_kernel", "kernel", "vllm::unified_attention_with_output")
+        self.assertEqual(stage, "attn")
+        self.assertEqual(source, "parent_operator")
+        self.assertEqual(rule, "attention.full.parent")
+
+    def test_parent_op_fallback_still_prefers_linear_attention(self):
+        stage, _rule, _src = mapping._stage_detail(
+            "chunk_fwd_kernel", "kernel", "ChunkGatedDeltaRuleFunction")
+        self.assertEqual(stage, "linear_attn")
+
+    def test_kernel_name_rules_still_win_over_the_parent(self):
+        # A kernel whose own name is conclusive must not be re-decided by its parent.
+        stage, _rule, source = mapping._stage_detail(
+            "kernel_paged_attention_2d", "kernel", "ChunkGatedDeltaRuleFunction")
+        self.assertEqual(stage, "attn")
+        self.assertEqual(source, "kernel_name")
+
     def test_linear_attention_pattern_does_not_require_an_attn_kernel(self):
         """A gated-delta layer emits linear_attn, never attn.
 

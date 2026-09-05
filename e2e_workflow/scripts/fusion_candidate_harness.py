@@ -39,7 +39,15 @@ API_SOURCE_KIND = {
 # write) and must not be silently dropped into a fusion_opportunity=false stage.
 DONOR_STAGES = {
     "gemm", "attn", "attention", "communication", "collective",
-    "moe", "expert_gemm"}
+    "moe", "expert_gemm",
+    # `linear_attn` is the MAIN COMPUTE of a gated-delta / Mamba / linear-attention
+    # layer -- an anchor in exactly the sense `attn` is, not a helper that fusion
+    # could absorb. Leaving it out made the escalation gate demand fusion candidates
+    # for the model's own attention: on Qwen3.5-2B every ChunkGatedDeltaRuleFunction
+    # row (40-94us each) was counted as a helper "dropped without a candidate".
+    # Same blind spot as `_required_stages` had in semantic_kernel_mapping: the
+    # codebase encoded "attention == attn" and breaks where it is not.
+    "linear_attn"}
 # Helper rows at or above this duration may not vanish: each must be a candidate
 # member or a deferred required_followups[].row_ids entry.
 DEFAULT_HELPER_FLOOR_US = 5.0

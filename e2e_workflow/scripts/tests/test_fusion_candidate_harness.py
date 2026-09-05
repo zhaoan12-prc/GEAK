@@ -183,6 +183,23 @@ class FusionCandidateHarnessTest(unittest.TestCase):
             }],
         }
 
+    def test_linear_attention_is_a_donor_not_a_fusable_helper(self):
+        """A gated-delta / Mamba layer's main compute is an anchor, like attn.
+
+        Leaving `linear_attn` out of DONOR_STAGES made the escalation gate demand fusion
+        candidates for the model's own attention: on Qwen3.5-2B every
+        ChunkGatedDeltaRuleFunction row (40-94 us each) counted as a helper "dropped
+        without a candidate", and the reported fusible surface was 5.5x too large because
+        it included the donors.
+        """
+        self.assertIn("linear_attn", harness.DONOR_STAGES)
+        for stage in ("gemm", "attn", "attention", "moe", "expert_gemm",
+                      "collective", "communication"):
+            self.assertIn(stage, harness.DONOR_STAGES)
+        # helpers must stay helpers
+        for stage in ("elementwise", "norm", "activation", "quant", "kv_cache"):
+            self.assertNotIn(stage, harness.DONOR_STAGES)
+
     def test_cited_api_gate_backfills_inventory_and_warns_on_spread(self):
         with tempfile.TemporaryDirectory() as tmp:
             env_path = self._write(tmp, "env.json", {
