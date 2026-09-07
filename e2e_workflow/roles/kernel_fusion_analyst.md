@@ -230,12 +230,26 @@ For every proposed chain:
 - Prefer contiguous `pos` and `device_seq_index`.
 - A non-contiguous or cross-layer plan requires explicit runtime-source
   producer/consumer evidence; otherwise omit it and add a follow-up request.
-- A row with `U` evidence may locate an opportunity but makes the candidate
-  `blocked_evidence`.
-- A Shape-sensitive plan using `P` evidence whose bucket does not exactly match
-  the Clean Trace bucket is `blocked_shape`, not implementation-ready.
+- `U` evidence does **not** automatically block a candidate. Missing exact
+  shape/type/wrapper metadata is an observability gap, especially for Decode
+  under CUDA Graph; keep the candidate and use
+  `needs_source_dependency_proof` (or `research_only` for an author-track
+  idea). Its estimated benefit is provisional and must be validated before
+  apply-back.
+- Reserve `blocked_evidence` for a chain whose only support is Kernel adjacency,
+  or whose ownership mappings conflict: there is no stable semantic region,
+  anchor/family match, runtime-source dependency, or source-code dependency
+  evidence that explains why these members belong together. One unresolved
+  member must not block an otherwise anchored chain merely because its wrapper,
+  shape, or dtype is absent.
+- A Shape-sensitive plan using `P` evidence whose observed bucket contradicts
+  the Clean Trace bucket is `blocked_shape`. A missing shape/type alone is
+  `needs_source_dependency_proof`, not `blocked_shape`; do not invent an Exact
+  API match until the missing fields are validated.
 - A broad layer wrapper is containment evidence, not proof that two adjacent
-  Kernels exchange the same Tensor.
+  Kernels exchange the same Tensor. It may support a provisional candidate when
+  combined with a stable semantic region/anchor, but it cannot support an Exact
+  API claim, precise shape, weight identity, or `already_engaged` decision.
 - Main GEMM, Attention, MoE, and Collective Kernels are donors/anchors unless
   the plan explicitly replaces them. Their full duration is never counted as
   removable benefit merely because they appear in the chain.
@@ -257,7 +271,11 @@ Allowed readiness:
 - `research_only`
 
 Readiness never controls whether a plausible candidate appears in the Phase
-2.1 report. It controls only its label.
+2.1 report. It controls its label and whether it is actionable in Phase 2.2.
+`needs_source_dependency_proof` remains actionable so incomplete Decode
+metadata cannot empty the Top-K; the follow-up proof must be carried into the
+execution plan. Only `blocked_evidence` and `blocked_shape` are excluded from
+the actionable board.
 
 ### 4. Inspect implementation reality
 
