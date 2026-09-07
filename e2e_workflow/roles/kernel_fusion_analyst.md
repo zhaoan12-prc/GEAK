@@ -971,6 +971,17 @@ The ranker now emits, alongside the ranked table:
   `candidate_ids` it stands for. **UnitSide and KernelFusion apply-back are accounted
   against this list**: every entry must end `applied`, `blocked`, or
   `deferred_with_reason`. Not being mentioned is a coverage hole, not a skip.
+- `subsumed_by` / `ladder_top` / `subsumes` / `unit_cost` — the ladder. A row whose
+  removable-row set is a strict SUBSET of another surviving row's is a lower rung of
+  the same ladder (AR+norm inside AR+norm+quant). Both rows stay on the board — the
+  cheap/partial vs costly/fuller tradeoff is real and the reader decides it — but
+  **unit-side budget is charged to ladder TOPS only** (`unit_cost: 1`); a subsumed
+  rung rides its top's microbench, which already exercises every row it would remove.
+  On DSR1 2026-09-03 two rungs of one ladder ate 8 of 10 unit-side slots and the
+  ★★★-prior oproj fusion at e04 never got benched at all. This pruning is sound
+  unit-side ONLY: at apply-back the integrator DESCENDS the ladder rung by rung,
+  because a superset winning e2e does not mean the subset is worse (measured:
+  superset −0.45%, subset +1.65%, same run).
 - `exclusive_groups` — overlap is reported as a pairwise CONFLICT GRAPH, not as
   an equivalence class. `choose: 1` is claimed only when every pair in the group
   genuinely conflicts; otherwise `choose: "compatible_subset"` with the actual
@@ -996,13 +1007,18 @@ not a per-model constant.
 ## Return JSON
 
 For `PHASE=rank_topk`, return the board path and copy the deterministic
-`execution_list` into StructuredOutput so the filesystem-less workflow can iterate
-the concrete candidate ids:
+`execution_list` into StructuredOutput **verbatim** so the filesystem-less workflow can
+iterate the concrete candidate ids. Copy every field the ranker emitted, including
+`subsumed_by` / `ladder_top` / `subsumes` / `unit_cost` — dropping them silently
+reverts unit-side scheduling to flat board order:
 
 ```json
 {"status":"pass|partial|failed","round":"fusion_capture",
  "fusion_topk_json":"<absolute path>","fusion_topk_md":"<absolute path>",
- "execution_list":[{"exec_id":"e01","candidate_ids":["c0"]}],
+ "execution_list":[{"exec_id":"e01","candidate_ids":["c0"],
+                   "subsumed_by":null,"ladder_top":null,"subsumes":["e04"],"unit_cost":1},
+                  {"exec_id":"e04","candidate_ids":["c7"],
+                   "subsumed_by":"e01","ladder_top":"e01","subsumes":[],"unit_cost":0}],
  "notes":"..."}
 ```
 

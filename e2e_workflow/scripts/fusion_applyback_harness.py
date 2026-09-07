@@ -275,6 +275,19 @@ def validate(topk_path, apply_path, unitside_path=None, budget=None,
                 reason = "单侧 gate: " + "; ".join(
                     "%s (%s)" % (u[0], u[1]) for u in unit_states[:2])
                 source = "unitside"
+            elif unit_states and all(
+                    u[0] in ("budget_skipped", "not_validated", "fail", "blocked")
+                    for u in unit_states):
+                # NEVER MEASURED is not a verdict. It must not inherit `blocked`
+                # (which reads as "we looked and it lost") and it must not be
+                # laundered into the tidy `deferred_budget` row either -- the
+                # unit-side budget ran out, so nobody knows what this fusion does.
+                disposition = "unaccounted"
+                reason = ("单侧 never measured it (%s) — no evidence either way; "
+                          "raise fusion_unitside_budget or hang it off a passing "
+                          "ladder top" % "; ".join(
+                              "%s: %s" % (u[0], u[1]) for u in unit_states[:2]))
+                source = "unitside_gap"
             elif conflicts.get(exec_id, set()) & applied_ids:
                 disposition = "blocked_by_exclusion"
                 reason = ("conflicts with applied %s"

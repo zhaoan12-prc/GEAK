@@ -403,6 +403,49 @@ def rank(candidates_path, validation_path, semantic_table_path, top_k,
         # and the reader saw a table with no denominator on it.
         truncated = actions[top_k:]
         actions = actions[:top_k]
+    # ---- subsumption ladder ---------------------------------------------
+    # A fusion whose removable-row set is a STRICT SUBSET of another surviving
+    # row's set is a rung BELOW it on the same ladder: AR+norm sits inside
+    # AR+norm+quant. Both rows stay on the board (the tradeoff is real and the
+    # reader must see it), but they must not each pay for their own unit-side
+    # microbench slot. On DSR1 2026-09-03 e01(AR+norm, 4 cands) and e02(
+    # AR+norm+quant, 4 cands) burned 8 of the 10 unit-side slots proving
+    # overlapping halves of one ladder, and e04 -- the oproj flatten-quant
+    # fusion carrying a ★★★ prior with two measured e2e confirms -- never got
+    # a slot at all. Unit-side, the superset's microbench exercises every row
+    # the subset would have; the subset inherits its coverage. (This is sound
+    # ONLY unit-side. At apply-back a superset that wins does NOT prove the
+    # subset is worse -- 2026-09-03 measured the AR+norm+quant superset at
+    # -0.45% while AR+norm delivered +1.65% -- so the integrator descends the
+    # ladder rung by rung instead of pruning it.)
+    #
+    # Link to the MINIMAL strict superset so the ladder descends one rung at a
+    # time; ties break deterministically on (set size, benefit, board order).
+    by_index = list(enumerate(actions))
+    for i, a in by_index:
+        ka = a["removable_key"]
+        if not ka:
+            a["_subsumed_by_index"] = None
+            continue
+        supersets = [
+            (len(b["removable_key"]), -(b["forward_pct"] or 0.0), j)
+            for j, b in by_index
+            if j != i and b["phase"] == a["phase"]
+            and b["removable_key"] and ka < b["removable_key"]]
+        a["_subsumed_by_index"] = min(supersets)[2] if supersets else None
+    # A chain a < b < c must not let b claim coverage from c while a claims it
+    # from b and nothing anchors the chain: resolve each row to the TOP of its
+    # ladder for cost accounting, and keep the one-rung link for descent.
+    for i, a in by_index:
+        seen_chain = {i}
+        top = a["_subsumed_by_index"]
+        while top is not None and actions[top]["_subsumed_by_index"] is not None:
+            if top in seen_chain:  # defensive: strict subset can't cycle
+                break
+            seen_chain.add(top)
+            top = actions[top]["_subsumed_by_index"]
+        a["_ladder_top_index"] = top
+
     for a in actions + truncated + deferred_author:  # drop unserializable key
         a.pop("removable_key", None)
 
@@ -429,6 +472,22 @@ def rank(candidates_path, validation_path, semantic_table_path, top_k,
             "required_disposition": [
                 "applied", "blocked", "deferred_with_reason"],
         })
+    exec_ids = [e["exec_id"] for e in exec_list]
+    for entry, a in zip(exec_list, actions):
+        sub_idx = a.pop("_subsumed_by_index", None)
+        top_idx = a.pop("_ladder_top_index", None)
+        entry["subsumed_by"] = exec_ids[sub_idx] if sub_idx is not None else None
+        entry["ladder_top"] = exec_ids[top_idx] if top_idx is not None else None
+        entry["subsumes"] = []
+        # Unit-side budget is charged to LADDER TOPS only: a subsumed rung is
+        # covered by its top's microbench and must be recorded downstream as
+        # subsumed_pass (covered) or promoted to its own slot if the top FAILS
+        # -- never silently dropped and never laundered as a waiver.
+        entry["unit_cost"] = 0 if top_idx is not None else 1
+    by_exec = {e["exec_id"]: e for e in exec_list}
+    for entry in exec_list:
+        if entry["subsumed_by"]:
+            by_exec[entry["subsumed_by"]]["subsumes"].append(entry["exec_id"])
 
     # Mutual exclusion becomes an explicit DECIDE-ONE group instead of a ✳ in a
     # column. The reader still chooses; what changes is that not choosing is now
@@ -628,17 +687,36 @@ def _render_execution_list(result):
         "下面每一条都必须在 3.0 单侧 / 3.1 apply-back 里有明确结论："
         "**已落地 / 被挡（原因）/ 延后（原因）**。没提到 = 覆盖漏洞，不是「跳过」。")
     lines.append("")
-    lines.append("| exec | 阶段 | 难度 | 动作 | 候选 ID | 收益 | 互斥组 |")
-    lines.append("|:--|:--:|:--:|---|---|---:|:--:|")
+    lines.append("| exec | 阶段 | 难度 | 动作 | 候选 ID | 收益 | 互斥组 | 阶梯 |")
+    lines.append("|:--|:--:|:--:|---|---|---:|:--:|:--|")
     for entry in exec_list:
-        lines.append("| `%s` | %s | **%s** | %s | %s | %s | %s |" % (
+        if entry.get("subsumed_by"):
+            ladder = "⊂ `%s`（单侧由其覆盖）" % entry["subsumed_by"]
+        elif entry.get("subsumes"):
+            ladder = "⊃ %s（单侧代测）" % ", ".join(
+                "`%s`" % c for c in entry["subsumes"])
+        else:
+            ladder = "-"
+        lines.append("| `%s` | %s | **%s** | %s | %s | %s | %s | %s |" % (
             entry["exec_id"], entry["phase"].capitalize(), entry["tier"],
             _esc(entry["action"]),
             ", ".join("`%s`" % c for c in entry["candidate_ids"]) or "-",
             ("%.2f%%" % entry["forward_pct"])
             if entry.get("forward_pct") is not None else "n/a",
-            entry.get("exclusive_group") or "-"))
+            entry.get("exclusive_group") or "-", ladder))
     lines.append("")
+    if any(e.get("subsumed_by") for e in exec_list):
+        lines.append(
+            "> **阶梯（⊂/⊃）**：可去除行集合是严格子集的行 = 同一阶梯上更低的一级"
+            "（AR+norm 内含于 AR+norm+quant）。**单侧**只给阶梯顶端行扣预算，"
+            "顶端 microbench 已经跑过子集的每一行，子集记 `subsumed_pass`；"
+            "顶端单侧**失败**时子集必须补一个自己的单侧名额，不得当作已覆盖。")
+        lines.append(
+            "> **apply-back 不做这种剪枝**：超集赢不代表子集更差"
+            "（2026-09-03 实测 AR+norm+quant −0.45%，而 AR+norm +1.65%）。"
+            "3.1 从阶梯顶端往下逐级测，失败/落在噪声带内就降一级；"
+            "带 ★★★ 先验且有实测 e2e 的子集一律单独跑一条边际 A/B。")
+        lines.append("")
     for group in result.get("exclusive_groups") or []:
         if group.get("choose") == 1:
             lines.append(

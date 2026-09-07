@@ -479,5 +479,90 @@ class CoverageGateTest(unittest.TestCase):
             self.assertEqual(res["counts"]["deferred_rank_budget"], 2)
 
 
+class BudgetVsSubsumptionTest(unittest.TestCase):
+    """Running out of budget and being covered by a ladder top are OPPOSITES.
+
+    Regression for DSR1 2026-09-03: 17 budget overruns were passed in as
+    `--waive`, rendered `waived`, dropped out of the unvalidated set, and
+    coverage reported complete over a board where the ★★★-prior oproj candidate
+    had never been measured. 「没测」不得渲染成「测过了」."""
+
+    _cands = CoverageGateTest._cands
+    _verdict = CoverageGateTest._verdict
+    _run = CoverageGateTest._run
+    _status = CoverageGateTest._status
+    _reason = CoverageGateTest._reason
+
+    def test_budget_skipped_counts_as_not_covered_and_fails(self):
+        res = self._run(self._cands(2), [self._verdict("c0")],
+                        budget_skipped={"c1": "unit-side budget 1 exhausted"},
+                        require_phase_generalization=False)
+        self.assertEqual(res["status"], "fail")
+        self.assertEqual(self._status(res, "c1"), "budget_skipped")
+        self.assertFalse(res["coverage"]["complete"])
+        self.assertEqual(res["coverage"]["budget_skipped"], 1)
+        self.assertEqual(res["coverage"]["not_validated"], 1)
+        self.assertIn("c1", res["coverage"]["not_validated_ids"])
+        # and it is NOT quietly counted as a waiver
+        self.assertEqual(res["coverage"]["waived"], 0)
+
+    def test_a_waiver_cannot_launder_a_budget_skip(self):
+        # Same candidate presented BOTH ways: the skip wins, loudly.
+        res = self._run(self._cands(2), [self._verdict("c0")],
+                        waivers={"c1": "past budget"},
+                        budget_skipped={"c1": "budget exhausted"},
+                        require_phase_generalization=False)
+        self.assertEqual(self._status(res, "c1"), "budget_skipped")
+        self.assertEqual(res["status"], "fail")
+
+    def test_subsumed_pass_is_covered_without_its_own_microbench(self):
+        res = self._run(self._cands(2), [self._verdict("c0")],
+                        subsumed={"c1": "e01"},
+                        require_phase_generalization=False)
+        self.assertEqual(res["status"], "pass")
+        self.assertEqual(self._status(res, "c1"), "subsumed_pass")
+        self.assertIn("e01", self._reason(res, "c1"))
+        self.assertTrue(res["coverage"]["complete"])
+        self.assertEqual(res["coverage"]["subsumed_pass"], 1)
+        self.assertEqual(res["coverage"]["not_validated"], 0)
+
+    def test_a_row_cannot_be_both_covered_and_never_measured(self):
+        res = self._run(self._cands(2), [self._verdict("c0")],
+                        subsumed={"c1": "e01"},
+                        budget_skipped={"c1": "budget exhausted"},
+                        require_phase_generalization=False)
+        self.assertEqual(res["status"], "fail")
+        self.assertTrue(any("BOTH --subsumed" in e for e in res["errors"]))
+
+    def test_unknown_ids_in_the_new_maps_are_errors(self):
+        res = self._run(self._cands(1), [self._verdict("c0")],
+                        subsumed={"ghost": "e01"},
+                        budget_skipped={"phantom": "budget"})
+        self.assertEqual(res["status"], "fail")
+        self.assertTrue(any("--subsumed references unknown" in e
+                            for e in res["errors"]))
+        self.assertTrue(any("--budget-skipped references unknown" in e
+                            for e in res["errors"]))
+
+    def test_the_markdown_says_never_measured_not_waived(self):
+        res = self._run(self._cands(2), [self._verdict("c0")],
+                        budget_skipped={"c1": "unit-side budget exhausted"},
+                        require_phase_generalization=False)
+        md = uh.render_markdown(res)
+        self.assertIn("从未测过", md)
+        self.assertIn("覆盖率缺口", md)
+        self.assertIn("c1", md)
+
+    def test_subsumed_and_skipped_are_separate_columns_in_coverage(self):
+        res = self._run(self._cands(3), [self._verdict("c0")],
+                        subsumed={"c1": "e01"},
+                        budget_skipped={"c2": "budget exhausted"},
+                        require_phase_generalization=False)
+        cov = res["coverage"]
+        self.assertEqual((cov["validated"], cov["subsumed_pass"],
+                          cov["budget_skipped"], cov["waived"]), (1, 1, 1, 0))
+        self.assertEqual(cov["not_validated"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1309,39 +1309,99 @@ if (!FAST_MODE && (FUSION_DISCOVERY_ON || fusionInputsComplete())) {
           { phase: 'KernelFusion', label: 'fusion-analyst:rank', schema: FUSION_RANK_SCHEMA }, 1);
         if (ranked && ranked.status !== 'failed' && ranked.fusion_topk_json) {
           FUSION_INPUTS.FUSION_TOPK_JSON = ranked.fusion_topk_json;
-          const allUnitWork = [];
-          const seenUnitCandidates = new Set();
+          // ---- unit-side scheduling: spend the budget on LADDER TOPS ------
+          // The budget is a microbench-run count, and it used to be spent in
+          // flat board order. On DSR1 2026-09-03 that meant e01 (AR+norm, 4
+          // candidates) and e02 (AR+norm+quant, 4 candidates) consumed 8 of
+          // the 10 slots proving overlapping halves of ONE ladder, and e04 --
+          // the oproj flatten-quant fusion carrying a ★★★ prior with two
+          // previously MEASURED e2e confirms -- never got a slot. The ranker
+          // now marks each row's ladder position, so a row whose removable
+          // rows are a strict subset of another surviving row waits: the top's
+          // microbench already exercises every row the subset would remove.
+          // A subsumed rung is released back into the queue if its top FAILS
+          // unit-side -- the top's PASS is what covers it, not its existence.
+          const execById = new Map();
+          for (const entry of (ranked.execution_list || [])) execById.set(entry.exec_id, entry);
+          const heldByTop = new Map();   // ladder_top exec_id -> [subsumed entries]
+          const tops = [];
           for (const entry of (ranked.execution_list || [])) {
-            for (const cid of (entry.candidate_ids || [])) {
-              if (seenUnitCandidates.has(cid)) continue;
-              seenUnitCandidates.add(cid);
-              allUnitWork.push({ exec_id: entry.exec_id, candidate_id: cid });
+            const top = entry.ladder_top || entry.subsumed_by || null;
+            if (top && execById.has(top)) {
+              if (!heldByTop.has(top)) heldByTop.set(top, []);
+              heldByTop.get(top).push(entry);
+            } else {
+              tops.push(entry);
             }
           }
-          const work = allUnitWork.slice(0, FUSION_UNITSIDE_BUDGET);
-          const deferred = allUnitWork.slice(FUSION_UNITSIDE_BUDGET).map(item => ({
-            ...item, reason: `deferred_rank_budget:${FUSION_UNITSIDE_BUDGET}`,
-          }));
-          for (const item of work) {
-            await safeAgent(
-              roleAgent('fusion_unit_validator', 'validate_one',
-                'Validate exactly this one concrete Top-K candidate; never substitute another candidate.', {
-                  EVAL_DIR, MODEL_PATH, GPU_IDS, TP: SERVING_TP,
-                  FUSION_CANDIDATES_JSON: discover.fusion_candidates_json,
-                  FUSION_TOPK_JSON: ranked.fusion_topk_json,
-                  EXEC_ID: item.exec_id, CANDIDATE_ID: item.candidate_id,
-                  IMAGE: RUNTIME_IMAGE, SKILL_DIR: WORKFLOW_DIR,
-                  ...FUSION_RUNTIME_INPUTS,
-                }),
-              { phase: 'KernelFusion', label: `fusion-unit:${item.candidate_id}`, schema: FUSION_UNIT_SCHEMA }, 1);
+          const seenUnitCandidates = new Set();
+          const expand = (entry) => (entry.candidate_ids || [])
+            .filter(cid => !seenUnitCandidates.has(cid))
+            .map(cid => ({ exec_id: entry.exec_id, candidate_id: cid }));
+          const queue = [];
+          for (const entry of tops) queue.push(entry);
+          const subsumedCovered = [];
+          const budgetSkipped = [];
+          let spent = 0;
+          // Advisory pass test, for ROUTING only: the authoritative pass/fail
+          // is the harness gate below. A missing or failed agent result counts
+          // as not-passed, which releases the held rungs -- the safe direction.
+          const unitPassed = (r) => !!(r && r.status !== 'failed' &&
+            String(r.parity || '').toLowerCase() === 'pass' &&
+            Number(r.isolated_speedup) > 1);
+          while (queue.length) {
+            const entry = queue.shift();
+            let anyPass = false;
+            for (const item of expand(entry)) {
+              if (spent >= FUSION_UNITSIDE_BUDGET) {
+                seenUnitCandidates.add(item.candidate_id);
+                budgetSkipped.push({ ...item,
+                  reason: `unit-side budget ${FUSION_UNITSIDE_BUDGET} exhausted; NEVER MEASURED (not a waiver)` });
+                continue;
+              }
+              seenUnitCandidates.add(item.candidate_id);
+              spent += 1;
+              const r = await safeAgent(
+                roleAgent('fusion_unit_validator', 'validate_one',
+                  'Validate exactly this one concrete Top-K candidate; never substitute another candidate.', {
+                    EVAL_DIR, MODEL_PATH, GPU_IDS, TP: SERVING_TP,
+                    FUSION_CANDIDATES_JSON: discover.fusion_candidates_json,
+                    FUSION_TOPK_JSON: ranked.fusion_topk_json,
+                    EXEC_ID: item.exec_id, CANDIDATE_ID: item.candidate_id,
+                    IMAGE: RUNTIME_IMAGE, SKILL_DIR: WORKFLOW_DIR,
+                    ...FUSION_RUNTIME_INPUTS,
+                  }),
+                { phase: 'KernelFusion', label: `fusion-unit:${item.candidate_id}`, schema: FUSION_UNIT_SCHEMA }, 1);
+              if (unitPassed(r)) anyPass = true;
+            }
+            const held = heldByTop.get(entry.exec_id) || [];
+            if (!held.length) continue;
+            if (anyPass) {
+              for (const child of held) {
+                for (const cid of (child.candidate_ids || [])) {
+                  if (seenUnitCandidates.has(cid)) continue;
+                  seenUnitCandidates.add(cid);
+                  subsumedCovered.push({ exec_id: child.exec_id, candidate_id: cid,
+                    ladder_top: entry.exec_id });
+                }
+              }
+              log(`KernelFusion unit-side: ${entry.exec_id} passed; ${held.length} subsumed rung(s) covered without their own slot.`);
+            } else {
+              log(`KernelFusion unit-side: ${entry.exec_id} did NOT pass; releasing ${held.length} subsumed rung(s) to their own slot.`);
+              for (const child of held) queue.unshift(child);
+            }
           }
+          const deferred = budgetSkipped.map(item => ({ ...item, disposition: 'budget_skipped' }));
           const aggregate = await safeAgent(
             roleAgent('fusion_unit_validator', 'aggregate',
-              'Aggregate only the Top-K execution_list candidate ids. Record every budget-overrun row as deferred_rank_budget or an explicit waiver.', {
+              'Aggregate only the Top-K execution_list candidate ids. Pass SUBSUMED_COVERED rows to the harness as ' +
+              '--subsumed <id>=<ladder_top> (covered: their ladder top was benched and passed) and BUDGET_SKIPPED rows as ' +
+              '--budget-skipped <id>=<reason> (NOT covered — never measured). Do NOT launder a budget skip through --waive.', {
                 EVAL_DIR, FUSION_CANDIDATES_JSON: discover.fusion_candidates_json,
                 FUSION_TOPK_JSON: ranked.fusion_topk_json,
                 FUSION_DIR: discover.fusion_candidates_json.replace(/\/[^/]+$/, ''),
                 FUSION_UNITSIDE_BUDGET, DEFERRED_EXECUTIONS: deferred,
+                SUBSUMED_COVERED: subsumedCovered, BUDGET_SKIPPED: budgetSkipped,
                 SKILL_DIR: WORKFLOW_DIR, ...FUSION_RUNTIME_INPUTS,
               }),
             { phase: 'KernelFusion', label: 'fusion-unit:aggregate', schema: FUSION_UNIT_AGG_SCHEMA }, 1);

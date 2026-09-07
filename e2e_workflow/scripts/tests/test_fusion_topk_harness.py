@@ -351,5 +351,123 @@ class FusionTopkTest(unittest.TestCase):
                 not action["mutually_exclusive_with"] for action in actions))
 
 
+class SubsumptionLadderTest(unittest.TestCase):
+    """A rung whose removable rows are a strict SUBSET of another surviving
+    row's is covered by that row's unit-side microbench, and must say so on the
+    execution list. On DSR1 2026-09-03 two rungs of one ladder each paid for
+    their own slots (8 of 10) and the ★★★-prior fusion below them never got
+    benched at all."""
+
+    def _write(self, root, name, value):
+        path = os.path.join(root, name)
+        with open(path, "w") as fh:
+            json.dump(value, fh)
+        return path
+
+    def _ladder(self, tmp, top_k=10):
+        table = {"tables": [{"phase": "decode", "pattern_id": "P0",
+                             "rows": [{"row_id": "r1", "provider": "aiter"},
+                                      {"row_id": "r2", "provider": "aiter"},
+                                      {"row_id": "r3", "provider": "aiter"},
+                                      {"row_id": "z1", "provider": "aiter"}]}]}
+        def cand(cid, family, rows, api):
+            return {"candidate_id": cid, "phase": "decode", "pattern_id": "P0",
+                    "family": family,
+                    "implementation_class": "existing_api_needs_adapter",
+                    "readiness": "ready_for_api_validation",
+                    "exact_kernel_status": "yes", "removable_row_ids": rows,
+                    "live_call_seam": "x.py:1",
+                    "existing_apis": [{"name": api}]}
+        cands = {"candidates": [
+            # AR+norm+quant (widest) > AR+norm > AR : one ladder, three rungs
+            cand("wide", "collective_norm_quant", ["r1", "r2", "r3"],
+                 "fused_ar_rmsnorm_quant"),
+            cand("mid", "collective_norm", ["r1", "r2"], "fused_ar_rmsnorm"),
+            cand("narrow", "collective", ["r1"], "fused_allreduce"),
+            # unrelated rows -> its own ladder top, never subsumed
+            cand("alone", "layout", ["z1"], "flatten_quant"),
+        ]}
+        val = {"metrics": {
+            "phase_total_forward_us": {"decode": 1000.0},
+            "candidate_savings": [
+                {"candidate_id": "wide", "estimate_us": 50.0,
+                 "stack_estimate_us": 500.0, "basis": "roofline"},
+                {"candidate_id": "mid", "estimate_us": 30.0,
+                 "stack_estimate_us": 300.0, "basis": "roofline"},
+                {"candidate_id": "narrow", "estimate_us": 20.0,
+                 "stack_estimate_us": 200.0, "basis": "roofline"},
+                {"candidate_id": "alone", "estimate_us": 10.0,
+                 "stack_estimate_us": 100.0, "basis": "roofline"}]}}
+        return topk.rank(
+            self._write(tmp, "c.json", cands),
+            self._write(tmp, "v.json", val),
+            self._write(tmp, "t.json", table), top_k)
+
+    def _by_candidate(self, result):
+        out = {}
+        for entry in result["execution_list"]:
+            for cid in entry["candidate_ids"]:
+                out[cid] = entry
+        return out
+
+    def test_narrower_rungs_point_at_the_widest_and_cost_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _actions, _ = self._ladder(tmp)
+            rows = self._by_candidate(result)
+            wide, mid, narrow = rows["wide"], rows["mid"], rows["narrow"]
+            # one rung at a time: narrow -> mid -> wide, so apply-back descends
+            # a single step instead of jumping the whole ladder.
+            self.assertEqual(narrow["subsumed_by"], mid["exec_id"])
+            self.assertEqual(mid["subsumed_by"], wide["exec_id"])
+            self.assertIsNone(wide["subsumed_by"])
+            # ...but cost is charged to the TOP of the chain, not the next step.
+            self.assertEqual(narrow["ladder_top"], wide["exec_id"])
+            self.assertEqual(mid["ladder_top"], wide["exec_id"])
+            self.assertIsNone(wide["ladder_top"])
+            self.assertEqual([wide["unit_cost"], mid["unit_cost"],
+                              narrow["unit_cost"]], [1, 0, 0])
+
+    def test_an_unrelated_row_is_its_own_ladder_top(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _actions, _ = self._ladder(tmp)
+            alone = self._by_candidate(result)["alone"]
+            self.assertIsNone(alone["subsumed_by"])
+            self.assertIsNone(alone["ladder_top"])
+            self.assertEqual(alone["unit_cost"], 1)
+            self.assertEqual(alone["subsumes"], [])
+
+    def test_every_rung_stays_on_the_board(self):
+        # Subsumption changes who PAYS for the microbench. It must never drop a
+        # row: the cheap/partial vs costly/fuller tradeoff is the reader's call.
+        with tempfile.TemporaryDirectory() as tmp:
+            result, actions, _ = self._ladder(tmp)
+            self.assertEqual(len(result["execution_list"]), len(actions))
+            self.assertEqual(
+                set(self._by_candidate(result)),
+                {"wide", "mid", "narrow", "alone"})
+
+    def test_subsumes_is_the_inverse_of_subsumed_by(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _actions, _ = self._ladder(tmp)
+            rows = self._by_candidate(result)
+            self.assertEqual(rows["wide"]["subsumes"], [rows["mid"]["exec_id"]])
+            self.assertEqual(rows["mid"]["subsumes"],
+                             [rows["narrow"]["exec_id"]])
+            self.assertEqual(rows["narrow"]["subsumes"], [])
+
+    def test_board_renders_the_ladder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_md = os.path.join(tmp, "topk.md")
+            result, _actions, _ = self._ladder(tmp)
+            with open(out_md, "w") as fh:
+                fh.write(topk.render_markdown(result, _actions))
+            with open(out_md) as fh:
+                report = fh.read()
+            self.assertIn("阶梯", report)
+            self.assertIn("单侧由其覆盖", report)
+            # and the asymmetry is stated where the reader sees it
+            self.assertIn("apply-back 不做这种剪枝", report)
+
+
 if __name__ == "__main__":
     unittest.main()

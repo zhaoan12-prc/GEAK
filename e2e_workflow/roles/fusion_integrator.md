@@ -84,6 +84,34 @@ accuracy gate, DEGRADE to the next-narrower rung and retry; keep the widest that
 NOT settle for the narrow flag when a wider fused kernel wires + gates. Record which rung was
 accepted and why the wider ones were rejected (missing-kernel vs gate-fail).
 
+### The exec-level ladder (`subsumed_by` / `subsumes` on the execution list)
+The ranker marks rows whose removable-row set is a strict SUBSET of another row's
+(`subsumed_by`, `ladder_top`): AR+norm sits inside AR+norm+quant. Unit-side those rungs
+share one microbench — the top's run exercises every row the subset would remove, so a
+covered rung arrives here with `unit_side_status: subsumed_pass` and **is eligible for
+apply-back exactly like a `pass`**.
+
+**Here, a superset winning does NOT prove the subset is worse. Never prune a rung on a
+sibling's e2e result.** Measured counterexamples, both on this model:
+- DSR1 2026-09-03: the AR+norm+quant superset measured **−0.45%** e2e while the narrower
+  AR+norm rung delivered **+1.65%**.
+- The V-absorb card records the wider bmm+rope+kv superset measuring **NULL** against the
+  narrower kernel.
+
+So descend the ladder instead of pruning it:
+1. Gate the ladder TOP first (widest removable set).
+2. Top passes the A/B + accuracy gate → accept it, and mark each rung it `subsumes` as
+   `deferred` with reason `subsumed_by:<exec_id> (accepted, occupies the same rows)`.
+   They conflict for the same rows, so only one can land.
+3. Top fails, cannot be wired, or lands INSIDE the noise band → descend ONE rung
+   (`subsumes` → the next-widest) and gate that on its own, against the same baseline.
+   Repeat down the ladder. A sub-band top is not a verdict on the rungs below it.
+4. **★★★ prior exemption.** If a rung carries a `knowledge/learned/` card at ★★★ with a
+   MEASURED e2e effect, it gets its own marginal A/B leg regardless of what its ladder top
+   did — accepted top included. Cite the card in the disposition. This is the rung the
+   09-03 board lost: a card with two reproduced e2e confirms (+1.606%, +2.142%) sat at
+   e04 and never reached a microbench, let alone an A/B.
+
 ## Persist + return
 On accept, persist the overlay + a README (seam, engagement proof, TTFT/TPOT/throughput
 deltas, gsm8k base-vs-cand, which branches wired / skipped) under the **output eval dir**
@@ -100,13 +128,19 @@ If `EXEC_PREFIX` is non-empty, run executable commands as
 `<EXEC_PREFIX> <command>`; it is not an environment assignment.
 This is the KernelFusion apply-back driver — the orchestrator has no fs access, so YOU loop the candidates
 (one role call keeps the wins, like `config_tuner:sweep`):
-1. Read `FUSION_TOPK_JSON` + `FUSION_UNITSIDE_JSON`; take ONLY
-   `unit_side_status==pass` **tier-A or tier-B** candidates (tier-C is author work;
-   count it into `deferred_author_count`). Order by Top-K `forward_pct`, up to
-   `FUSION_BUDGET`. Tier-A belongs here, not ConfigSweep: apply its one flag/env,
+1. Read `FUSION_TOPK_JSON` + `FUSION_UNITSIDE_JSON`; take `unit_side_status` in
+   {`pass`, `subsumed_pass`} **tier-A or tier-B** candidates (tier-C is author work;
+   count it into `deferred_author_count`). `subsumed_pass` means the rung's ladder top
+   was benched and passed and that microbench covered this rung's rows — it is a pass,
+   not a gap. `budget_skipped` / `not_validated` are NOT eligible: they were never
+   measured, and they must be returned in `deferred[]` saying exactly that, never as
+   "not a win". Order by Top-K `forward_pct`, up to `FUSION_BUDGET`. Tier-A belongs here, not ConfigSweep: apply its one flag/env,
    run serving A/B, verify the fused kernel/route engagement, and keep or revert it
    before moving to the next row.
-2. Start the candidate server ONCE on `CURRENT_OVERLAY` (the running accepted baseline). For each
+2. Start the candidate server ONCE on `CURRENT_OVERLAY` (the running accepted baseline). Walk the
+   exec-level ladders top-down (see **The exec-level ladder** above): gate each `ladder_top`, and
+   descend to the rungs it `subsumes` only when the top fails/can't-wire/lands in the noise band —
+   except a ★★★-prior rung, which always gets its own marginal leg. For each
    fusion, in maximal-first order per its `fusion_degrade_ladder`: author the overlay adapter (the
    pattern above), STACK it onto the currently-accepted overlay via a combined-loader, verify the
    `[overlay-…] ENGAGED` banner on all ranks, then gate — interleaved A/B (`cand_min>ref_max` +

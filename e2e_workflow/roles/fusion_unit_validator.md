@@ -28,8 +28,9 @@ The caller supplies `FUSION_TOPK_JSON`, `EXEC_ID`, and `CANDIDATE_ID`.
 a family-level substitute or validate more than this one candidate.
 
 `fusion_unitside_harness.py --topk` enforces this: it expands concrete candidate ids
-from the execution list and requires every in-scope id to end in a verdict, an explicit
-`--waive <id>=<reason>`, or `not_validated` → **the gate FAILS**. tier-C
+from the execution list and requires every in-scope id to end in a verdict, a
+`--subsumed <id>=<ladder_top>` (its ladder top was benched and passed), or an explicit
+`--waive <id>=<reason>`; `budget_skipped` / `not_validated` → **the gate FAILS**. tier-C
 (`new_helper_kernel`, no existing kernel) is reported `deferred_author` and is out of
 scope. The report leads with the denominator and a per-phase breakdown.
 
@@ -48,15 +49,30 @@ If a candidate genuinely cannot be benched this round, waive it WITH A REASON
 ## PHASE=aggregate — publish the Top-K denominator
 
 Inputs: `FUSION_TOPK_JSON`, `FUSION_CANDIDATES_JSON`, `FUSION_DIR`, `EVAL_DIR`,
-`FUSION_UNITSIDE_BUDGET`, and any explicit budget deferrals/waivers from the caller.
+`FUSION_UNITSIDE_BUDGET`, `SUBSUMED_COVERED`, `BUDGET_SKIPPED`, and any explicit
+waivers from the caller.
 
 Run the harness with `--topk "$FUSION_TOPK_JSON"`. Its coverage denominator is the
 union of concrete `candidate_ids` in `fusion_topk.execution_list`, not every discovery
 candidate. Candidates outside that union are `deferred_rank_budget` and cannot fail
-Top-K coverage. If `FUSION_UNITSIDE_BUDGET` stops inside the execution list, every
-unrun concrete candidate id in `DEFERRED_EXECUTIONS` must become a reasoned harness
-argument such as `--waive <id>=deferred_rank_budget:<budget>` and be copied into
-the returned `deferred[]`; never silently omit it.
+Top-K coverage.
+
+Two caller-supplied lists close the rest of the denominator, and they are **opposites —
+do not merge them, and do not route either through `--waive`**:
+
+| caller input | harness flag | status | covered? |
+|---|---|---|---|
+| `SUBSUMED_COVERED` | `--subsumed <id>=<ladder_top>` | `subsumed_pass` | **yes** — its ladder-top superset was benched and PASSED, and that microbench exercised every row this rung removes |
+| `BUDGET_SKIPPED` / `DEFERRED_EXECUTIONS` | `--budget-skipped <id>=<reason>` | `budget_skipped` | **no** — the unit-side budget ran out; nobody measured it. Counts against coverage and FAILS the gate |
+
+Copy both into the returned `deferred[]` with their status; never silently omit one.
+
+Why the split: on DSR1 2026-09-03 budget overruns were passed in as `--waive`. They
+rendered as `waived`, dropped out of the unvalidated set, and coverage reported
+`complete: true` over a board where 17 of 27 in-scope candidates had never been
+measured — including the one carrying a ★★★ prior with two reproduced e2e confirms
+(+1.606%, +2.142%). Running out of budget is a fact about US, not a judgment about the
+candidate. 「没测」不得渲染成「测过了」。
 
 One verdict per candidate is not a phase result. When the loop is done, the CALLER runs
 the harness once over the whole verdict dir and publishes the Phase 3.0 report at the
@@ -69,6 +85,8 @@ python3 "$SKILL_DIR/scripts/fusion_unitside_harness.py" \
   --verdicts   "$EVAL_DIR/verdict" \
   --out-md     "$EVAL_DIR/04_FUSION_UNITSIDE.md" \
   --out-json   "$FUSION_DIR/fusion_unitside.json" \
+  --subsumed "<id>=<ladder_top_exec_id>"  # repeat per SUBSUMED_COVERED row (covered)
+  --budget-skipped "<id>=<reason>"        # repeat per BUDGET_SKIPPED row (NOT covered)
   --waive "<id>=<reason>"   # repeat per genuinely un-benchable candidate
 python3 "$SKILL_DIR/scripts/report_index.py" --eval-dir "$EVAL_DIR"
 ```
