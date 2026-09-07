@@ -456,6 +456,58 @@ class RuntimeMarkerMappingTest(unittest.TestCase):
             self.assertEqual(
                 mapped["candidate_op_instance_id"], "geak-op-1")
 
+    def test_decode_mla_anchors_separate_k_and_v_absorb(self):
+        targets = [
+            {"phase": "decode", "pattern_id": "P", "representative_layer_id": 2,
+             "pos": 0, "stage": "norm", "raw_name": "fused_qk_rmsnorm"},
+            {"phase": "decode", "pattern_id": "P", "representative_layer_id": 2,
+             "pos": 1, "stage": "gemm", "raw_name": "batched_gemm_prequant"},
+            {"phase": "decode", "pattern_id": "P", "representative_layer_id": 2,
+             "pos": 2, "stage": "kv_cache", "raw_name": "rope_cache"},
+            {"phase": "decode", "pattern_id": "P", "representative_layer_id": 2,
+             "pos": 3, "stage": "attn", "raw_name": "mla_attention"},
+            {"phase": "decode", "pattern_id": "P", "representative_layer_id": 2,
+             "pos": 4, "stage": "attn", "raw_name": "mla_reduce"},
+            {"phase": "decode", "pattern_id": "P", "representative_layer_id": 2,
+             "pos": 5, "stage": "elementwise", "raw_name": "copy"},
+            {"phase": "decode", "pattern_id": "P", "representative_layer_id": 2,
+             "pos": 6, "stage": "gemm", "raw_name": "Cijk_bf16"},
+            {"phase": "decode", "pattern_id": "P", "representative_layer_id": 2,
+             "pos": 7, "stage": "quant", "raw_name": "quant"},
+            {"phase": "decode", "pattern_id": "P", "representative_layer_id": 2,
+             "pos": 8, "stage": "communication", "raw_name": "allreduce"},
+        ]
+        mapping._annotate_decode_semantic_regions(targets)
+        self.assertEqual(targets[1]["semantic_region"], "k_absorb")
+        self.assertEqual(targets[2]["semantic_region"], "rope_kv")
+        self.assertEqual(targets[5]["semantic_region"], "v_absorb")
+        self.assertEqual(targets[6]["semantic_region"], "v_absorb")
+        self.assertEqual(targets[7]["semantic_region"], "o_proj")
+
+    def test_unique_torch_bmm_probe_maps_only_vabsorb_gemm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shape_log = os.path.join(tmp, "shape.jsonl")
+            record = {
+                "phase": "decode", "layer_id": 2,
+                "op_instance_id": "bmm-1",
+                "op_type": "targeted_python_launcher",
+                "op_path": "model.layers.2.self_attn::launcher:torch:bmm",
+            }
+            with open(shape_log, "w") as fh:
+                fh.write(json.dumps(record) + "\n")
+            targets = [{
+                "phase": "decode", "representative_layer_id": 2,
+                "stage": "gemm", "semantic_region": "v_absorb",
+                "semantic_region_path": "model.layers.2.self_attn.v_absorb",
+                "runtime_marker_mapping_status": "not_found",
+            }]
+            self.assertEqual(
+                mapping._apply_vabsorb_bmm_probe(targets, shape_log), 1)
+            self.assertEqual(targets[0]["mapping_cardinality"], "1:1")
+            self.assertEqual(
+                targets[0]["candidate_op_path"],
+                "model.layers.2.self_attn.v_absorb")
+
 
 if __name__ == "__main__":
     unittest.main()

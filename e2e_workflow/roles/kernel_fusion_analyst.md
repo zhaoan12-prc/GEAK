@@ -607,6 +607,11 @@ card in it an explicit disposition** in `fusion_candidates.json`:
    "disposition": "candidate", "candidate_id": "d3_vabsorb_dequant_fold"},
   {"card": "fusion-allreduce-rmsnorm-quant-gfx942",
    "disposition": "already_engaged",
+   "engagement_evidence": {
+     "ownership_scope": "semantic_region|kernel_exact",
+     "kernel": "the live fused Kernel in the intended semantic region",
+     "removed_kernel_count": 0
+   },
    "reason": "--enable-aiter-allreduce-fusion is on in this run's launch and the "
              "banner is in server.log:1841; incremental here is ~0"},
   {"card": "fusion-x-gfx950", "disposition": "not_applicable",
@@ -620,6 +625,13 @@ really in your candidate list). `already_engaged` / `not_applicable` need a REAL
 reason — name the gfx/regime/flag/op that does not match. `"skipped"`, `""` and
 `"n/a"` are rejected. `type: method` cards are advisory: read them, no
 disposition needed.
+
+`already_engaged` additionally requires structured `engagement_evidence`:
+the fused Kernel must be owned by the intended semantic region (or be
+Kernel-exact), and `removed_kernel_count` must prove that the helper Kernel(s)
+the card claims to eliminate are absent. Whole-layer ownership such as
+`model.layers.N` is insufficient. A similarly named Kernel elsewhere in the
+layer must not close the card.
 
 **This is the run-to-run stability gate, and it is the only one.** The DSR1
 complaint was that the same model + same trace produced a *different* fusion set

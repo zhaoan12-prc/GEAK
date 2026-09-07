@@ -854,9 +854,15 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir):
                         "schema": _tensor_schema(
                             group, row, table, bucket_status == "exact"),
                     }
+                    wrapper_scope = evidence.get("wrapper_scope")
+                    region_only = (
+                        wrapper_scope == "phase_layer_semantic_region")
+                    canonical_op = (
+                        target.get("candidate_op_path")
+                        if region_only else group["op_path"])
                     row["parent_operator"] = {
                         **row.get("parent_operator", {}),
-                        "canonical_op": group["op_path"],
+                        "canonical_op": canonical_op,
                         "mapping_level": (
                             "logger_one_to_one" if probe_scope == "kernel"
                             else "parent_wrapper_context"),
@@ -868,16 +874,17 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir):
                         "source": (
                             "runtime_probe_kernel"
                             if probe_scope == "kernel"
-                            else "runtime_probe_wrapper"),
+                            else "runtime_probe_region_context"
+                            if region_only else "runtime_probe_wrapper"),
                         # Publish P-level probe shapes through the same canonical
                         # contract consumed by candidate grafting and unitside
                         # provenance. `logger_schema` remains the rich evidence.
-                        "input_dims": [
+                        "input_dims": [] if region_only else [
                             tensor.get("effective_shape") or tensor.get("shape")
                             for tensor in evidence["schema"].get("tensors", [])
                             if (tensor.get("effective_shape") or tensor.get("shape"))
                         ],
-                        "input_types": [
+                        "input_types": [] if region_only else [
                             tensor.get("dtype") or "Tensor"
                             for tensor in evidence["schema"].get("tensors", [])
                             if (tensor.get("effective_shape") or tensor.get("shape"))

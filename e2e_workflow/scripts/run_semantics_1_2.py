@@ -189,21 +189,10 @@ def run(config_path, trace_path, shape_log_path, out_dir,
             "shape_log_path, capture_setup_path, or capture_result_path "
             "is required")
 
-    # --- F3: rebuild layer boundaries from the eager capture DECODE trace ----
-    # The phase-1.1 build above ran before any capture existed, so its decode
-    # rows came from the CLEAN trace -- which is captured with CUDA graphs on.
-    # A graph-replayed decode trace carries no `nn.Module: DecoderLayer_N`
-    # python spans and no External ids, so decode boundaries degraded to
-    # anchor_repeat_segmentation (rotated layer bodies) and every decode row
-    # fell back to layer-level identity (`canonical_op = model.layers.N`).
-    # Real per-kernel ops -- e.g. the MLA v-absorb `aten::bmm
-    # [[16,4,512],[16,512,128]]` -- were therefore invisible to fusion search.
-    #
-    # The shape capture already runs eager (disable_cuda_graph), and its DECODE
-    # trace has all 61 module spans plus External-id linkage.  Rebuild with
-    # [clean EXTEND] + [eager capture DECODE] so prefill keeps its clean-trace
-    # boundaries while decode gains K-level identity.  auto_sibling is off so
-    # the graph DECODE sibling is not re-adopted alongside it.
+    # --- Keep the CUDA-graph clean trace authoritative -----------------------
+    # A graph-replayed Decode trace has little CPU-side attribution, while an
+    # eager probe has wrappers but may execute a different branch.  Keep the
+    # former as the fact table and use the latter only in the merge below.
     boundary_rebuild = None
     eager_decode_traces = []
     for capture in capture_results:
@@ -213,31 +202,15 @@ def run(config_path, trace_path, shape_log_path, out_dir,
                 and semantic_kernel_mapping.has_module_layer_spans(
                     decode_trace)):
             eager_decode_traces.append(decode_trace)
-    if eager_decode_traces:
-        extend_traces = [
-            path for path in (
-                [trace_path] if isinstance(trace_path, str) else list(trace_path))
-            if "-DECODE" not in os.path.basename(path)]
-        rebuild_dir = os.path.join(out_dir, "boundary_rebuild")
-        rebuilt = semantic_kernel_mapping.build(
-            extend_traces + eager_decode_traces, patterns_path, rebuild_dir,
-            auto_sibling=False, require_phases=require_phases)
-        if rebuilt["status"] != "fail":
-            shutil.copyfile(rebuilt["semantic_table_json"], phase_1_1_json)
-            shutil.copyfile(rebuilt["semantic_table_md"], phase_1_1_md)
-            with open(rebuilt["layer_instance_audit_json"]) as fh:
-                rebuild_audit = json.load(fh)
-            module_scope_count = int(
-                rebuild_audit.get("module_scope_count", 0) or 0)
-        boundary_rebuild = {
-            "applied": rebuilt["status"] != "fail",
-            "status": rebuilt["status"],
-            "reason": "graph-decode trace has no DecoderLayer module spans; "
-                      "decode boundaries rebuilt from the eager capture trace",
-            "traces": [os.path.abspath(path)
-                       for path in extend_traces + eager_decode_traces],
-            "out_dir": rebuild_dir,
-        }
+    boundary_rebuild = {
+        "applied": False,
+        "status": "auxiliary_only" if eager_decode_traces else "unavailable",
+        "reason": (
+            "eager Decode traces provide wrapper/shape evidence only; the "
+            "CUDA-graph clean trace remains authoritative for Kernel order "
+            "and timing"),
+        "traces": [os.path.abspath(path) for path in eager_decode_traces],
+    }
 
     probe_tables = []
     probe_runs = []
@@ -314,13 +287,22 @@ def run(config_path, trace_path, shape_log_path, out_dir,
     degraded_phases = sorted(
         phase for phase, level in phase_boundary_evidence.items()
         if level != "module_span")
+    # CUDA-graph replay legitimately lacks CPU module spans.  A separately
+    # captured eager Decode pass may supply wrapper/region evidence, but it must
+    # never replace the clean graph rows.  Treat only that explicit combination
+    # as a non-blocking boundary degradation.
+    auxiliary_decode_ok = bool(
+        eager_decode_traces and capture_phase_coverage_complete)
+    blocking_degraded_phases = [
+        phase for phase in degraded_phases
+        if phase != "decode" or not auxiliary_decode_ok]
 
     status = "pass" if (
         semantic["status"] != "fail"
         and merged["status"] == "pass"
         and capture_phase_coverage_complete
         and boundary_evidence == "module_span"
-        and not degraded_phases
+        and not blocking_degraded_phases
     ) else "fail"
     result = {
         "schema_version": 1,
@@ -339,6 +321,7 @@ def run(config_path, trace_path, shape_log_path, out_dir,
         "boundary_evidence": boundary_evidence,
         "phase_boundary_evidence": phase_boundary_evidence,
         "degraded_boundary_phases": degraded_phases,
+        "blocking_degraded_boundary_phases": blocking_degraded_phases,
         "boundary_rebuild": boundary_rebuild,
         "module_scope_count": module_scope_count,
         "inputs": {

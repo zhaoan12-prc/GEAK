@@ -164,8 +164,24 @@ class FusionPriorsTest(unittest.TestCase):
             self._priors("fusion-a"),
             {"prior_dispositions": [{
                 "card": "fusion-a.md", "disposition": "already_engaged",
-                "reason": "aiter fused AR is the live default at this shape"}]})
+                "reason": "aiter fused AR is the live default at this shape",
+                "engagement_evidence": {
+                    "ownership_scope": "semantic_region",
+                    "kernel": "fused_allreduce_rmsnorm",
+                    "removed_kernel_count": 0}}]})
         self.assertEqual(errors, [])
+
+    def test_already_engaged_rejects_whole_layer_name_only_evidence(self):
+        errors, _ = priors.check_dispositions(
+            self._priors("fusion-a"),
+            {"prior_dispositions": [{
+                "card": "fusion-a", "disposition": "already_engaged",
+                "reason": "a similarly named kernel appears in the layer",
+                "engagement_evidence": {
+                    "ownership_scope": "layer",
+                    "kernel": "batched_gemm",
+                    "removed_kernel_count": 0}}]})
+        self.assertTrue(any("ownership_scope" in e for e in errors), errors)
 
     def test_an_unknown_disposition_word_fails(self):
         errors, _ = priors.check_dispositions(
@@ -206,7 +222,9 @@ class FusionPriorsTest(unittest.TestCase):
             {"prior_dispositions": [
                 {"card": "a", "disposition": "candidate", "candidate_id": "x"},
                 {"card": "b", "disposition": "already_engaged",
-                 "reason": "live default"}]},
+                 "reason": "live default", "engagement_evidence": {
+                     "ownership_scope": "kernel_exact",
+                     "kernel": "fused_b", "removed_kernel_count": 0}}]},
             {"x"})
         summary = priors.summarise(rows)
         self.assertEqual(summary["priors_total"], 3)

@@ -311,6 +311,51 @@ class SemanticShapeMergeTest(unittest.TestCase):
         self.assertFalse(merge._is_runtime_internal({
             "short_name": "_gemm_a8w8"}))
 
+    def test_region_context_does_not_publish_layer_shape_as_kernel_shape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            table = {"tables": [{
+                "phase": "decode", "pattern_id": "P",
+                "representative_layer_id": 2,
+                "selected_bucket": {"batch_size": 4, "input_tokens": 0},
+                "rows": [{
+                    "pos": 0, "row_id": "event-1", "raw_event_index": 1,
+                    "device_seq_index": 1, "raw_name": "copy",
+                    "short_name": "copy", "stage": "elementwise",
+                    "duration_us": 2.0,
+                    "shape": {"source": "unresolved", "input_dims": []},
+                    "parent_operator": {"canonical_op": "unresolved"},
+                }]}]}
+            plan = {"capture_targets": [{
+                "row_id": "event-1",
+                "candidate_op_instance_id": "layer-2",
+                "candidate_op_path": "model.layers.2.self_attn.v_absorb",
+                "mapping_cardinality": "1:N",
+                "shape_log_layer_evidence": {
+                    "scope": "phase_layer_semantic_region",
+                    "semantic_region": "v_absorb"},
+            }]}
+            records = [{
+                "phase": "decode", "rank": 0, "layer_id": 2,
+                "batch_size": 4, "input_tokens": 4,
+                "op_instance_id": "layer-2", "op_name": "2",
+                "op_type": "DecoderLayer", "op_path": "model.layers.2",
+                "io": "input", "tensor_path": "args[0]",
+                "shape": [4, 7168], "dtype": "bf16",
+            }]
+            result = merge.merge(
+                self._write(tmp, "table.json", table),
+                self._write(tmp, "plan.json", plan),
+                self._write(tmp, "shape.jsonl", records, jsonl=True),
+                os.path.join(tmp, "out"))
+            with open(result["semantic_table_json"]) as fh:
+                row = json.load(fh)["tables"][0]["rows"][0]
+            self.assertEqual(
+                row["parent_operator"]["canonical_op"],
+                "model.layers.2.self_attn.v_absorb")
+            self.assertEqual(row["shape"]["input_dims"], [])
+            self.assertEqual(
+                row["shape"]["source"], "runtime_probe_region_context")
+
     def test_unmatched_memcpy_has_specific_reason_code(self):
         reason_code, _ = merge._unavailable_reason(
             {"event_type": "gpu_memcpy", "short_name": "Memcpy"},

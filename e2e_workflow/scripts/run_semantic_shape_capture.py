@@ -313,6 +313,12 @@ def capture(setup_path, capture_plan_path, out_dir,
         benchmark = os.path.join(out_dir, "benchmark_eager_decode.sh")
         with open(benchmark, "w") as fh:
             fh.write(benchmark_text)
+    callable_targets = list(setup.get("callable_targets", []))
+    # V-absorb uses a functional BMM, so nn.Module hooks only expose the broad
+    # self-attention wrapper.  Probe torch.bmm during the eager Decode pass;
+    # logging is still restricted to selected layers and profiler windows.
+    if decode_requested and "torch:bmm" not in callable_targets:
+        callable_targets.append("torch:bmm")
     command = """
 set -e
 export GEAK_SEMANTICS_CAPTURE=1
@@ -346,7 +352,7 @@ wait "$geak_wrapper"
 """ % (
         shape_log, ",".join(str(layer) for layer in layers),
         ",".join(phases or []), forwards_per_bucket,
-        ",".join(setup.get("callable_targets", [])), trace_dir,
+        ",".join(callable_targets), trace_dir,
         setup["model"], setup["tensor_parallel_size"],
         workload["concurrency"], workload["input_length"],
         workload["output_length"], workload.get("random_range_ratio", 0.8),
@@ -377,7 +383,7 @@ wait "$geak_wrapper"
         "forwards_per_bucket": int(forwards_per_bucket),
         "container": container,
         "representative_layers": layers,
-        "callable_targets": list(setup.get("callable_targets", [])),
+        "callable_targets": callable_targets,
         "callable_kernel_map": list(
             setup.get("callable_kernel_map", [])),
         "source_wrapper_map": list(

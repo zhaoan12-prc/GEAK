@@ -205,6 +205,39 @@ def merge(clean_table_path, probe_table_paths, out_dir):
         if audit["evidence"]["level"] == "U"
         and not audit["evidence"].get("reason_code")]
     classified = sum(counts.values()) == len(audits) and not unexplained
+    # Probe merges change row-level shape evidence.  Refresh the embedded phase
+    # summary so downstream consumers do not see the pre-probe "0/N" beside
+    # rows that now carry resolved shapes.
+    phase_stats = {}
+    for table in output.get("tables", []):
+        phase = table.get("phase")
+        if not phase:
+            continue
+        stat = phase_stats.setdefault(phase, {"rows": 0, "resolved": 0})
+        for row in table.get("rows", []):
+            stat["rows"] += 1
+            if (row.get("shape") or {}).get("input_dims"):
+                stat["resolved"] += 1
+    for stat in phase_stats.values():
+        stat["resolved_fraction"] = (
+            round(stat["resolved"] / float(stat["rows"]), 4)
+            if stat["rows"] else 0.0)
+    phase_coverage = output.setdefault("phase_coverage", {})
+    phase_coverage["shape_resolution_by_phase"] = phase_stats
+    decode = phase_stats.get("decode", {"resolved": 0})
+    decode_sequence = bool(
+        phase_coverage.get("decode_sequence_covered")
+        or "decode" in phase_stats)
+    phase_coverage["decode_shapes_covered"] = decode["resolved"] > 0
+    phase_coverage["decode_covered"] = bool(
+        decode_sequence and decode["resolved"] > 0)
+    phase_coverage["decode_requires_eager_probe"] = bool(
+        "decode" in phase_stats and decode["resolved"] == 0)
+    if "decode" in phase_stats:
+        phase_coverage["decode_evidence"] = (
+            "sequence_and_shapes" if phase_coverage["decode_covered"]
+            else "sequence_only_shapes_unresolved"
+            if decode_sequence else "no_decode_trace_analysed")
     os.makedirs(out_dir, exist_ok=True)
     table_out = os.path.join(out_dir, "pattern_layer_kernel_table.json")
     markdown_out = os.path.join(out_dir, "ORDERED_UNIQUE_LAYER_TABLES.md")

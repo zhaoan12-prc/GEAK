@@ -215,6 +215,34 @@ def check_dispositions(priors, payload, candidate_ids=None):
                 errors.append(
                     "prior %s: candidate_id %r is not in this run's candidates"
                     % (prior["slug"], row["candidate_id"]))
+        elif row["disposition"] == "already_engaged":
+            evidence = entry.get("engagement_evidence")
+            if not isinstance(evidence, dict):
+                errors.append(
+                    "prior %s: disposition=already_engaged needs structured "
+                    "engagement_evidence; a Kernel name somewhere in the "
+                    "layer is not proof that the intended seam is engaged"
+                    % prior["slug"])
+            else:
+                scope = str(evidence.get("ownership_scope") or "")
+                if scope in ("", "layer", "phase_layer_wrapper"):
+                    errors.append(
+                        "prior %s: already_engaged ownership_scope %r is too "
+                        "broad; provide semantic_region or kernel_exact "
+                        "ownership" % (prior["slug"], scope))
+                if not evidence.get("kernel"):
+                    errors.append(
+                        "prior %s: already_engaged engagement_evidence needs "
+                        "the engaged kernel" % prior["slug"])
+                if evidence.get("removed_kernel_count") is None:
+                    errors.append(
+                        "prior %s: already_engaged engagement_evidence needs "
+                        "removed_kernel_count for the helper(s) the fusion "
+                        "claims to eliminate" % prior["slug"])
+            if _bad_reason(row["reason"]):
+                errors.append(
+                    "prior %s: disposition=already_engaged needs a real reason"
+                    % prior["slug"])
         elif _bad_reason(row["reason"]):
             errors.append(
                 "prior %s: disposition=%s needs a real reason (%r says nothing "

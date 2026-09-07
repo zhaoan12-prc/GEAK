@@ -98,12 +98,17 @@ class SemanticEvidenceLedgerTest(unittest.TestCase):
             self.assertEqual(result["evidence_counts"], {
                 "K": 1, "P": 2, "U": 0})
             with open(result["semantic_table_json"]) as fh:
-                rows = json.load(fh)["tables"][0]["rows"]
+                document = json.load(fh)
+                rows = document["tables"][0]["rows"]
             self.assertEqual(rows[0]["semantic_evidence"]["level"], "K")
             self.assertEqual(
                 rows[1]["semantic_evidence"]["probe_scope"], "wrapper")
             self.assertEqual(
                 rows[2]["semantic_evidence"]["probe_scope"], "kernel")
+            self.assertEqual(
+                document["phase_coverage"]["shape_resolution_by_phase"]
+                ["decode"],
+                {"rows": 3, "resolved": 1, "resolved_fraction": 0.3333})
             with open(result["coverage_manifest"]) as fh:
                 coverage = json.load(fh)
             self.assertEqual(coverage["probe_scope_counts"], {

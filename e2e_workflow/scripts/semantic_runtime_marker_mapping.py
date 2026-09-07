@@ -369,6 +369,113 @@ def _layer_fallback_eligible(target):
         and "__amd_rocclr_fillBufferAligned" not in kernel)
 
 
+def _annotate_decode_semantic_regions(targets):
+    """Partition MLA Decode rows using anchors in the clean graph trace.
+
+    The result is region evidence, never Kernel-exact ownership.  It prevents
+    a whole-layer fallback from conflating the pre-attention K-absorb BMM with
+    the post-attention V-absorb BMM.
+    """
+    grouped = {}
+    for target in targets:
+        if _phase(target.get("phase")) != "decode":
+            continue
+        key = (target.get("pattern_id"),
+               int(target.get("representative_layer_id", -1)))
+        grouped.setdefault(key, []).append(target)
+    for (_, layer_id), rows in grouped.items():
+        rows.sort(key=lambda item: int(item.get("pos", -1)))
+        attn = [i for i, row in enumerate(rows)
+                if str(row.get("stage") or "").lower() == "attn"]
+        if not attn:
+            continue
+        core = attn[0]
+        reduce_idx = next((
+            i for i in attn[1:]
+            if "reduce" in str(rows[i].get("raw_name") or "").lower()), core)
+        v_gemm = next((
+            i for i in range(reduce_idx + 1, len(rows))
+            if str(rows[i].get("stage") or "").lower() == "gemm"), None)
+        next_collective = next((
+            i for i in range((v_gemm + 1) if v_gemm is not None else core + 1,
+                             len(rows))
+            if str(rows[i].get("stage") or "").lower() == "communication"),
+            len(rows))
+        for i, row in enumerate(rows):
+            raw = str(row.get("raw_name") or "").lower()
+            region = None
+            if i < core and "qk" in raw and "norm" in raw:
+                region = "qk_norm"
+            elif i < core and "batched_gemm" in raw:
+                region = "k_absorb"
+            elif i < core and (row.get("stage") == "kv_cache"
+                               or "rope" in raw or "catarray" in raw):
+                region = "rope_kv"
+            elif core <= i <= reduce_idx:
+                region = "mla_core"
+            elif v_gemm is not None and reduce_idx < i <= v_gemm:
+                region = "v_absorb"
+            elif v_gemm is not None and v_gemm < i < next_collective:
+                region = "o_proj"
+            if not region:
+                continue
+            row["semantic_region"] = region
+            row["semantic_region_path"] = (
+                "model.layers.%d.self_attn.%s" % (layer_id, region))
+            row["semantic_region_evidence"] = {
+                "level": "P",
+                "source": "clean_graph_anchor_partition",
+                "rule": "ordered Decode anchors in the CUDA-graph trace",
+            }
+
+
+def _apply_vabsorb_bmm_probe(targets, shape_log_path):
+    """Attach a unique eager torch.bmm probe to the graph V-absorb GEMM."""
+    if not shape_log_path or not os.path.exists(shape_log_path):
+        return 0
+    records = []
+    with open(shape_log_path) as fh:
+        for line in fh:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if (record.get("op_type") == "targeted_python_launcher"
+                    and str(record.get("op_path") or "").endswith(
+                        "::launcher:torch:bmm")):
+                records.append(record)
+    matched = 0
+    for target in targets:
+        if target.get("runtime_marker_mapping_status") == "matched":
+            continue
+        if (target.get("semantic_region") != "v_absorb"
+                or str(target.get("stage") or "").lower() != "gemm"):
+            continue
+        candidates = [record for record in records
+                      if _phase(record.get("phase")) == "decode"
+                      and int(record.get("layer_id", -1)) == int(
+                          target.get("representative_layer_id", -1))]
+        if len(candidates) != 1:
+            continue
+        record = candidates[0]
+        target["candidate_op_path"] = target["semantic_region_path"]
+        target["candidate_op_instance_id"] = record["op_instance_id"]
+        target["candidate_wrapper"] = record["op_path"]
+        target["candidate_terminal_launcher"] = "torch:bmm"
+        target["mapping_cardinality"] = "1:1"
+        target["source_mapping_status"] = "vabsorb_targeted_bmm_probe"
+        target["runtime_marker_mapping_status"] = "matched"
+        target.pop("runtime_marker_candidate_count", None)
+        target["targeted_region_evidence"] = {
+            "shape_log": os.path.abspath(shape_log_path),
+            "semantic_region": "v_absorb",
+            "launcher": "torch:bmm",
+            "rule": "unique eager bmm inside the anchored V-absorb region",
+        }
+        matched += 1
+    return matched
+
+
 def _semantic_wrapper_candidates(records, stage, layer_id):
     rules = {
         "norm": r"norm",
@@ -507,19 +614,24 @@ def _apply_shape_log_layer_fallback(
                 continue
             if int(target.get("representative_layer_id", -1)) != layer_id:
                 continue
-            target["candidate_op_path"] = record["op_path"]
+            region_path = target.get("semantic_region_path")
+            target["candidate_op_path"] = region_path or record["op_path"]
             target["candidate_op_instance_id"] = record["op_instance_id"]
             target["candidate_wrapper"] = record["op_path"]
             target["candidate_terminal_launcher"] = record.get("op_type")
             target["mapping_cardinality"] = "1:N"
             target["source_mapping_status"] = (
-                "runtime_shape_log_layer_wrapper")
+                "runtime_shape_log_semantic_region"
+                if region_path else "runtime_shape_log_layer_wrapper")
             target["runtime_marker_mapping_status"] = "matched"
             target.pop("runtime_marker_candidate_count", None)
             target["shape_log_layer_evidence"] = {
                 "shape_log": os.path.abspath(shape_log_path),
                 "wrapper": record["op_path"],
-                "scope": "phase_layer_wrapper",
+                "scope": (
+                    "phase_layer_semantic_region"
+                    if region_path else "phase_layer_wrapper"),
+                "semantic_region": target.get("semantic_region"),
                 "rule": (
                     "clean trace assigns kernel to phase/layer; same replay "
                     "captures that layer wrapper shape; no kernel-level "
@@ -529,11 +641,61 @@ def _apply_shape_log_layer_fallback(
     return matched, covered_keys
 
 
+def _apply_shape_log_region_fallback(targets, shape_log_path):
+    """Bind anchored Decode regions to the layer probe without claiming shape.
+
+    This runs even when some profiler markers exist for the bucket: partial
+    marker export is common on Decode worker threads.  Only targets already
+    assigned a clean-graph semantic region are eligible.
+    """
+    records_by_key = _shape_log_first_forward(shape_log_path)
+    matched = 0
+    for (phase, layer_id), records in records_by_key.items():
+        if phase != "decode":
+            continue
+        layer_pattern = re.compile(r"(?:^|\.)layers\.%d$" % layer_id)
+        record = next((item for item in records
+                       if layer_pattern.search(
+                           str(item.get("op_path") or ""))), None)
+        if record is None:
+            continue
+        for target in targets:
+            if target.get("runtime_marker_mapping_status") == "matched":
+                continue
+            if not target.get("semantic_region_path"):
+                continue
+            if (_phase(target.get("phase")) != phase
+                    or int(target.get("representative_layer_id", -1))
+                    != layer_id):
+                continue
+            target["candidate_op_path"] = target["semantic_region_path"]
+            target["candidate_op_instance_id"] = record["op_instance_id"]
+            target["candidate_wrapper"] = record["op_path"]
+            target["candidate_terminal_launcher"] = record.get("op_type")
+            target["mapping_cardinality"] = "1:N"
+            target["source_mapping_status"] = (
+                "runtime_shape_log_semantic_region")
+            target["runtime_marker_mapping_status"] = "matched"
+            target.pop("runtime_marker_candidate_count", None)
+            target["shape_log_layer_evidence"] = {
+                "shape_log": os.path.abspath(shape_log_path),
+                "wrapper": record["op_path"],
+                "scope": "phase_layer_semantic_region",
+                "semantic_region": target.get("semantic_region"),
+                "rule": (
+                    "clean graph anchor partition identifies the narrow "
+                    "region; eager layer wrapper supplies context only"),
+            }
+            matched += 1
+    return matched
+
+
 def map_plan(
         plan_path, capture_trace_path, out_path, shape_log_path="",
         callable_kernel_map=None, source_wrapper_map=None):
     with open(plan_path) as fh:
         plan = json.load(fh)
+    _annotate_decode_semantic_regions(plan.get("capture_targets", []))
     events = _load(capture_trace_path)
     markers, entries = _runtime_entries(events)
     marker_launch_counts = collections.Counter(
@@ -643,6 +805,8 @@ def map_plan(
     source_callable_matched = _apply_source_callable_mapping(
         plan.get("capture_targets", []), shape_log_path,
         callable_kernel_map)
+    vabsorb_probe_matched = _apply_vabsorb_bmm_probe(
+        plan.get("capture_targets", []), shape_log_path)
     source_wrapper_matched = _apply_source_wrapper_mapping(
         plan.get("capture_targets", []), shape_log_path,
         source_wrapper_map)
@@ -654,6 +818,8 @@ def map_plan(
     semantic_wrapper_matched = _apply_shape_log_semantic_wrapper_mapping(
         plan.get("capture_targets", []), shape_log_path,
         missing_bucket_keys)
+    region_fallback_matched = _apply_shape_log_region_fallback(
+        plan.get("capture_targets", []), shape_log_path)
     layer_fallback_matched, layer_fallback_keys = (
         _apply_shape_log_layer_fallback(
             plan.get("capture_targets", []), shape_log_path,
@@ -677,6 +843,9 @@ def map_plan(
         "contained_runtime_kernel_count": len(entries),
         "matched_target_count": matched,
         "source_callable_matched_target_count": source_callable_matched,
+        "vabsorb_probe_matched_target_count": vabsorb_probe_matched,
+        "shape_log_region_fallback_matched_target_count": (
+            region_fallback_matched),
         "source_wrapper_matched_target_count": source_wrapper_matched,
         "shape_log_semantic_wrapper_matched_target_count": (
             semantic_wrapper_matched),
