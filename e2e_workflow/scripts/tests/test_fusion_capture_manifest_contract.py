@@ -41,6 +41,19 @@ class FusionCaptureManifestContractTest(unittest.TestCase):
             source,
         )
 
+    def test_applyback_cannot_time_out_into_a_stale_profile(self):
+        with open(os.path.join(WORKFLOW, "e2e_workflow.js")) as fh:
+            source = fh.read()
+        self.assertIn("const FUSION_APPLY_TIMEOUT_MS", source)
+        self.assertIn(
+            "timeoutMs: FUSION_APPLY_TIMEOUT_MS",
+            source,
+        )
+        self.assertIn(
+            "refusing to run Profile on the pre-Fusion stack",
+            source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -750,6 +750,14 @@ Return ONLY the structured JSON the role file specifies (a StructuredOutput tool
 // it to 45min so a single hung/slow agent can't blow the wall-clock budget (still ample for the director
 // baseline + the head e2e A/B). Default mode keeps 120min → unchanged.
 const AGENT_TIMEOUT_MS = parseInt(A.agent_timeout_ms != null ? A.agent_timeout_ms : (FAST_MODE ? 2700000 : 7200000), 10);
+// Apply-back can legitimately take several hours because it runs a sequence of
+// serving A/B and accuracy gates.  It must not inherit the generic 120-minute
+// hung-agent guard: Promise.race cannot cancel the losing agent(), so timing out
+// here would let Profile start on the pre-Fusion stack while apply-back keeps
+// mutating artifacts in the background.  Zero delegates the hard bound to the
+// outer workflow timeout; callers may still set an explicit phase-local bound.
+const FUSION_APPLY_TIMEOUT_MS = parseInt(
+  A.fusion_apply_timeout_ms != null ? A.fusion_apply_timeout_ms : 0, 10);
 // Process-safety rule prepended to EVERY agent prompt. It is injected at this funnel
 // (the one place `agent()` is ever called) rather than in roleAgent(), because several
 // prompts are built inline and would otherwise never see it — and any future call site
@@ -776,16 +784,21 @@ function withProcessSafety(prompt) {
 
 function agentBounded(rawPrompt, opts) {
   const prompt = withProcessSafety(rawPrompt);
-  if (typeof setTimeout !== 'function' || !(AGENT_TIMEOUT_MS > 0)) return agent(prompt, opts);
+  const timeoutMs = opts && opts.timeoutMs != null
+    ? Number(opts.timeoutMs) : AGENT_TIMEOUT_MS;
+  // timeoutMs is an orchestrator-only option; do not leak it into agent().
+  const agentOpts = (opts && opts.timeoutMs != null) ? { ...opts } : opts;
+  if (agentOpts && agentOpts.timeoutMs != null) delete agentOpts.timeoutMs;
+  if (typeof setTimeout !== 'function' || !(timeoutMs > 0)) return agent(prompt, agentOpts);
   let to;
   const guard = new Promise((resolve) => {
     to = setTimeout(() => {
-      log(`  [hung-agent guard] ${(opts && opts.label) || 'agent'} exceeded ${Math.round(AGENT_TIMEOUT_MS / 60000)}min with no return — treating as a failed attempt.`);
+      log(`  [hung-agent guard] ${(opts && opts.label) || 'agent'} exceeded ${Math.round(timeoutMs / 60000)}min with no return — treating as a failed attempt.`);
       resolve(null);
-    }, AGENT_TIMEOUT_MS);
+    }, timeoutMs);
   });
   return Promise.race([
-    agent(prompt, opts).then((r) => { clearTimeout(to); return r; }, (e) => { clearTimeout(to); throw e; }),
+    agent(prompt, agentOpts).then((r) => { clearTimeout(to); return r; }, (e) => { clearTimeout(to); throw e; }),
     guard,
   ]);
 }
@@ -1470,7 +1483,17 @@ if (!FAST_MODE && (FUSION_DISCOVERY_ON || fusionInputsComplete())) {
         FUSION_BUDGET, FUSION_OVERLAYS_DIR: `${EVAL_DIR}/fusion/fusion_overlays`,
         ...ACCURACY_INPUTS, ...FUSION_RUNTIME_INPUTS, SKILL_DIR: WORKFLOW_DIR,
       }),
-    { phase: 'KernelFusion', label: 'fusion_integrator:apply_back', schema: FUSION_APPLY_SCHEMA }, 1);
+    { phase: 'KernelFusion', label: 'fusion_integrator:apply_back',
+      schema: FUSION_APPLY_SCHEMA, timeoutMs: FUSION_APPLY_TIMEOUT_MS }, 1);
+  // Once apply-back has started, a missing terminal result is not equivalent to
+  // "no Fusion win".  Continuing would profile stale curOverlay/curFlags while
+  // an uncancelled integrator may still finish later and write contradictory
+  // artifacts.  Stop at the phase boundary instead of contaminating every
+  // downstream GEAK decision.
+  if (!fapply) {
+    throw new Error(
+      'KernelFusion apply-back did not reach a terminal state; refusing to run Profile on the pre-Fusion stack.');
+  }
   const acc = (fapply && Array.isArray(fapply.accepted_fusions)) ? fapply.accepted_fusions : [];
   // Surface the coverage verdict in the run log next to the win count. Two accepted
   // fusions out of a twelve-row board is a real result AND an incomplete one; the log
