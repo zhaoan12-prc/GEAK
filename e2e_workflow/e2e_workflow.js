@@ -95,6 +95,13 @@ const suppliedFusionPriorComplete = !!(
   FU.topk_json && FU.candidates_json && FU.unitside_json);
 const FUSION_DISCOVERY_ON = !suppliedFusionPriorComplete &&
   String(A.fusion_discovery != null ? A.fusion_discovery : 'true') === 'true';
+// An explicitly requested discovery is a required phase: silently continuing
+// would turn "Fusion did not run" into a misleading end-to-end "no win". The
+// implicit default remains best-effort for backward compatibility. Callers may
+// override this independently with fusion_required=false.
+const FUSION_REQUIRED = String(A.fusion_required != null
+  ? A.fusion_required
+  : (A.fusion_discovery != null ? A.fusion_discovery : 'false')) === 'true';
 const FUSION_TOP_K = parseInt(A.fusion_top_k != null ? A.fusion_top_k : 10, 10);
 const FUSION_UNITSIDE_BUDGET = parseInt(
   A.fusion_unitside_budget != null ? A.fusion_unitside_budget : FUSION_TOP_K, 10);
@@ -1247,12 +1254,21 @@ if (!FAST_MODE && (FUSION_DISCOVERY_ON || fusionInputsComplete())) {
           ...FUSION_RUNTIME_INPUTS, ...TRACELENS_INPUTS,
         }),
       { phase: 'KernelFusion', label: 'fusion-trace-collector:capture', schema: CAPTURE_SCHEMA }, 1);
-    if (SEMANTICS_MAPPING_ON && fusionCapture && fusionCapture.trace_manifest_json) {
+    // A fresh capture deterministically writes this artifact from bench_e2e.sh.
+    // Keep the agent return as the preferred path, but do not discard a valid
+    // capture merely because the agent timed out or omitted the path field.
+    const expectedFusionManifest = `${EVAL_DIR}/${fusionRound}/profile_trace_manifest.json`;
+    const fusionTraceManifest = (fusionCapture && fusionCapture.trace_manifest_json)
+      ? fusionCapture.trace_manifest_json : expectedFusionManifest;
+    if (!fusionCapture || !fusionCapture.trace_manifest_json) {
+      log(`KernelFusion capture agent returned no manifest; trying deterministic capture artifact ${expectedFusionManifest}.`);
+    }
+    if (SEMANTICS_MAPPING_ON && fusionTraceManifest) {
       semantics = await safeAgent(
         roleAgent('semantics_mapper', 'build_table',
           'Build fusion semantics from the clean production graph trace. Eager/shape evidence may only fill semantic gaps. If EXEC_PREFIX is set, use it as the literal command prefix.', {
             EVAL_DIR, MODEL_PATH, MODEL_NAME, WORKLOAD, ROUND: fusionRound,
-            TRACE_MANIFEST_JSON: fusionCapture.trace_manifest_json,
+            TRACE_MANIFEST_JSON: fusionTraceManifest,
             PROFILE_TOPN_JSON: '', PROFILE_WORKLOAD_JSON: '', SKILL_DIR: WORKFLOW_DIR,
             ...FUSION_RUNTIME_INPUTS,
           }),
@@ -1263,7 +1279,7 @@ if (!FAST_MODE && (FUSION_DISCOVERY_ON || fusionInputsComplete())) {
           roleAgent('semantics_mapper', 'complete_table',
             'Complete unresolved shapes without replacing production-trace timing or phase attribution. If EXEC_PREFIX is set, use it as the literal command prefix.', {
               EVAL_DIR, MODEL_PATH, MODEL_NAME, WORKLOAD, ROUND: fusionRound,
-              TRACE_MANIFEST_JSON: fusionCapture.trace_manifest_json,
+              TRACE_MANIFEST_JSON: fusionTraceManifest,
               STRUCTURAL_PATTERNS_JSON: semantics.structural_patterns_json || '',
               SEMANTIC_TABLE_JSON: semantics.semantic_table_json || '',
               SHAPE_CAPTURE_PLAN_JSON: semantics.shape_capture_plan_json || '',
@@ -1274,7 +1290,7 @@ if (!FAST_MODE && (FUSION_DISCOVERY_ON || fusionInputsComplete())) {
         if (completed) semantics = completed;
       }
     } else {
-      semantics = { status: 'failed', notes: 'fusion capture produced no raw trace manifest' };
+      semantics = { status: 'failed', notes: 'fusion capture produced no usable trace manifest' };
     }
 
     if (semantics && semantics.semantic_table_json) {
@@ -1502,6 +1518,11 @@ if (!FAST_MODE && (FUSION_DISCOVERY_ON || fusionInputsComplete())) {
   }
   } else {
     log('KernelFusion discovery/validation produced no apply-back-ready Top-K; degrading to formal Profile.');
+    if (FUSION_REQUIRED) {
+      throw new Error(
+        'KernelFusion was explicitly required but produced no apply-back-ready Top-K. ' +
+        `Expected deterministic capture manifest: ${EVAL_DIR}/fusion_capture/profile_trace_manifest.json`);
+    }
   }
   // Checkpoint only — not a new runtime baseline. Later stages keep using curTput;
   // Finalize/Director still score against BASELINE_TPUT.

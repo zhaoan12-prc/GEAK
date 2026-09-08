@@ -591,6 +591,37 @@ PY
       adapter_bench "$PROFILE_NUM_PROMPTS" "$CONC" 1 || echo "!!! profile run failed"
   fi
   echo ">>> Trace(s) in $PROFILE_DIR"
+
+  # KernelFusion consumes a deterministic trace manifest, not the raw trace
+  # directory directly. Generate it in the capture process so the pipeline does
+  # not depend on an agent remembering to run trace_capability.py afterward.
+  if [ "$_GEAK_FUSION_CAPTURE" = "1" ]; then
+    _TRACE_CAPABILITY="${SKILL_DIR:-}/scripts/trace_capability.py"
+    _TRACE_MANIFEST="$OUT_DIR/profile_trace_manifest.json"
+    if [ ! -f "$_TRACE_CAPABILITY" ]; then
+      echo "!!! KernelFusion manifest builder missing: $_TRACE_CAPABILITY" >&2
+      exit 2
+    fi
+    if ! python3 "$_TRACE_CAPABILITY" \
+        --trace-dir "$PROFILE_DIR" \
+        --analysis-rank 0 \
+        --out "$_TRACE_MANIFEST"; then
+      echo "!!! KernelFusion trace manifest generation failed: $_TRACE_MANIFEST" >&2
+      exit 2
+    fi
+    if ! python3 - "$_TRACE_MANIFEST" <<'PY'
+import json, sys
+with open(sys.argv[1]) as fh:
+    doc = json.load(fh)
+if doc.get("status") != "pass" or not doc.get("analysis_rank_trace"):
+    raise SystemExit(2)
+PY
+    then
+      echo "!!! KernelFusion trace manifest is invalid: $_TRACE_MANIFEST" >&2
+      exit 2
+    fi
+    echo ">>> KernelFusion trace manifest: $_TRACE_MANIFEST"
+  fi
 fi
 
 # ---- summarize (median throughput across repeats) — backend-independent ----
