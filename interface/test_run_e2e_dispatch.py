@@ -252,6 +252,19 @@ class TestMapArgs(_RunE2ECase):
                     "unitside_json": "/prior/unitside.json"},
             fusion_discovery="false",
             fusion_unitside_budget=4,
+            semantics_shape_capture=True,
+            semantics_shape_capture_setup={
+                "container": "geak-runtime",
+                "model": "/models/test",
+                "benchmark": "benchmarks/sglang/bench_serving.sh",
+                "port": 31017,
+                "tensor_parallel_size": 4,
+                "workload": {
+                    "input_length": 1024,
+                    "output_length": 256,
+                    "concurrency": 8,
+                },
+            },
             e2e_repeats=1,
             state={"headQueue": [{"short_name": "h0"}]},
         )
@@ -263,6 +276,15 @@ class TestMapArgs(_RunE2ECase):
         self.assertEqual(ps["fusion"]["topk_json"], "/prior/topk.json")
         self.assertEqual(ps["fusion_discovery"], "false")
         self.assertEqual(ps["fusion_unitside_budget"], 4)
+        self.assertIs(ps["semantics_shape_capture"], True)
+        self.assertEqual(
+            ps["semantics_shape_capture_setup"]["container"],
+            "geak-runtime",
+        )
+        self.assertEqual(
+            ps["semantics_shape_capture_setup"]["workload"]["concurrency"],
+            8,
+        )
         self.assertEqual(ps["e2e_repeats"], 1)
         self.assertEqual(ps["state"], {"headQueue": [{"short_name": "h0"}]})
         self.assertEqual(ps["time_budget_s"], 3600)

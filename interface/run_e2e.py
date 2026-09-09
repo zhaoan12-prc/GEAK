@@ -285,6 +285,16 @@ def map_args(h: dict, timeout_s: int | None = None) -> dict:
     ):
         if h.get(key) is not None:
             ps_args[key] = h[key]
+    # KernelFusion enables Semantics 1.2 shape completion by default.  The
+    # replay setup is execution context (container, official benchmark, port,
+    # TP and workload), so it cannot be reconstructed reliably by the JS
+    # workflow or the semantics agent.  Preserve the caller's structured setup
+    # verbatim instead of silently degrading to {} and an empty shape log.
+    if h.get("semantics_shape_capture") is not None:
+        ps_args["semantics_shape_capture"] = h["semantics_shape_capture"]
+    if isinstance(h.get("semantics_shape_capture_setup"), dict):
+        ps_args["semantics_shape_capture_setup"] = dict(
+            h["semantics_shape_capture_setup"])
     # Optional A/B repeat count override (bounds the cost of a resume / finalize
     # A/B — e.g. 1 repeat per leg is enough to PROVE both legs ran). General.
     if h.get("e2e_repeats") is not None:

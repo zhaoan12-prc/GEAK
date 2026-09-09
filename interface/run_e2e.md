@@ -44,6 +44,21 @@ The fast-path artifacts live under `<exp_root>/geak_e2e_moe_int4/`
   "runtime_image": "lmsysorg/sglang:latest", // optional fresh unitside runtime
   "fusion_discovery": true,               // default true; fast mode skips fusion
   "fusion_unitside_budget": 10,           // explicit Top-K validation budget
+  "semantics_shape_capture": true,        // optional; KernelFusion defaults true
+  "semantics_shape_capture_setup": {      // required for deterministic shape replay
+    "container": "geak-runtime",
+    "model": "/models/Qwen-Qwen3.5-27B",
+    "benchmark_repository": "/opt/InferenceX",
+    "benchmark": "benchmarks/sglang/bench_serving.sh",
+    "port": 31017,
+    "tensor_parallel_size": 8,
+    "workload": {
+      "input_length": 1024,
+      "output_length": 1024,
+      "concurrency": 64,
+      "random_range_ratio": 0
+    }
+  },
   "raw_baseline_tput": 1485.4,           // caller's pre-change session baseline (audit reference)
   "orchestrator_best_tput_same_config": 1550.8, // caller best measured with accepted_flags/env
   "exp_root": "/work/experiment/geak",   // basename MUST be `geak`; the timestamped run dir is created here
@@ -86,6 +101,8 @@ a ~10-15% 口径 gap. Both default to `0` (fixed) so the standalone and forwarde
 | `exec_prefix` | `exec_prefix` | optional command prefix for KernelFusion roles only |
 | `runtime_image` / `image` | `runtime_image` | optional image used when UnitSide must create a fresh runtime and no `exec_prefix` is supplied |
 | `fusion` / `fusion_discovery` / `fusion_*_budget` | same names | optional complete prior or discovery/budget controls; a complete topk+candidates+unitside prior short-circuits discovery |
+| `semantics_shape_capture` | `semantics_shape_capture` | optional enable/disable control; KernelFusion defaults it to enabled |
+| `semantics_shape_capture_setup` | `semantics_shape_capture_setup` | structured replay contract, forwarded verbatim; must provide container, model, official benchmark, free port, TP and workload |
 | `raw_baseline_tput` | result audit metadata | pre-change session baseline; never used as the measurement-alignment signal |
 | `orchestrator_best_tput_same_config` | result alignment metadata | caller throughput on the accepted config GEAK uses for its baseline |
 | `exp_root` | `exp_root` | run dir root |
