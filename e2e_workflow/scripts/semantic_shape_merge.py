@@ -164,18 +164,23 @@ def _normalize(value):
     return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
 
-def _candidate_groups(row, target, groups, table):
+def _candidate_groups(
+        row, target, groups, table, allow_verified_cross_layer=False):
     phase = str(table["phase"]).lower()
     layer_id = int(table["representative_layer_id"])
-    candidates = [
+    phase_candidates = [
         group for group in groups
-        if group["rank"] == 0 and group["phase"] == phase
-        and group["layer_id"] == layer_id]
+        if group["rank"] == 0 and group["phase"] == phase]
     op_instance_id = target.get("candidate_op_instance_id")
     if op_instance_id:
-        return [
-            group for group in candidates
+        matched = [
+            group for group in phase_candidates
             if group.get("op_instance_id") == op_instance_id]
+        if allow_verified_cross_layer:
+            return matched
+        return [group for group in matched if group["layer_id"] == layer_id]
+    candidates = [
+        group for group in phase_candidates if group["layer_id"] == layer_id]
     explicit = target.get("candidate_op_path") or target.get(
         "candidate_wrapper")
     if not explicit and target.get("parent_operator") != "unresolved":
@@ -248,27 +253,71 @@ def _axis(value, role, source):
     return {"axis_role": role, "value": int(value), "source": source}
 
 
+def _axis_0_alignment(tensor, group, table, exact_bucket):
+    """Return an auditable axis-0 alignment decision.
+
+    A graph-capture bucket may differ from the clean replay batch. Only a
+    floating, rank-2-or-higher activation whose leading dimension equals the
+    capture bucket cardinality is eligible for substitution. This excludes
+    weights, integer indices/offsets, block tables, and ambiguous 1-D buffers.
+    """
+    shape = list(tensor.get("shape") or [])
+    clean = table.get("selected_bucket") or {}
+    target = clean.get("input_tokens") or clean.get("batch_size")
+    observed = {
+        value for value in (
+            group.get("input_tokens"), group.get("batch_size"))
+        if isinstance(value, int) and value > 0}
+    dtype = str(tensor.get("dtype") or "").lower()
+    tensor_path = str(tensor.get("tensor_path") or "").lower()
+    io = str(tensor.get("io") or "").lower()
+    excluded_name = re.search(
+        r"weight|expert|cache|block|index|indices|offset|slot|position",
+        tensor_path)
+    floating = any(token in dtype for token in (
+        "float", "bfloat", "half", "fp8", "bf16", "fp16", "fp32"))
+    eligible = bool(
+        target and len(shape) >= 2 and shape[0] in observed
+        and io in ("input", "output") and floating and not excluded_name)
+    effective = list(shape)
+    if eligible:
+        effective[0] = int(target)
+    changed = effective != shape
+    return effective, {
+        "status": (
+            "axis_0_rewritten" if changed else
+            "exact_bucket_unchanged" if eligible and exact_bucket else
+            "eligible_unchanged" if eligible else "not_eligible"),
+        "axis": 0 if eligible else None,
+        "axis_role": "token_or_batch" if eligible else "unresolved",
+        "logger_value": shape[0] if shape else None,
+        "effective_value": effective[0] if effective else None,
+        "source": (
+            "shape_logger" if eligible and exact_bucket else
+            "clean_trace_step" if eligible else "shape_logger"),
+        "rule": (
+            "floating activation/token-scale axis 0 equals the capture "
+            "bucket cardinality" if eligible else
+            "axis 0 was not proven to be a batch/token activation axis"),
+    }
+
+
 def _tensor_schema(group, row, table, exact_bucket):
     tensors = []
     trace_dims = row.get("shape", {}).get("input_dims") or []
-    clean_bucket = table.get("selected_bucket") or {}
-    clean_dynamic = (
-        clean_bucket.get("input_tokens")
-        or clean_bucket.get("batch_size"))
-    logger_dynamic = {
-        group.get("input_tokens"), group.get("batch_size")}
     for tensor in group["tensors"]:
         item = dict(tensor)
+        item["logger_shape"] = list(tensor.get("shape") or [])
         item["axes"] = [
             _axis(value, "unresolved", "shape_logger")
-            for value in tensor["shape"]]
-        if (item["io"] in ("input", "output") and item["axes"]
-                and item["shape"][0] in logger_dynamic and clean_dynamic):
+            for value in item["logger_shape"]]
+        effective, alignment = _axis_0_alignment(
+            item, group, table, exact_bucket)
+        item["axis_0_alignment"] = alignment
+        if alignment["axis_role"] == "token_or_batch" and item["axes"]:
             item["axes"][0] = _axis(
-                clean_dynamic, "token_or_batch",
-                "shape_logger" if exact_bucket else "clean_trace_step")
-        item["effective_shape"] = [
-            axis["value"] for axis in item["axes"]]
+                effective[0], "token_or_batch", alignment["source"])
+        item["effective_shape"] = effective
         tensors.append(item)
 
     inputs = [item for item in tensors if item["io"] == "input"]
@@ -313,16 +362,11 @@ def _layer_tensor(tensor, table, group):
         return None
     value = dict(tensor)
     value["logger_shape"] = list(tensor.get("shape") or [])
-    value["effective_shape"] = list(value["logger_shape"])
-    clean = table.get("selected_bucket") or {}
-    dynamic = clean.get("input_tokens") or clean.get("batch_size")
-    if (value["effective_shape"] and dynamic
-            and value["effective_shape"][0] in {
-                group.get("input_tokens"), group.get("batch_size")}):
-        value["effective_shape"][0] = dynamic
-        value["axis_0_source"] = (
-            "shape_logger" if _bucket_status(table, group) == "exact"
-            else "clean_trace_step")
+    exact_bucket = _bucket_status(table, group) == "exact"
+    value["effective_shape"], value["axis_0_alignment"] = (
+        _axis_0_alignment(value, group, table, exact_bucket))
+    if value["axis_0_alignment"]["axis"] == 0:
+        value["axis_0_source"] = value["axis_0_alignment"]["source"]
     return value
 
 
@@ -687,18 +731,11 @@ def _markdown(table_doc):
 def _phase_resolution(audits, groups):
     """B8: a phase the shape log covers must resolve at least one row.
 
-    The eager probe (B4) makes the *shape log* carry decode records, but the
-    merge attaches them by `parent_operator`.  A table built from a
-    CUDA-graph DECODE trace has `parent_operator: "unresolved"` on every row
-    -- the CPU replays a captured graph and never walks the module tree --
-    so `_candidate_groups` returns [] for all of them and every decode row
-    lands at evidence level U.  Nothing else in this file notices: the
-    identity checks compare the table against itself and pass.
-
-    The fix at the source is to build the decode table from the *eager*
-    capture trace, which does carry module spans.  This gate is what makes
-    the mistake loud instead of silent: if the shape log has records for a
-    phase and not one row of that phase resolved, the merge fails.
+    CUDA-graph replay does not walk the Python module tree, so its clean rows
+    may have unresolved parent operators. Graph-construction metadata is bound
+    through the separately audited capture plan. If the shape log covers a
+    phase but no row resolves, the mapping or sequence audit failed and the
+    merge must fail loudly.
     """
     log_phases = set()
     for group in groups:
@@ -728,9 +765,8 @@ def _phase_resolution(audits, groups):
             "status": "fail" if bad else "pass",
             "note": (
                 "the shape log carries records for this phase but not one "
-                "table row resolved -- the table was almost certainly built "
-                "from a CUDA-graph trace, whose rows have no parent operator "
-                "to key on; rebuild it from the eager capture trace"
+                "table row resolved -- CUDA-graph construction markers were "
+                "not successfully bound to the clean Kernel rows"
             ) if bad else None,
         })
     return {"status": "fail" if failed else "pass",
@@ -745,7 +781,17 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir):
     groups = _groups(_shape_records(shape_log_path))
     target_by_row = {
         target["row_id"]: target
-        for target in capture_plan.get("capture_targets", [])}
+        for target in capture_plan.get("capture_targets", [])
+        if target.get("row_id")}
+    clean_sequence_verified = (
+        (capture_plan.get("runtime_marker_mapping") or {})
+        .get("clean_table_sequence_audit", {}).get("status") == "pass")
+    target_by_position = {}
+    if clean_sequence_verified:
+        target_by_position = {
+            (str(target.get("phase", "")).lower(),
+             target.get("pattern_id"), int(target.get("pos", -1))): target
+            for target in capture_plan.get("capture_targets", [])}
     audits = []
     for table in table_doc.get("tables", []):
         table_groups = [
@@ -811,11 +857,20 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir):
                     "source": "clean_trace_external_id",
                 }
             else:
-                target = target_by_row.get(row["row_id"], {})
+                target = target_by_row.get(row["row_id"])
+                clean_row_binding = "row_id"
+                if target is None and clean_sequence_verified:
+                    target = target_by_position.get((
+                        str(table.get("phase", "")).lower(),
+                        table.get("pattern_id"), int(row.get("pos", -1))))
+                    clean_row_binding = "verified_pattern_position"
+                target = target or {}
                 runtime_internal = _is_runtime_internal(row)
                 candidates = (
                     [] if runtime_internal
-                    else _candidate_groups(row, target, groups, table))
+                    else _candidate_groups(
+                        row, target, groups, table,
+                        clean_row_binding == "verified_pattern_position"))
                 alignment_source = False
                 if len(candidates) == 1:
                     group = candidates[0]
@@ -846,6 +901,7 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir):
                             "a matching semantic anchor"
                             if alignment_source else
                             "unique source/runtime candidate"),
+                        "clean_row_binding": clean_row_binding,
                         "wrapper_scope": (
                             target.get("shape_log_layer_evidence", {})
                             .get("scope")),
@@ -960,6 +1016,26 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir):
     for audit in audits:
         level = audit["evidence"]["level"]
         counts[level] = counts.get(level, 0) + 1
+    alignment_counts = {}
+    alignment_rewrites = []
+    for audit in audits:
+        tensors = (audit.get("evidence", {}).get("schema", {})
+                   .get("tensors", []))
+        for tensor in tensors:
+            alignment = tensor.get("axis_0_alignment") or {}
+            status = alignment.get("status", "not_recorded")
+            alignment_counts[status] = alignment_counts.get(status, 0) + 1
+            if status == "axis_0_rewritten":
+                alignment_rewrites.append({
+                    "row_id": audit["row_id"],
+                    "tensor_path": tensor.get("tensor_path"),
+                    "io": tensor.get("io"),
+                    "dtype": tensor.get("dtype"),
+                    "logger_shape": tensor.get("logger_shape"),
+                    "effective_shape": tensor.get("effective_shape"),
+                    "source": alignment.get("source"),
+                    "rule": alignment.get("rule"),
+                })
     phase_resolution = _phase_resolution(audits, groups)
     verification = {
         "schema_version": 1,
@@ -967,6 +1043,14 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir):
             unchanged and phase_resolution["status"] == "pass") else "fail",
         "clean_trace_identity_unchanged": unchanged,
         "evidence_counts": counts,
+        "shape_alignment_audit": {
+            "policy": (
+                "only axis 0 of proven floating activation/token-scale "
+                "tensors may follow the clean replay batch/token dimension"),
+            "status_counts": alignment_counts,
+            "rewritten_tensor_count": len(alignment_rewrites),
+            "rewrites": alignment_rewrites,
+        },
         "row_count": len(audits),
         "shape_log_group_count": len(groups),
         "representative_table_checks": table_checks,

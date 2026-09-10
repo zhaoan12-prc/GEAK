@@ -16,6 +16,13 @@ except Exception:  # noqa: BLE001 - catalog gate is opt-in via --catalog
     fusion_catalog = None
 
 
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_PRIORS_INDEX = os.path.abspath(os.path.join(
+    _SCRIPT_DIR, "..", "knowledge", "learned", "INDEX.md"))
+DEFAULT_FUSION_STRATEGIES = os.path.abspath(os.path.join(
+    _SCRIPT_DIR, "..", "knowledge", "fusion", "fusion_strategies.json"))
+
+
 PHASE_ORDER = {"prefill": 0, "decode": 1}
 READINESS = {
     "ready_for_api_validation",
@@ -344,7 +351,8 @@ def _phase_coverage_gate(table, payload, allow_reason):
     Candidate DISCOVERY needs the sequence (which kernels, in what order).
     Candidate GENERATION and the 单侧 microbench need the SHAPES.  So a phase
     that appears in the tables but resolved zero shapes is not a weaker input,
-    it is an unusable one, and the honest answer is to run the eager probe --
+    it is an unusable one, and the honest answer is to run graph-construction
+    shape capture --
     not to emit candidates nobody can bench.
 
     Returns (record, errors, warnings).
@@ -438,8 +446,9 @@ def _phase_coverage_gate(table, payload, allow_reason):
             problems.append(
                 "phase %r resolved 0/%d row shapes (%s): candidates for it "
                 "would carry shapes nobody measured, and the 单侧 microbench "
-                "has nothing real to build tensors from. Run the eager shape "
-                "probe (run_semantic_shape_capture) and merge before Phase 2"
+                "has nothing real to build tensors from. Run graph-construction "
+                "shape capture (run_semantic_shape_capture) and merge before "
+                "Phase 2"
                 % (phase, rows,
                    coverage.get("decode_evidence") if phase == "decode"
                    else "no shape evidence"))
@@ -469,7 +478,7 @@ def _phase_coverage_gate(table, payload, allow_reason):
             else "sequence_and_shapes" if (_decode_shapes and _decode_seq)
             else "sequence_only_shapes_unresolved" if _decode_seq
             else "no_decode_trace_analysed"),
-        "decode_requires_eager_probe": (
+        "decode_requires_graph_capture": (
             "decode" in shape_stats and not _decode_shapes),
         "problems": problems,
         "waiver": allow_reason,
@@ -1105,22 +1114,42 @@ def validate(semantic_table_path, candidates_path,
                 candidate.get("addressable_us_per_layer"), removable_total):
             errors.append("%s addressable_us_per_layer must equal removable sum" % path)
         # Merge ceiling: a fusion replaces N kernels with ONE fused kernel that
-        # still runs, so it must keep an anchor — the heaviest member cannot be
-        # counted as savings. This kills the "removable = every member -> save
-        # 100%" over-claim (e.g. norm+quant marked fully removable).
+        # still runs, so it must keep an anchor. Most candidates do not identify
+        # the producer explicitly, in which case the conservative fallback is the
+        # heaviest member. Cross-donor fusions such as dequant->GEMM may name an
+        # explicit DONOR anchor: the fused GEMM remains while even more expensive
+        # helper kernels disappear. This is evidence about ownership, not a way to
+        # make every member removable.
         member_durations = [
             float(source_rows[(key[0], key[1], rid)].get("duration_us", 0.0)
                   or 0.0)
             for rid in member_ids if (key[0], key[1], rid) in source_rows]
         max_member = max(member_durations) if member_durations else 0.0
-        merge_ceiling = member_total - max_member
+        anchor_row_id = candidate.get("anchor_row_id")
+        anchor_duration = max_member
+        if anchor_row_id is not None:
+            if anchor_row_id not in member_ids:
+                errors.append(
+                    "%s anchor_row_id must be a candidate member" % path)
+            else:
+                anchor_source = source_rows.get(
+                    (key[0], key[1], anchor_row_id), {})
+                if anchor_source.get("stage") not in DONOR_STAGES:
+                    errors.append(
+                        "%s anchor_row_id must name a donor stage, got %r" % (
+                            path, anchor_source.get("stage")))
+                if anchor_row_id in removable:
+                    errors.append(
+                        "%s anchor_row_id cannot also be removable" % path)
+                anchor_duration = float(
+                    anchor_source.get("duration_us", 0.0) or 0.0)
+        merge_ceiling = member_total - anchor_duration
         if removable_total > merge_ceiling + 1e-3:
             errors.append(
                 "%s addressable %.3f exceeds merge ceiling %.3f (Σmembers − "
-                "heaviest member %.3f): a fused kernel is at least as costly as "
-                "its heaviest constituent, which cannot be counted as savings — "
-                "keep it as the anchor (not removable)" % (
-                    path, removable_total, merge_ceiling, max_member))
+                "anchor %.3f): the surviving fused producer cannot be counted "
+                "as savings — keep it as the anchor (not removable)" % (
+                    path, removable_total, merge_ceiling, anchor_duration))
         # A fused kernel cannot cross a main donor. An aggregate "cluster"
         # candidate (family *_cluster, from the sub-floor escalation) must be a
         # CONTIGUOUS run — no donor-stage row (GEMM/Attention/MoE/Collective) may
@@ -1924,8 +1953,9 @@ def main():
         help="min per-layer sum (us) of sub-floor non-candidate helpers in one "
              "(phase, pattern) before they must become a cluster candidate")
     parser.add_argument(
-        "--priors-index", metavar="INDEX_MD", default=None,
-        help="knowledge/learned/INDEX.md. When given, every fusion card in it "
+        "--priors-index", metavar="INDEX_MD", default=DEFAULT_PRIORS_INDEX,
+        help="knowledge/learned/INDEX.md (defaults to the repository copy). "
+             "Every fusion card in it "
              "must have an explicit entry in the candidates' "
              "`prior_dispositions` (candidate | already_engaged | "
              "not_applicable + reason). Priors only ADD candidates; the gate "
@@ -1943,8 +1973,10 @@ def main():
              "the result. This does NOT make the candidates for that phase "
              "trustworthy -- it records that you knowingly built them anyway")
     parser.add_argument(
-        "--fusion-priors", metavar="FUSION_STRATEGIES_JSON", default="",
-        help="knowledge/fusion/fusion_strategies.json. Fills the gap the "
+        "--fusion-priors", metavar="FUSION_STRATEGIES_JSON",
+        default=DEFAULT_FUSION_STRATEGIES,
+        help="knowledge/fusion/fusion_strategies.json (defaults to the "
+             "repository copy). Fills the gap the "
              "installed-kernel scan cannot see: a fusible region with no catalog "
              "kernel but a matching known strategy is annotated with the "
              "strategy + its kernel/provider (a porting reference for the author "

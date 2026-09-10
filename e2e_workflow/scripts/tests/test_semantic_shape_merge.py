@@ -93,8 +93,12 @@ class SemanticShapeMergeTest(unittest.TestCase):
                 }],
             }
             plan = {
+                "runtime_marker_mapping": {
+                    "clean_table_sequence_audit": {"status": "pass"}},
                 "capture_targets": [{
-                    "row_id": "event-2",
+                    "row_id": "old-event-2",
+                    "phase": "decode", "pattern_id": "P", "pos": 1,
+                    "candidate_op_instance_id": "op1",
                     "candidate_wrapper": "model.layers.2.proj",
                     "candidate_terminal_launcher": None,
                     "mapping_cardinality": "1:N",
@@ -148,6 +152,9 @@ class SemanticShapeMergeTest(unittest.TestCase):
             self.assertEqual(rows[0]["shape"]["input_dims"], [[4, 8]])
             self.assertEqual(rows[1]["semantic_evidence"]["level"], "P")
             self.assertEqual(
+                rows[1]["semantic_evidence"]["clean_row_binding"],
+                "verified_pattern_position")
+            self.assertEqual(
                 rows[1]["semantic_evidence"]["probe_scope"], "wrapper")
             self.assertEqual(rows[1]["shape"]["input_dims"],
                              [[4, 8], [16, 8], [4, 16]])
@@ -162,9 +169,13 @@ class SemanticShapeMergeTest(unittest.TestCase):
                 layer_io = json.load(fh)["tables"][0]["layer_io"]
             self.assertEqual(layer_io["bucket_match"], "compatible")
             self.assertEqual(layer_io["input"]["shape"], [8, 8])
+            self.assertEqual(layer_io["input"]["logger_shape"], [8, 8])
             self.assertEqual(layer_io["input"]["effective_shape"], [4, 8])
             self.assertEqual(
                 layer_io["input"]["axis_0_source"], "clean_trace_step")
+            self.assertEqual(
+                layer_io["input"]["axis_0_alignment"]["status"],
+                "axis_0_rewritten")
             with open(result["semantic_table_md"]) as fh:
                 markdown = fh.read()
             self.assertIn("pattern layers (3): `[1, 2, 3]`", markdown)
@@ -179,6 +190,42 @@ class SemanticShapeMergeTest(unittest.TestCase):
                 "representative layer I/O: `source=shape_logger, "
                 "input=BF16[4×8], output=BF16[4×16], bucket=compatible`",
                 markdown)
+
+    def test_axis_0_alignment_preserves_weights_indices_and_ambiguous_1d(self):
+        table = {"selected_bucket": {"batch_size": 4, "input_tokens": 0}}
+        group = {"batch_size": 1, "input_tokens": 1}
+        cases = [
+            ({"io": "weight", "tensor_path": "parameters.weight",
+              "shape": [1, 8], "dtype": "float8_e4m3fnuz"}, [1, 8]),
+            ({"io": "input", "tensor_path": "args.indices",
+              "shape": [1, 8], "dtype": "int64"}, [1, 8]),
+            ({"io": "input", "tensor_path": "args[0]",
+              "shape": [1], "dtype": "bfloat16"}, [1]),
+            ({"io": "input", "tensor_path": "args[0]",
+              "shape": [1, 8], "dtype": "bfloat16"}, [4, 8]),
+            ({"io": "output", "tensor_path": "output.scale",
+              "shape": [1, 2], "dtype": "float32"}, [4, 2]),
+        ]
+        for tensor, expected in cases:
+            effective, audit = merge._axis_0_alignment(
+                tensor, group, table, exact_bucket=False)
+            self.assertEqual(effective, expected)
+            self.assertEqual(audit["status"] == "axis_0_rewritten",
+                             expected != tensor["shape"])
+
+    def test_verified_pattern_position_allows_cross_layer_shape_group(self):
+        groups = [{
+            "rank": 0, "phase": "decode", "layer_id": 13,
+            "op_instance_id": "capture-op"}]
+        target = {"candidate_op_instance_id": "capture-op"}
+        table = {"phase": "decode", "representative_layer_id": 32}
+        self.assertEqual(
+            merge._candidate_groups(
+                {}, target, groups, table,
+                allow_verified_cross_layer=True),
+            groups)
+        self.assertEqual(
+            merge._candidate_groups({}, target, groups, table), [])
 
     def test_kernel_gemm_shape_uses_semantic_roles_and_canonical_dtypes(self):
         row = {

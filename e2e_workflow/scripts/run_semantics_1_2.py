@@ -28,6 +28,32 @@ def _sha256(path):
     return digest.hexdigest()
 
 
+def _verified_graph_capture_phases(capture_results):
+    """Phases whose clean rows were fully checked against graph-capture data."""
+    verified = set()
+    for capture in capture_results:
+        if capture.get("shape_capture_execution") != "graph_capture":
+            continue
+        mapping = capture.get("runtime_marker_mapping") or {}
+        audit = mapping.get("clean_table_sequence_audit") or {}
+        passed_groups = {}
+        for group in audit.get("groups", []):
+            phase = str(group.get("phase") or "").lower()
+            passed_groups.setdefault(phase, []).append(
+                group.get("status") == "pass")
+        for phase, stats in (mapping.get(
+                "shape_mapping_by_phase") or {}).items():
+            phase = str(phase or "").lower()
+            eligible = int(stats.get("shape_eligible_target_count", 0) or 0)
+            matched = int(
+                stats.get("shape_eligible_matched_target_count", 0) or 0)
+            if (eligible > 0 and matched == eligible
+                    and passed_groups.get(phase)
+                    and all(passed_groups[phase])):
+                verified.add(phase)
+    return verified
+
+
 def run(config_path, trace_path, shape_log_path, out_dir,
         config_key="", runtime_sources=None, capture_setup_path="",
         capture_result_path="", capture_result_paths=None,
@@ -96,65 +122,19 @@ def run(config_path, trace_path, shape_log_path, out_dir,
     semantic = semantic_kernel_mapping.build(
         trace_path, patterns_path, out_dir, require_phases=require_phases)
 
-    # --- Layer-boundary evidence gate (module spans) -------------------------
+    # --- Initial layer-boundary evidence -------------------------------------
     # semantic_kernel_mapping resolves per-layer boundaries from python_function
     # `nn.Module: ...DecoderLayer_<id>` spans, captured only when the torch
     # profiler ran with with_stack/with_modules. Without them the boundary step
-    # degrades to forced_best_alignment and mis-places layer start/end. Fail
-    # loudly instead of silently emitting unreliable boundaries; allow an
-    # explicit opt-in to proceed degraded.
+    # degrades to sequence segmentation.  Do not accept that evidence by itself;
+    # graph-capture completion below must independently verify every degraded
+    # phase against the clean Kernel sequence before the run can pass.
     with open(semantic["layer_instance_audit_json"]) as fh:
         module_scope_count = int(
             json.load(fh).get("module_scope_count", 0) or 0)
-    allow_no_module_spans = os.environ.get(
-        "GEAK_SEMANTICS_ALLOW_NO_MODULE_SPANS", "0") in ("1", "true", "True")
     boundary_evidence = (
         "module_span" if module_scope_count > 0
         else "degraded_no_module_span")
-    if module_scope_count == 0 and not allow_no_module_spans:
-        # Non-gating sidecar: do NOT crash or re-capture. Return an explicit
-        # failed status so the caller (e2e_workflow) skips Semantics 1.2 +
-        # semantic/fusion and falls back to the native optimization flow.
-        notes = (
-            "clean trace has no DecoderLayer module spans "
-            "(module_scope_count=0): the torch profiler was captured without "
-            "with_stack/with_modules, so per-layer kernel boundaries would "
-            "degrade to forced_best_alignment and are untrustworthy. Skipping "
-            "Semantics 1.2 + semantic/fusion; native flow should proceed. "
-            "Re-capture the trace with SGLANG_PROFILE_WITH_STACK=1 (keep "
-            "record_shapes on), or set GEAK_SEMANTICS_ALLOW_NO_MODULE_SPANS=1 "
-            "to force a degraded run.")
-        result = {
-            "schema_version": 1,
-            "pipeline": "geak_semantics_1_2",
-            "status": "failed",
-            "boundary_evidence": boundary_evidence,
-            "module_scope_count": module_scope_count,
-            "notes": notes,
-            "inputs": {
-                "config": {
-                    "path": os.path.abspath(config_path),
-                    "sha256": _sha256(config_path),
-                },
-                "trace": {
-                    "path": os.path.abspath(trace_path),
-                    "sha256": _sha256(trace_path),
-                },
-                "agent_structural_patterns": {
-                    "path": structural_patterns_input,
-                    "sha256": structural_patterns_input_sha256,
-                },
-            },
-            "structural_patterns_json": patterns_path,
-            "semantic_mapping": semantic,
-            "published_semantic_table_json": semantic["semantic_table_json"],
-            "published_semantic_table_md": semantic["semantic_table_md"],
-        }
-        result_path = os.path.join(out_dir, "SEMANTICS_1_2_RUN.json")
-        result["result_json"] = result_path
-        with open(result_path, "w") as fh:
-            json.dump(result, fh, indent=2)
-        return result
 
     phase_1_1_json = os.path.join(
         out_dir, "pattern_layer_kernel_table_1_1.json")
@@ -189,29 +169,6 @@ def run(config_path, trace_path, shape_log_path, out_dir,
             "shape_log_path, capture_setup_path, or capture_result_path "
             "is required")
 
-    # --- Keep the CUDA-graph clean trace authoritative -----------------------
-    # A graph-replayed Decode trace has little CPU-side attribution, while an
-    # eager probe has wrappers but may execute a different branch.  Keep the
-    # former as the fact table and use the latter only in the merge below.
-    boundary_rebuild = None
-    eager_decode_traces = []
-    for capture in capture_results:
-        by_phase = capture.get("capture_traces_by_phase") or {}
-        decode_trace = by_phase.get("DECODE")
-        if (decode_trace and os.path.exists(decode_trace)
-                and semantic_kernel_mapping.has_module_layer_spans(
-                    decode_trace)):
-            eager_decode_traces.append(decode_trace)
-    boundary_rebuild = {
-        "applied": False,
-        "status": "auxiliary_only" if eager_decode_traces else "unavailable",
-        "reason": (
-            "eager Decode traces provide wrapper/shape evidence only; the "
-            "CUDA-graph clean trace remains authoritative for Kernel order "
-            "and timing"),
-        "traces": [os.path.abspath(path) for path in eager_decode_traces],
-    }
-
     probe_tables = []
     probe_runs = []
     if shape_log_path:
@@ -235,7 +192,9 @@ def run(config_path, trace_path, shape_log_path, out_dir,
             capture_result.get(
                 "callable_kernel_map", callable_kernel_map),
             capture_result.get(
-                "source_wrapper_map", source_wrapper_map))
+                "source_wrapper_map", source_wrapper_map),
+            clean_table_path=phase_1_1_json,
+            required_phases=capture_result.get("capture_phases"))
         capture_result["runtime_marker_mapping"] = marker_mapping
         merged_probe = semantic_shape_merge.merge(
             phase_1_1_json, merge_plan_path,
@@ -261,6 +220,24 @@ def run(config_path, trace_path, shape_log_path, out_dir,
         capture.get("runtime_marker_mapping", {}).get(
             "phase_coverage_complete", False)
         for capture in capture_results)
+    graph_capture_verified_phases = _verified_graph_capture_phases(
+        capture_results)
+    boundary_rebuild = {
+        "applied": bool(graph_capture_verified_phases),
+        "status": (
+            "graph_capture_sequence_verified"
+            if graph_capture_verified_phases else "unavailable"),
+        "reason": (
+            "degraded clean-trace layer boundaries are accepted only for "
+            "phases whose graph-capture shape-eligible rows all mapped and "
+            "whose pattern Kernel sequences matched the clean table"),
+        "verified_phases": sorted(graph_capture_verified_phases),
+        "traces": [
+            os.path.abspath(capture["capture_trace"])
+            for capture in capture_results
+            if capture.get("shape_capture_execution") == "graph_capture"
+            and capture.get("capture_trace")],
+    }
     # --- Per-phase boundary evidence -----------------------------------------
     # `boundary_evidence` above is an AGGREGATE over the whole run: prefill's 61
     # module spans set it to "module_span" even when every decode layer fell
@@ -287,21 +264,14 @@ def run(config_path, trace_path, shape_log_path, out_dir,
     degraded_phases = sorted(
         phase for phase, level in phase_boundary_evidence.items()
         if level != "module_span")
-    # CUDA-graph replay legitimately lacks CPU module spans.  A separately
-    # captured eager Decode pass may supply wrapper/region evidence, but it must
-    # never replace the clean graph rows.  Treat only that explicit combination
-    # as a non-blocking boundary degradation.
-    auxiliary_decode_ok = bool(
-        eager_decode_traces and capture_phase_coverage_complete)
     blocking_degraded_phases = [
         phase for phase in degraded_phases
-        if phase != "decode" or not auxiliary_decode_ok]
+        if phase not in graph_capture_verified_phases]
 
     status = "pass" if (
         semantic["status"] != "fail"
         and merged["status"] == "pass"
         and capture_phase_coverage_complete
-        and boundary_evidence == "module_span"
         and not blocking_degraded_phases
     ) else "fail"
     result = {

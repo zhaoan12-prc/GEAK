@@ -135,6 +135,69 @@ def _target_bucket(target):
     )
 
 
+def _clean_sequence_audit(plan, clean_table_path, active_phases):
+    """Verify captured target positions against the authoritative clean table."""
+    if not clean_table_path:
+        return None, set()
+    with open(clean_table_path) as fh:
+        clean_doc = json.load(fh)
+    clean_tables = {
+        (_phase(table.get("phase")), table.get("pattern_id")): table
+        for table in clean_doc.get("tables", [])}
+    grouped = {}
+    for target in plan.get("capture_targets", []):
+        phase = _phase(target.get("phase"))
+        if phase not in active_phases:
+            continue
+        key = (phase, target.get("pattern_id"))
+        grouped.setdefault(key, []).append(target)
+    groups = []
+    failed = set()
+    for key, targets in sorted(grouped.items()):
+        table = clean_tables.get(key)
+        clean_by_pos = {
+            int(row.get("pos", -1)): row
+            for row in (table or {}).get("rows", [])}
+        mismatches = []
+        for target in sorted(targets, key=lambda item: item.get("pos", -1)):
+            pos = int(target.get("pos", -1))
+            clean_row = clean_by_pos.get(pos)
+            if clean_row is None:
+                mismatches.append({"pos": pos, "reason": "missing_clean_row"})
+                continue
+            if _kernel_key(target.get("raw_name")) != _kernel_key(
+                    clean_row.get("raw_name")):
+                mismatches.append({
+                    "pos": pos,
+                    "reason": "kernel_identity_mismatch",
+                    "capture_plan_kernel": target.get("raw_name"),
+                    "clean_table_kernel": clean_row.get("raw_name"),
+                })
+        status = "pass" if table is not None and not mismatches else "fail"
+        if status == "fail":
+            failed.add(key)
+        groups.append({
+            "phase": key[0],
+            "pattern_id": key[1],
+            "status": status,
+            "capture_target_count": len(targets),
+            "clean_row_count": len(clean_by_pos),
+            "capture_representative_layers": sorted({
+                int(target.get("representative_layer_id", -1))
+                for target in targets}),
+            "clean_representative_layer": (
+                table.get("representative_layer_id") if table else None),
+            "matched_position_count": len(targets) - len(mismatches),
+            "mismatches": mismatches,
+        })
+    return {
+        "status": "fail" if failed else "pass",
+        "clean_table": os.path.abspath(clean_table_path),
+        "active_phases": sorted(active_phases),
+        "groups": groups,
+    }, failed
+
+
 def _marker_matches_bucket(marker, bucket):
     phase, layer_id, batch_size, input_tokens = bucket
     if marker["phase"] != phase or marker["layer_id"] != layer_id:
@@ -369,6 +432,19 @@ def _layer_fallback_eligible(target):
         and "__amd_rocclr_fillBufferAligned" not in kernel)
 
 
+def _shape_mapping_exclusion_reason(target):
+    """Classify clean rows that do not own a meaningful tensor schema."""
+    if str(target.get("stage") or "").lower() == "communication":
+        return "cross_device_communication"
+    if str(target.get("event_type") or "").lower() in (
+            "gpu_memcpy", "gpu_memset"):
+        return "runtime_copy_or_memset"
+    kernel = str(target.get("short_name") or target.get("raw_name") or "")
+    if "__amd_rocclr_fillBufferAligned" in kernel:
+        return "runtime_buffer_fill"
+    return None
+
+
 def _annotate_decode_semantic_regions(targets):
     """Partition MLA Decode rows using anchors in the clean graph trace.
 
@@ -430,7 +506,7 @@ def _annotate_decode_semantic_regions(targets):
 
 
 def _apply_vabsorb_bmm_probe(targets, shape_log_path):
-    """Attach a unique eager torch.bmm probe to the graph V-absorb GEMM."""
+    """Attach a unique graph-construction torch.bmm probe to V-absorb."""
     if not shape_log_path or not os.path.exists(shape_log_path):
         return 0
     records = []
@@ -470,7 +546,9 @@ def _apply_vabsorb_bmm_probe(targets, shape_log_path):
             "shape_log": os.path.abspath(shape_log_path),
             "semantic_region": "v_absorb",
             "launcher": "torch:bmm",
-            "rule": "unique eager bmm inside the anchored V-absorb region",
+            "rule": (
+                "unique graph-construction bmm inside the anchored "
+                "V-absorb region"),
         }
         matched += 1
     return matched
@@ -684,7 +762,8 @@ def _apply_shape_log_region_fallback(targets, shape_log_path):
                 "semantic_region": target.get("semantic_region"),
                 "rule": (
                     "clean graph anchor partition identifies the narrow "
-                    "region; eager layer wrapper supplies context only"),
+                    "region; graph-construction layer wrapper supplies "
+                    "context only"),
             }
             matched += 1
     return matched
@@ -692,7 +771,8 @@ def _apply_shape_log_region_fallback(targets, shape_log_path):
 
 def map_plan(
         plan_path, capture_trace_path, out_path, shape_log_path="",
-        callable_kernel_map=None, source_wrapper_map=None):
+        callable_kernel_map=None, source_wrapper_map=None,
+        clean_table_path="", required_phases=None):
     with open(plan_path) as fh:
         plan = json.load(fh)
     _annotate_decode_semantic_regions(plan.get("capture_targets", []))
@@ -716,6 +796,15 @@ def map_plan(
         if bucket is not None and bucket not in bucket_marker_ids:
             bucket_marker_ids[bucket] = _first_forward_marker_ids(
                 markers, bucket)
+    required_phases = {
+        _phase(value) for value in (required_phases or [])}
+    active_phases = {
+        bucket[0] for bucket, marker_ids in bucket_marker_ids.items()
+        if marker_ids}
+    audited_phases = (
+        active_phases & required_phases if required_phases else active_phases)
+    clean_sequence_audit, failed_sequence_groups = _clean_sequence_audit(
+        plan, clean_table_path, audited_phases)
 
     matched = 0
     ambiguous = 0
@@ -724,6 +813,13 @@ def map_plan(
     for key, targets in grouped_targets.items():
         targets.sort(key=lambda item: item.get("pos", -1))
         phase, layer_id, kernel_key, bucket = key
+        if any(
+                (phase, target.get("pattern_id")) in failed_sequence_groups
+                for target in targets):
+            for target in targets:
+                target["runtime_marker_mapping_status"] = (
+                    "clean_sequence_mismatch")
+            continue
         marker_ids = bucket_marker_ids.get(bucket) if bucket else None
         candidates = [
             entry for entry in entries
@@ -796,7 +892,7 @@ def map_plan(
                 (
                     "same phase/layer/normalized kernel identity; unique "
                     "candidate between already-mapped neighboring clean "
-                    "kernel positions inside one eager forward"),
+                    "kernel positions inside one graph-construction forward"),
                 marker_launch_counts[
                     inside[0]["marker"]["op_instance_id"]])
             matched += 1
@@ -824,18 +920,65 @@ def map_plan(
         _apply_shape_log_layer_fallback(
             plan.get("capture_targets", []), shape_log_path,
             missing_bucket_keys))
+    for target in plan.get("capture_targets", []):
+        sequence_key = (
+            _phase(target.get("phase")), target.get("pattern_id"))
+        if sequence_key not in failed_sequence_groups:
+            continue
+        for key in (
+                "candidate_op_path", "candidate_op_instance_id",
+                "candidate_wrapper", "candidate_terminal_launcher",
+                "mapping_cardinality", "source_mapping_status",
+                "runtime_marker_evidence", "source_callable_evidence",
+                "source_wrapper_evidence", "shape_log_layer_evidence"):
+            target.pop(key, None)
+        target["runtime_marker_mapping_status"] = "clean_sequence_mismatch"
     statuses = [
         target.get("runtime_marker_mapping_status")
         for target in plan.get("capture_targets", [])]
     matched = statuses.count("matched")
     ambiguous = statuses.count("ambiguous_count")
     unmatched = statuses.count("not_found")
+    sequence_rejected = statuses.count("clean_sequence_mismatch")
     missing_marker_buckets = [
         "|".join(str(value) for value in bucket)
         for bucket, marker_ids in bucket_marker_ids.items()
         if (not marker_ids
+            and (not required_phases or bucket[0] in required_phases)
             and (bucket[0], bucket[1]) not in layer_fallback_keys)
     ]
+    eligibility = collections.Counter()
+    eligible_targets = []
+    for target in plan.get("capture_targets", []):
+        reason = _shape_mapping_exclusion_reason(target)
+        if reason:
+            eligibility[reason] += 1
+        else:
+            eligible_targets.append(target)
+    eligible_matched = sum(
+        target.get("runtime_marker_mapping_status") == "matched"
+        for target in eligible_targets)
+    mapping_by_phase = {}
+    for phase in sorted({
+            _phase(target.get("phase"))
+            for target in plan.get("capture_targets", [])}):
+        phase_targets = [
+            target for target in plan.get("capture_targets", [])
+            if _phase(target.get("phase")) == phase]
+        phase_eligible = [
+            target for target in phase_targets
+            if _shape_mapping_exclusion_reason(target) is None]
+        phase_matched = sum(
+            target.get("runtime_marker_mapping_status") == "matched"
+            for target in phase_eligible)
+        mapping_by_phase[phase] = {
+            "target_count": len(phase_targets),
+            "shape_eligible_target_count": len(phase_eligible),
+            "shape_eligible_matched_target_count": phase_matched,
+            "shape_eligible_match_fraction": round(
+                phase_matched / len(phase_eligible), 4)
+                if phase_eligible else 1.0,
+        }
     plan["runtime_marker_mapping"] = {
         "schema_version": 1,
         "capture_trace": os.path.abspath(capture_trace_path),
@@ -853,6 +996,17 @@ def map_plan(
             layer_fallback_matched),
         "ambiguous_target_count": ambiguous,
         "unmatched_target_count": unmatched,
+        "sequence_rejected_target_count": sequence_rejected,
+        "shape_eligible_target_count": len(eligible_targets),
+        "shape_eligible_matched_target_count": eligible_matched,
+        "shape_eligible_match_fraction": round(
+            eligible_matched / len(eligible_targets), 4)
+            if eligible_targets else 1.0,
+        "shape_ineligible_target_count": sum(eligibility.values()),
+        "shape_ineligible_reasons": dict(sorted(eligibility.items())),
+        "shape_mapping_by_phase": mapping_by_phase,
+        "clean_table_sequence_audit": clean_sequence_audit,
+        "required_phases": sorted(required_phases),
         "phase_coverage_complete": not missing_marker_buckets,
         "missing_marker_buckets": missing_marker_buckets,
         "selected_forward_marker_counts": {
@@ -871,9 +1025,22 @@ def main():
     parser.add_argument("--capture-plan", required=True)
     parser.add_argument("--capture-trace", required=True)
     parser.add_argument("--out", required=True)
+    parser.add_argument(
+        "--shape-log", default="",
+        help="optional runtime shape JSONL used only for explicit fallbacks")
+    parser.add_argument(
+        "--clean-table", default="",
+        help="optional current clean-trace table used to gate cross-trace mapping")
+    parser.add_argument(
+        "--phase", action="append", default=[],
+        help="phase required from this capture; repeat for multiple phases")
     parser.add_argument("--result-json", default="")
     args = parser.parse_args()
-    result = map_plan(args.capture_plan, args.capture_trace, args.out)
+    result = map_plan(
+        args.capture_plan, args.capture_trace, args.out,
+        shape_log_path=args.shape_log,
+        clean_table_path=args.clean_table,
+        required_phases=args.phase)
     if args.result_json:
         with open(args.result_json, "w") as fh:
             json.dump(result, fh, indent=2)

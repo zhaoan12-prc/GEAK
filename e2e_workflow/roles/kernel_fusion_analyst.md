@@ -67,7 +67,7 @@ make the degradation explicit per candidate.
    needs only the sequence; candidate GENERATION and the 单侧 microbench need
    the SHAPES. A phase whose rows are present but carry **zero** resolved
    shapes cannot be built on — every candidate you emit for it would cite
-   shapes nobody measured. Run the eager shape probe
+   shapes nobody measured. Run the graph-construction shape capture
    (`run_semantic_shape_capture`) and merge before Phase 2.1, or stop and say
    so; do NOT emit shape-citing candidates from a shape-blind phase.
    The harness enforces this at entry and it measures the ROWS, not the
@@ -615,6 +615,11 @@ The harness enforces two floors on non-donor helper rows
   candidate per contiguous cluster.
 
 ### 5c. Known-fusion priors must each get a disposition (mandatory, harness-enforced)
+
+This step happens **during candidate generation, before Top-K**. Do not wait for
+Phase 3 to read the cards. The CLI defaults to the repository knowledge files so
+omitting `--priors-index` or `--fusion-priors` is no longer a way to bypass this
+gate; an applicable card must add/correct a candidate before ranking.
 
 Read `$LEARNED_INDEX`'s `## kernel fusion` group AFTER 5a/5b, and give **every
 card in it an explicit disposition** in `fusion_candidates.json`:

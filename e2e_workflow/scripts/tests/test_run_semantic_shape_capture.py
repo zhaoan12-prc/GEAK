@@ -23,27 +23,6 @@ class RunSemanticShapeCaptureTest(unittest.TestCase):
         self.assertEqual(
             capture._required_phases(plan), ["decode", "prefill"])
 
-    def test_injects_eager_flag_for_inline_server_arguments(self):
-        text = "launch --disable-radix-cache $EVAL_CONTEXT_ARGS"
-        self.assertIn(
-            "--disable-radix-cache --disable-cuda-graph",
-            capture._with_disable_cuda_graph(text))
-
-    def test_injects_eager_flag_for_multiline_server_arguments(self):
-        text = (
-            "launch \\\n"
-            "  --disable-radix-cache \\\n"
-            "  --max-prefill-tokens 32768")
-        result = capture._with_disable_cuda_graph(text)
-        self.assertIn(
-            "--disable-radix-cache --disable-cuda-graph \\", result)
-
-    def test_existing_eager_flag_is_idempotent(self):
-        text = "--disable-radix-cache --disable-cuda-graph"
-        self.assertEqual(capture._with_disable_cuda_graph(text), text)
-
-
-
 class OwnProcessGroupTeardownTest(unittest.TestCase):
     """Regression tests for B6 (docs/decode-coverage-bugs.md)."""
 
@@ -80,28 +59,20 @@ class OwnProcessGroupTeardownTest(unittest.TestCase):
         completed = mock.Mock(stdout=b"FREE\n")
         with mock.patch.object(capture.subprocess, "run",
                                return_value=completed):
-            capture._assert_port_free("container", 8935)
+                capture._assert_port_free("container", 8935)
+
+    def test_runtime_patch_is_restored(self):
+        with mock.patch.object(capture, "_docker") as docker:
+            capture._restore("container", "/runtime/model_runner.py",
+                             "/runtime/geak_capture.py")
+        command = docker.call_args[0][1]
+        self.assertIn("model_runner.py.geak_semantics_bak", command)
+        self.assertIn("geak_capture.py.geak_semantics_bak", command)
+        self.assertIn("rm -f", command)
 
 
 class DecodeProbeTest(unittest.TestCase):
-    """Regression tests for B4/B5 (docs/decode-coverage-bugs.md)."""
-
-    def test_b5_rank_filter_matches_profile_by_stage_names(self):
-        """The old filter tested for '-TP-0.trace.json', which never matches."""
-        with tempfile.TemporaryDirectory() as tmp:
-            names = ["s-TP-0-EXTEND.trace.json.gz",
-                     "s-TP-0-DECODE.trace.json.gz",
-                     "s-TP-5-EXTEND.trace.json.gz",
-                     "s-TP-5-DECODE.trace.json.gz"]
-            for name in names:
-                open(os.path.join(tmp, name), "w").close()
-            by_phase = capture._traces_by_phase(tmp, 0)
-            self.assertIn("EXTEND", by_phase)
-            self.assertIn("DECODE", by_phase)
-            for path in by_phase.values():
-                self.assertIn("-TP-0-", os.path.basename(path))
-            # deterministic: never a race with whichever rank wrote last
-            self.assertIn("-TP-0-EXTEND", capture._latest_trace(tmp, 0))
+    """Graph-construction shape capture regression tests."""
 
     def test_b4_narrowed_phases_are_reported(self):
         notes = capture._warn_narrowed_phases(
@@ -110,7 +81,7 @@ class DecodeProbeTest(unittest.TestCase):
         self.assertTrue(notes)
         joined = " ".join(notes)
         self.assertIn("decode", joined)
-        self.assertIn("eager probe", joined)
+        self.assertIn("graph construction", joined)
 
     def test_b4_full_phase_set_warns_about_nothing(self):
         self.assertEqual(
@@ -126,6 +97,98 @@ class DecodeProbeTest(unittest.TestCase):
             # EXTEND is an alias of prefill; the audit must compare like for like
             self.assertEqual(capture._observed_phases(log),
                              {"prefill", "decode"})
+
+    def test_shape_capture_exports_graph_trace_without_workload_profiler(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            setup_path = os.path.join(tmp, "setup.json")
+            plan_path = os.path.join(tmp, "plan.json")
+            out_dir = os.path.join(tmp, "out")
+            with open(setup_path, "w") as fh:
+                json.dump({
+                    "container": "c",
+                    "model": "/model",
+                    "benchmark_repository": "/repo",
+                    "benchmark": "/repo/bench.sh",
+                    "port": 30001,
+                    "tensor_parallel_size": 8,
+                    "gpu_ids": "0,1,2,3,4,5,6,7",
+                    "mem_fraction": 0.8,
+                    "bench_client": "inferencex",
+                    "inferencex_path": "/repo",
+                    "workload": {
+                        "concurrency": 4,
+                        "input_length": 8192,
+                        "output_length": 1024,
+                    },
+                    "extra_server_args": "--disable-radix-cache",
+                    "extra_env": "SGLANG_USE_AITER=1",
+                }, fh)
+            with open(plan_path, "w") as fh:
+                json.dump({
+                    "target_buckets": [{"phase": "decode"}],
+                    "capture_targets": [{"representative_layer_id": 2}],
+                }, fh)
+
+            def fake_docker(container, command, stdout=None):
+                os.makedirs(out_dir, exist_ok=True)
+                with open(os.path.join(out_dir, "shape.jsonl"), "w") as fh:
+                    fh.write(json.dumps({
+                        "phase": "decode", "layer_id": 2}) + "\n")
+                with open(os.path.join(
+                        out_dir, "graph_capture-TP-0.trace.json"), "w") as fh:
+                    json.dump({"traceEvents": []}, fh)
+            with mock.patch.object(capture, "_assert_port_free"), \
+                    mock.patch.object(capture, "_deploy"), \
+                    mock.patch.object(capture, "_restore") as restore, \
+                    mock.patch.object(capture, "_stop_service"), \
+                    mock.patch.object(capture, "_docker",
+                                      side_effect=fake_docker) as docker:
+                result = capture.capture(
+                    setup_path, plan_path, out_dir, phases=["decode"])
+
+            command = docker.call_args[0][1]
+            self.assertIn("--enable-profile-cuda-graph", command)
+            self.assertNotIn("--disable-cuda-graph", command)
+            self.assertIn("GEAK_SEMANTICS_REQUIRE_PROFILER=0", command)
+            self.assertIn("export PROFILE=0", command)
+            self.assertIn("export GPU=0,1,2,3,4,5,6,7", command)
+            self.assertIn(
+                "export ROCR_VISIBLE_DEVICES=0,1,2,3,4,5,6,7", command)
+            self.assertIn("export NUM_PROMPTS=20", command)
+            self.assertIn("export MEM_FRACTION=0.8", command)
+            self.assertIn("export OUT_DIR=", command)
+            self.assertEqual(result["shape_capture_execution"], "graph_capture")
+            self.assertEqual(
+                result["capture_trace"],
+                os.path.join(out_dir, "graph_capture-TP-0.trace.json"))
+            self.assertNotIn("clean_traces_by_phase", result)
+            self.assertNotIn("capture_traces_by_phase", result)
+            restore.assert_called_once_with(
+                "c", capture.DEFAULT_MODEL_RUNNER,
+                capture.DEFAULT_RUNTIME_MODULE)
+
+    def test_shape_capture_rejects_disable_cuda_graph(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            setup = os.path.join(tmp, "setup.json")
+            plan = os.path.join(tmp, "plan.json")
+            with open(setup, "w") as fh:
+                json.dump({
+                    "container": "c", "model": "/model",
+                    "benchmark": "/repo/bench.sh", "port": 30001,
+                    "tensor_parallel_size": 1,
+                    "workload": {"concurrency": 1, "input_length": 1,
+                                 "output_length": 1},
+                    "extra_server_args": "--disable-cuda-graph",
+                }, fh)
+            with open(plan, "w") as fh:
+                json.dump({
+                    "target_buckets": [{"phase": "decode"}],
+                    "capture_targets": [{"representative_layer_id": 0}],
+                }, fh)
+            with mock.patch.object(capture, "_assert_port_free"), \
+                    mock.patch.object(capture, "_deploy"):
+                with self.assertRaisesRegex(ValueError, "requires CUDA/HIP"):
+                    capture.capture(setup, plan, os.path.join(tmp, "out"))
 
 
 if __name__ == "__main__":

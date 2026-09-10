@@ -124,7 +124,7 @@ def has_module_layer_spans(path):
 
     CUDA-graph-replayed decode traces do not: the whole layer stack replays as
     one opaque graph launch, so there are no per-layer python frames and no
-    External ids.  Used to decide whether an eager capture trace can supply
+    External ids. Used to decide whether graph-construction capture can supply
     decode layer boundaries the clean trace cannot.
     """
     try:
@@ -2084,8 +2084,8 @@ def _phase_coverage(instances, tables, trace_paths, adopted_siblings,
         # Under CUDA-graph replay the CPU never walks the module tree, so a
         # steady-state DECODE trace carries kernel events but essentially no
         # nn.Module spans.  The ordered sequence survives; the shapes do not.
-        # Only the shape half needs an eager probe.
-        "decode_requires_eager_probe": decode_seq and not decode_shapes,
+        # Only the shape half needs a separate graph-construction capture.
+        "decode_requires_graph_capture": decode_seq and not decode_shapes,
         "decode_evidence": (
             "sequence_and_shapes" if (decode_seq and decode_shapes) else
             "sequence_only_shapes_unresolved" if decode_seq else
@@ -2166,10 +2166,7 @@ def _shape_capture_plan(tables, pattern_doc, trace_path,
             "metadata_only": True,
             "stdout": False,
             "unresolved_targets_only": True,
-            # B3: this used to be a hardcoded three-element list that no code
-            # anywhere read.  It now reports what this build actually achieved
-            # and what a decode-covering rerun would require.
-            "decode_capture_windows_implemented": ["enforce_eager_probe"],
+            "decode_capture_windows_implemented": ["graph_construction"],
             "decode_sequence_covered": bool(
                 coverage and coverage.get("decode_sequence_covered")),
             "decode_shapes_covered": bool(
@@ -2180,8 +2177,8 @@ def _shape_capture_plan(tables, pattern_doc, trace_path,
                  else ["analyse the -TP-0-DECODE trace (auto-adopted by "
                        "default; --no-auto-sibling disables)"]) +
                 ([] if (coverage and coverage.get("decode_shapes_covered"))
-                 else ["capture --phase decode with the eager probe "
-                       "(--disable-cuda-graph) to resolve decode shapes"])),
+                 else ["run graph-construction shape capture for decode to "
+                       "resolve decode shapes"])),
         },
         "capture_targets": needs,
         "target_count": len(needs),
@@ -2273,12 +2270,12 @@ def build(trace_path, pattern_path, out_dir, table_phases=None,
             "traces analysed: %s" % (
                 ", ".join(coverage["missing_required_phases"]),
                 ", ".join(os.path.basename(p) for p in trace_paths)))
-    elif coverage["decode_requires_eager_probe"]:
+    elif coverage["decode_requires_graph_capture"]:
         quality.setdefault("warnings", []).append(
             "phase coverage: decode kernel SEQUENCE is covered but 0/%d decode "
             "rows carry resolved shapes (CUDA-graph replay emits no module "
             "spans). Sequence is enough to discover decode fusion seams; "
-            "generating or benchmarking one needs an eager-probe capture."
+            "generating or benchmarking one needs graph-construction shape capture."
             % (coverage["shape_resolution_by_phase"]
                .get("decode", {}).get("rows", 0)))
     elif coverage["single_phase"]:

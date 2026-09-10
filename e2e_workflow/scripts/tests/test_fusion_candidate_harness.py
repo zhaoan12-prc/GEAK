@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPTS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -71,7 +72,7 @@ class FusionCandidateHarnessTest(unittest.TestCase):
                 "sequence_and_shapes" if ("decode" in phases and resolved)
                 else "sequence_only_shapes_unresolved" if "decode" in phases
                 else "no_decode_trace_analysed"),
-            "decode_requires_eager_probe": (
+            "decode_requires_graph_capture": (
                 "decode" in phases and not resolved),
             "required_phases": list(phases),
             "missing_required_phases": [],
@@ -770,6 +771,44 @@ class FusionCandidateHarnessTest(unittest.TestCase):
             self.assertTrue(any(
                 "merge ceiling" in error for error in result["errors"]))
 
+    def test_explicit_donor_anchor_allows_more_expensive_helpers_to_be_removed(self):
+        # A fused GEMM can absorb dequant helpers that are individually slower
+        # than the donor. The donor remains the semantic anchor even when it is
+        # not the heaviest member; the old max-duration heuristic rejected this
+        # valid cross-donor shape.
+        with tempfile.TemporaryDirectory() as tmp:
+            table_payload = self._table()
+            table_payload["tables"][0]["rows"][2]["duration_us"] = 3.0
+            payload = self._payload()
+            payload["environment_api_inventory_json"] = self._env(tmp)
+            cand = payload["candidates"][0]
+            cand["members"].append({
+                "row_id": "r2", "pos": 2, "device_seq_index": 12,
+                "stream": 8, "duration_us": 3.0, "stage": "gemm",
+                "evidence_level": "K",
+            })
+            cand["donor_row_ids"] = ["r2"]
+            cand["anchor_row_id"] = "r2"
+            cand["removable_row_ids"] = ["r0", "r1"]
+            cand["current_chain_us_per_layer"] = 13.0
+            cand["addressable_us_per_layer"] = 10.0
+            cand["stack_addressable_ceiling_us"] = 20.0
+            summary = payload["summary_rows"][0]
+            summary["source_row_ids"] = ["r0", "r1", "r2"]
+            summary["current_chain_us_per_layer"] = 13.0
+            summary["single_plan_reason"] = "one donor absorbs both helpers"
+            plan = summary["plans"][0]
+            plan["current_chain_us_per_layer"] = 13.0
+            plan["addressable_us_per_layer"] = 10.0
+            candidates = self._write(tmp, "candidates.json", payload)
+            table = self._write(tmp, "table.json", table_payload)
+            result = harness.run(
+                table, candidates, os.path.join(tmp, "report.md"),
+                os.path.join(tmp, "validation.json"))
+            self.assertFalse(any(
+                "merge ceiling" in error for error in result["errors"]),
+                result["errors"])
+
     def test_collective_row_only_in_followup_fails(self):
         # A tail all-reduce covered only by a followup (not a candidate member)
         # must fail: every collective is a fusion anchor.
@@ -1173,6 +1212,23 @@ class FusionCandidateHarnessTest(unittest.TestCase):
                                  os.path.join(tmp, "validation.json"))
             self.assertIsNone(result["prior_coverage"])
             self.assertFalse(any("disposition" in e for e in result["errors"]))
+
+    def test_cli_defaults_enable_repository_prior_gates(self):
+        self.assertTrue(os.path.isfile(harness.DEFAULT_PRIORS_INDEX))
+        self.assertTrue(os.path.isfile(harness.DEFAULT_FUSION_STRATEGIES))
+        argv = [
+            "fusion_candidate_harness.py",
+            "--semantic-table", "table.json",
+            "--candidates", "candidates.json",
+            "--out-md", "out.md",
+            "--result-json", "result.json",
+        ]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(
+                harness, "run", return_value={"status": "pass"}) as run:
+            self.assertEqual(harness.main(), 0)
+        args = run.call_args[0]
+        self.assertEqual(args[8], harness.DEFAULT_PRIORS_INDEX)
+        self.assertEqual(args[10], harness.DEFAULT_FUSION_STRATEGIES)
 
     def test_fusible_region_deferred_in_followups_passes(self):
         with tempfile.TemporaryDirectory() as tmp:

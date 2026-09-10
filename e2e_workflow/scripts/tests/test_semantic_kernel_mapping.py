@@ -559,12 +559,26 @@ class PhaseCoverageTest(unittest.TestCase):
         self.assertTrue(coverage["decode_sequence_covered"])
         self.assertFalse(coverage["decode_shapes_covered"])
         self.assertFalse(coverage["decode_covered"])
-        self.assertTrue(coverage["decode_requires_eager_probe"])
+        self.assertTrue(coverage["decode_requires_graph_capture"])
         self.assertEqual(coverage["decode_evidence"],
                          "sequence_only_shapes_unresolved")
         self.assertEqual(
             coverage["shape_resolution_by_phase"]["decode"]["resolved_fraction"],
             0.0)
+
+    def test_shape_capture_plan_declares_graph_construction_only(self):
+        coverage = {
+            "decode_sequence_covered": True,
+            "decode_shapes_covered": False,
+            "decode_covered": False,
+        }
+        plan = mapping._shape_capture_plan(
+            tables=[], pattern_doc={}, trace_path=__file__, coverage=coverage)
+        policy = plan["capture_policy"]
+        self.assertEqual(
+            policy["decode_capture_windows_implemented"],
+            ["graph_construction"])
+        self.assertNotIn("eager", json.dumps(policy).lower())
 
     def test_require_phases_reports_the_missing_one(self):
         coverage = mapping._phase_coverage(

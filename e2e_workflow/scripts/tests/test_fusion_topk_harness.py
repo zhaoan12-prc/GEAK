@@ -215,7 +215,7 @@ class FusionTopkTest(unittest.TestCase):
                     "decode": {"rows": 64, "resolved": 0,
                                "resolved_fraction": 0.0}},
                 "decode_evidence": "sequence_only_shapes_unresolved",
-                "decode_requires_eager_probe": True,
+                "decode_requires_graph_capture": True,
                 "problems": ["phase 'decode' resolved 0/64 row shapes"],
                 "waiver": "known gap", "ok": True}
             validation["region_coverage"] = {

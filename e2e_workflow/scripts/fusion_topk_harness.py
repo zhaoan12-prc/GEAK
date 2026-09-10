@@ -642,8 +642,8 @@ def _render_coverage(result):
         if pc.get("decode_evidence"):
             lines.append("- decode 证据等级：`%s`%s" % (
                 pc["decode_evidence"],
-                "（需 eager shape probe）"
-                if pc.get("decode_requires_eager_probe") else ""))
+                "（需 graph-construction shape capture）"
+                if pc.get("decode_requires_graph_capture") else ""))
         for problem in pc.get("problems") or []:
             lines.append("- ⚠️ %s" % problem)
         if pc.get("waiver"):

@@ -31,11 +31,78 @@ class RuntimeMarkerMappingTest(unittest.TestCase):
             with open(trace_path, "w") as fh:
                 json.dump({"traceEvents": []}, fh)
             result = mapping.map_plan(
-                plan_path, trace_path, out_path)
+                plan_path, trace_path, out_path,
+                required_phases=["decode"])
             self.assertFalse(result["phase_coverage_complete"])
             self.assertEqual(
                 result["missing_marker_buckets"],
                 ["decode|1|4|0"])
+
+    def test_mapping_summary_excludes_non_shape_runtime_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = os.path.join(tmp, "plan.json")
+            trace_path = os.path.join(tmp, "trace.json")
+            out_path = os.path.join(tmp, "mapped.json")
+            with open(plan_path, "w") as fh:
+                json.dump({"capture_targets": [
+                    {"phase": "decode", "representative_layer_id": 1,
+                     "stage": "communication", "raw_name": "allreduce"},
+                    {"phase": "decode", "representative_layer_id": 1,
+                     "stage": "elementwise",
+                     "raw_name": "__amd_rocclr_fillBufferAligned"},
+                ]}, fh)
+            with open(trace_path, "w") as fh:
+                json.dump({"traceEvents": []}, fh)
+            result = mapping.map_plan(plan_path, trace_path, out_path)
+            self.assertEqual(result["shape_eligible_target_count"], 0)
+            self.assertEqual(result["shape_ineligible_target_count"], 2)
+            self.assertEqual(result["shape_eligible_match_fraction"], 1.0)
+            self.assertEqual(
+                result["shape_mapping_by_phase"]["decode"]
+                ["shape_eligible_target_count"], 0)
+
+    def test_clean_sequence_mismatch_rejects_cross_trace_mapping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = os.path.join(tmp, "plan.json")
+            trace_path = os.path.join(tmp, "trace.json")
+            clean_path = os.path.join(tmp, "clean.json")
+            out_path = os.path.join(tmp, "mapped.json")
+            target = {
+                "phase": "decode", "pattern_id": "P",
+                "representative_layer_id": 1, "pos": 0,
+                "raw_name": "capture_kernel",
+                "selected_bucket": {"phase": "decode", "batch_size": 4,
+                                    "input_tokens": 0},
+            }
+            with open(plan_path, "w") as fh:
+                json.dump({"capture_targets": [target]}, fh)
+            marker = (
+                "GEAK_SEMANTICS|op=op-1|phase=DECODE|bs=4|toks=4|"
+                "layer=1|path=model.layers.1.proj")
+            with open(trace_path, "w") as fh:
+                json.dump({"traceEvents": [
+                    {"cat": "user_annotation", "name": marker,
+                     "pid": 1, "tid": 2, "ts": 10, "dur": 20},
+                    {"cat": "hip_runtime", "name": "hipModuleLaunchKernel",
+                     "pid": 1, "tid": 2, "ts": 15, "dur": 1,
+                     "args": {"kernel": "capture_kernel", "correlation": 1}},
+                ]}, fh)
+            with open(clean_path, "w") as fh:
+                json.dump({"tables": [{
+                    "phase": "decode", "pattern_id": "P",
+                    "representative_layer_id": 9,
+                    "rows": [{"pos": 0, "raw_name": "different_kernel"}],
+                }]}, fh)
+            result = mapping.map_plan(
+                plan_path, trace_path, out_path,
+                clean_table_path=clean_path)
+            self.assertEqual(result["clean_table_sequence_audit"]["status"],
+                             "fail")
+            self.assertEqual(result["sequence_rejected_target_count"], 1)
+            with open(out_path) as fh:
+                mapped = json.load(fh)["capture_targets"][0]
+            self.assertEqual(mapped["runtime_marker_mapping_status"],
+                             "clean_sequence_mismatch")
 
     def test_decode_uses_honest_layer_wrapper_when_marker_is_thread_local(self):
         with tempfile.TemporaryDirectory() as tmp:

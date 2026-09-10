@@ -9,6 +9,7 @@ contained by the wrapper that supplied the Shape.
 import json
 import functools
 import importlib
+import contextlib
 import os
 import re
 import sys
@@ -20,6 +21,7 @@ _TRUE = ("1", "true", "True", "TRUE", "yes", "on")
 _LOGGER = None
 _INSTALLED_CLASSES = set()
 _PATCHED_CALLABLES = set()
+_GRAPH_CAPTURE_PROFILER_INSTALLED = False
 
 
 def _flag(name, default="0"):
@@ -55,6 +57,79 @@ def _profiler_active():
         return bool(probe and probe())
     except Exception:
         return False
+
+
+def _distributed_rank():
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            return int(dist.get_rank())
+    except Exception:
+        pass
+    return 0
+
+
+def _graph_capture_trace_path(rank):
+    path = os.environ.get("GEAK_SEMANTICS_GRAPH_CAPTURE_TRACE", "")
+    if not path:
+        return ""
+    try:
+        return path.format(rank=rank)
+    except (KeyError, ValueError):
+        return path
+
+
+def install_graph_capture_profiler():
+    """Export a rank-0 trace of CUDA/HIP graph construction.
+
+    SGLang's ``--enable-profile-cuda-graph`` profiler normally prints only
+    aggregate tables and a memory snapshot.  Semantics needs the Chrome trace
+    containing GEAK record_function markers and the kernel launches nested in
+    them.  Profile rank 0 only, avoid memory-history recording, and leave graph
+    replay profiling to the normal clean workload profiler.
+    """
+    global _GRAPH_CAPTURE_PROFILER_INSTALLED
+    if _GRAPH_CAPTURE_PROFILER_INSTALLED:
+        return
+    if not os.environ.get("GEAK_SEMANTICS_GRAPH_CAPTURE_TRACE"):
+        return
+    try:
+        import torch
+        from torch.profiler import ProfilerActivity, profile
+        from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+
+        def _init_profile_context_and_memory_record(self):
+            if _distributed_rank() != int(os.environ.get(
+                    "GEAK_SEMANTICS_RANK", "0")):
+                return contextlib.nullcontext(None)
+            return profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=True,
+                with_stack=False,
+            )
+
+        def _post_process_after_profile(self, prof_context):
+            rank = _distributed_rank()
+            if prof_context is None or rank != int(os.environ.get(
+                    "GEAK_SEMANTICS_RANK", "0")):
+                return
+            path = _graph_capture_trace_path(rank)
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            prof_context.export_chrome_trace(path)
+            sys.stderr.write(
+                "[GEAK_SEMANTICS] graph-capture trace exported to %s\n" % path)
+
+        CudaGraphRunner._init_profile_context_and_memory_record = (
+            _init_profile_context_and_memory_record)
+        CudaGraphRunner._post_process_after_profile = (
+            _post_process_after_profile)
+        _GRAPH_CAPTURE_PROFILER_INSTALLED = True
+        sys.stderr.write(
+            "[GEAK_SEMANTICS] installed rank-0 graph-capture profiler export\n")
+    except Exception as exc:
+        sys.stderr.write(
+            "[GEAK_SEMANTICS] graph-capture profiler install failed: %s\n" % exc)
+        raise
 
 
 def _phase_of(forward_batch):
@@ -489,6 +564,7 @@ def _register_hooks(model):
 
 
 def install_on_model(model):
+    install_graph_capture_profiler()
     logger = get_logger()
     if not logger.active():
         return model

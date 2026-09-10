@@ -90,7 +90,7 @@ def _reason_from_attempts(row, attempts):
     if "kernel_not_observed_in_probe" in codes:
         return (
             "kernel_not_observed_in_probe",
-            "kernel was not observed inside a matching graph/eager probe marker")
+            "kernel was not observed inside a matching graph-capture marker")
     return (
         codes[-1] if codes else "probe_exhausted_without_unique_mapping",
         "available probe runs did not produce a unique shape attribution")
@@ -231,7 +231,7 @@ def merge(clean_table_path, probe_table_paths, out_dir):
     phase_coverage["decode_shapes_covered"] = decode["resolved"] > 0
     phase_coverage["decode_covered"] = bool(
         decode_sequence and decode["resolved"] > 0)
-    phase_coverage["decode_requires_eager_probe"] = bool(
+    phase_coverage["decode_requires_graph_capture"] = bool(
         "decode" in phase_stats and decode["resolved"] == 0)
     if "decode" in phase_stats:
         phase_coverage["decode_evidence"] = (

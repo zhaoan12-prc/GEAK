@@ -83,9 +83,14 @@ This phase is opt-in and remains non-gating.
 2. Validate `SHAPE_CAPTURE_SETUP` supplies the current container/image setup, model, official
    benchmark, port, TP, and optional reversible deploy/sweep scripts. Create a new attempt directory;
    never overwrite a previous shape log.
-3. Run one Shape-only replay with `PROFILE=0`, rank 0, metadata-only logging, stdout disabled, and at
-   most one matching forward per selected bucket. Prefer exact Clean Trace buckets; capture Decode
-   during graph-capture/warmup eager execution before considering an enforce-eager probe.
+3. Run one Shape-only replay after the Clean Trace table exists, with rank 0, metadata-only logging,
+   stdout disabled, and at most one matching forward per selected bucket. Use
+   `run_semantic_shape_capture.py`: collect tensor metadata while SGLang constructs its CUDA/HIP graphs
+   and export a separate graph-capture marker trace. Keep the normal workload profiler disabled during
+   this replay; the already-captured Clean Trace remains the only timing source. Prefer the graph-capture
+   bucket that exactly matches the Clean Trace `selected_bucket.batch_size`. Do not capture or use an
+   enforce-eager Decode trace. If graph-capture metadata or marker export fails, return partial/failed
+   evidence instead of substituting a different execution path.
 4. Filter at the logging source to representative layers and unresolved/candidate OPs plus their
    necessary parent wrappers. Do not record Tensor values or synchronize the device.
 5. Inspect the actual imported runtime source for every unresolved target. Populate candidate
@@ -106,6 +111,22 @@ This phase is opt-in and remains non-gating.
 7. Verify the merged table has exactly the same row IDs, raw names, order, counts, and durations as
    the Clean Trace table. Return Shape evidence as K/P/C/U; every P/C/U needs an auditable reason.
    Shape may remain partial without invalidating Kernel completeness.
+
+   Graph-capture shape evidence must preserve both the observed and aligned dimensions:
+   `logger_shape` is immutable; `effective_shape` may replace axis 0 only when that axis is proven to
+   be the token/batch axis and the target value comes from the Clean Trace selected graph bucket.
+   Apply the same proven axis rule to corresponding activation outputs and token-indexed scales.
+   Never rewrite weights, KV-cache capacity, block tables, expert weights, or index/offset dimensions.
+   Cross-trace graph-capture evidence remains `P`, even when the marker-to-kernel containment is exact.
+   Reject the transfer when the capture and Clean Trace layer Kernel sequences cannot be reconciled;
+   never repair a mismatch by kernel-name guessing.
+
+   The Role owns semantic judgment: decide which axis is the batch/token axis and record the evidence
+   rule. The merge script owns every numeric substitution and its audit trail. It must preserve
+   `logger_shape`, publish a separate `effective_shape`, and deterministically apply `[capture_bs, ...]
+   -> [clean_bs, ...]` only to floating activation/token-scale tensors with a proven axis 0. Integer or
+   ambiguous 1-D tensors remain unchanged. The graph-capture mapping report must separate shape-bearing
+   Kernel rows from communication, copy, memset, and runtime-buffer rows that have no tensor schema.
 
 ## Phase-1 报告（根目录，强制）
 

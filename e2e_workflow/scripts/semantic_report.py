@@ -287,7 +287,8 @@ def render_markdown(rep):
         if v["rows"] and not v["resolved"]:
             lines.append(
                 "> 🔴 **%s 的 shape 一条都没解析出来**（%d 行）。CUDA-graph replay 下 "
-                "decode 几乎不发 `nn.Module` span，需要 eager probe 补 shape，否则该阶段"
+                "decode replay 几乎不发 `nn.Module` span，需要 graph-construction "
+                "capture 补 shape，否则该阶段"
                 "只有序列、没有形状，无法出候选。" % (phase, v["rows"]))
             lines.append("")
     if rep.get("stale_record_notes"):

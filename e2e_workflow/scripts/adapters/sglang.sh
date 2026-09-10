@@ -87,9 +87,9 @@ adapter_bench() {
 # evidence: without python_function spans there are no nn.Module spans, so DECODE rows resolve their
 # SEQUENCE (which kernels, in what order) but NOT their SHAPES. Semantics records this honestly as
 # `phase_coverage.decode_evidence = "sequence_only_shapes_unresolved"` +
-# `decode_requires_eager_probe = true`, and Phase 2 REFUSES to build decode candidates on it (see
-# fusion_candidate_harness --require-phase-coverage). Getting decode shapes needs the eager probe
-# (run_semantic_shape_capture), not a blind flip of this default.
+# `decode_requires_graph_capture = true`, and Phase 2 REFUSES to build decode candidates on it (see
+# fusion_candidate_harness --require-phase-coverage). Decode shapes come from the separate
+# graph-construction capture (run_semantic_shape_capture), not from this clean timing trace.
 #
 # profile_by_stage=TRUE (default): sglang then writes SEPARATE per-phase traces
 # `<id>-TP-<rank>-EXTEND.trace.json.gz` and `...-DECODE.trace.json.gz`. This is what makes decode

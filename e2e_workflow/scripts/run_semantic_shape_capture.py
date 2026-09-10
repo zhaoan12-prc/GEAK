@@ -2,7 +2,6 @@
 """Launch the real GEAK Semantics 1.2 metadata+marker replay."""
 import argparse
 import base64
-import glob
 import json
 import os
 import shlex
@@ -86,6 +85,12 @@ kill -KILL -"$pgid" 2>/dev/null || true
 
 
 def _deploy(container, model_runner, runtime_module):
+    runtime_backup = runtime_module + ".geak_semantics_bak"
+    _docker(container, """
+set -e
+if [ -e %s ] && [ ! -e %s ]; then cp %s %s; fi
+""" % tuple(shlex.quote(path) for path in (
+        runtime_module, runtime_backup, runtime_module, runtime_backup)))
     _run(["docker", "cp", RUNTIME_CAPTURE,
           "%s:%s" % (container, runtime_module)])
     bootstrap = """
@@ -125,48 +130,29 @@ if sentinel not in text:
             encoded)
 
 
-def _traces_by_phase(trace_dir, rank=0):
-    """Rank-`rank` traces keyed by phase tag.
+def _restore(container, model_runner, runtime_module):
+    """Restore both runtime files changed by `_deploy`.
 
-    B5: the old rank filter tested for `-TP-0.trace.json`, which never matches
-    once `profile_by_stage` is on (real names are `-TP-0-EXTEND.trace.json.gz`).
-    Selection silently fell through to newest-by-mtime across all 8 ranks and
-    both phases, so which trace got analysed was a race.
+    A failed capture must not leave the serving installation instrumented.  A
+    pre-existing runtime module is restored from its backup; a module created
+    only for this capture is removed.
     """
-    candidates = glob.glob(
-        os.path.join(trace_dir, "**", "*.trace.json*"), recursive=True)
-    prefix = "-TP-%d" % int(rank)
-    ranked = [path for path in candidates
-              if prefix in os.path.basename(path)] or candidates
-    by_phase = {}
-    for path in sorted(ranked, key=os.path.getmtime):
-        base = os.path.basename(path)
-        if "%s-EXTEND" % prefix in base:
-            by_phase["EXTEND"] = path
-        elif "%s-DECODE" % prefix in base:
-            by_phase["DECODE"] = path
-        else:
-            by_phase.setdefault("UNSPLIT", path)
-    return by_phase
-
-
-def _latest_trace(trace_dir, rank=0):
-    by_phase = _traces_by_phase(trace_dir, rank)
-    for key in ("EXTEND", "UNSPLIT", "DECODE"):
-        if by_phase.get(key):
-            return by_phase[key]
-    return ""
-
-
-def _with_disable_cuda_graph(benchmark_text):
-    needle = "--disable-radix-cache"
-    if needle not in benchmark_text:
-        raise RuntimeError(
-            "official benchmark lacks expected server argument anchor")
-    if "--disable-cuda-graph" in benchmark_text:
-        return benchmark_text
-    return benchmark_text.replace(
-        needle, "--disable-radix-cache --disable-cuda-graph", 1)
+    model_backup = model_runner + ".geak_semantics_bak"
+    runtime_backup = runtime_module + ".geak_semantics_bak"
+    command = """
+set -e
+if [ -e %s ]; then cp %s %s; rm -f %s; fi
+if [ -e %s ]; then
+  cp %s %s
+  rm -f %s
+else
+  rm -f %s
+fi
+""" % tuple(shlex.quote(path) for path in (
+        model_backup, model_backup, model_runner, model_backup,
+        runtime_backup, runtime_backup, runtime_module, runtime_backup,
+        runtime_module))
+    _docker(container, command)
 
 
 _MODEL_PHASES = ("prefill", "decode")
@@ -195,9 +181,9 @@ def _warn_narrowed_phases(phases, plan, source):
     ]
     if "decode" in absent:
         notes.append(
-            "To cover decode: pass --phase decode (the eager probe arms "
-            "automatically). Decode under CUDA-graph replay emits no module "
-            "spans, so an eager probe is mandatory, not optional.")
+            "To cover decode: pass --phase decode. Decode shapes are captured "
+            "during CUDA/HIP graph construction; no enforce-eager trace is "
+            "required.")
     if coverage.get("phases_absent_from_tables"):
         notes.append(
             "upstream plan phase_coverage reports absent phases: %s"
@@ -230,13 +216,10 @@ def _observed_phases(shape_log):
     return seen
 
 
-def capture(setup_path, capture_plan_path, out_dir,
-            disable_cuda_graph=False, phases=None,
-            forwards_per_bucket=1, allow_decode_without_eager=False):
+def capture(setup_path, capture_plan_path, out_dir, phases=None,
+            forwards_per_bucket=1):
     with open(setup_path) as fh:
         setup = json.load(fh)
-    disable_cuda_graph = bool(
-        disable_cuda_graph or setup.get("disable_cuda_graph", False))
     phases = list(phases or setup.get("capture_phases", []))
     if forwards_per_bucket == 1 and setup.get("forwards_per_bucket") is not None:
         forwards_per_bucket = int(setup["forwards_per_bucket"])
@@ -249,22 +232,7 @@ def capture(setup_path, capture_plan_path, out_dir,
     phases = [str(phase).strip().lower() for phase in phases if str(phase).strip()]
     phase_notes = _warn_narrowed_phases(phases, plan, phase_source)
 
-    # Decode is unobservable under CUDA-graph replay: the CPU replays a
-    # captured graph and never walks the module tree, so the DECODE trace
-    # carries zero nn.Module DecoderLayer spans to hang a table off.  Asking
-    # for decode therefore implies the eager probe unless the caller has
-    # explicitly opted out.
     decode_requested = "decode" in phases
-    if decode_requested and not disable_cuda_graph:
-        if allow_decode_without_eager:
-            print("[GEAK_SEMANTICS][warn] decode requested without the eager "
-                  "probe; expect zero decode module spans.", file=sys.stderr)
-        else:
-            disable_cuda_graph = True
-            phase_notes.append(
-                "eager probe auto-armed because decode was requested")
-            print("[GEAK_SEMANTICS] decode requested -> eager probe armed "
-                  "(--disable-cuda-graph)", file=sys.stderr)
     required = ("container", "model", "benchmark", "port",
                 "tensor_parallel_size", "workload")
     missing = [name for name in required if setup.get(name) is None]
@@ -284,9 +252,9 @@ def capture(setup_path, capture_plan_path, out_dir,
         raise ValueError("capture plan has no representative layers")
 
     os.makedirs(out_dir, exist_ok=True)
-    trace_dir = os.path.join(out_dir, "trace")
-    os.makedirs(trace_dir, exist_ok=True)
     shape_log = os.path.join(out_dir, "shape.jsonl")
+    graph_capture_trace = os.path.join(
+        out_dir, "graph_capture-TP-{rank}.trace.json")
     benchmark_log = os.path.join(out_dir, "benchmark.log")
     pgid_path = os.path.join(out_dir, "server.pgid")
     for path in (shape_log,):
@@ -294,29 +262,25 @@ def capture(setup_path, capture_plan_path, out_dir,
             os.remove(path)
 
     _assert_port_free(container, setup["port"])
-    _deploy(container, model_runner, runtime_module)
     workload = setup["workload"]
     repository = setup.get(
         "benchmark_repository",
         "/mnt/raid0/zhaoan12/repo/InferenceX")
     benchmark = setup["benchmark"]
-    if disable_cuda_graph:
-        benchmark_source = os.path.join(repository, benchmark)
-        with open(benchmark_source) as fh:
-            benchmark_text = fh.read()
-        benchmark_lib = os.path.join(
-            repository, "benchmarks", "benchmark_lib.sh")
-        benchmark_text = benchmark_text.replace(
-            'source "$(dirname "$0")/../../benchmark_lib.sh"',
-            'source "%s"' % benchmark_lib)
-        benchmark_text = _with_disable_cuda_graph(benchmark_text)
-        benchmark = os.path.join(out_dir, "benchmark_eager_decode.sh")
-        with open(benchmark, "w") as fh:
-            fh.write(benchmark_text)
+    extra_server_args = str(setup.get("extra_server_args", "")).strip()
+    if (setup.get("disable_cuda_graph")
+            or "--disable-cuda-graph" in extra_server_args):
+        raise ValueError(
+            "semantic shape capture requires CUDA/HIP graph construction; "
+            "remove --disable-cuda-graph")
+    if "--enable-profile-cuda-graph" not in extra_server_args:
+        extra_server_args = (
+            extra_server_args + " --enable-profile-cuda-graph").strip()
+    extra_env = str(setup.get("extra_env", "")).strip()
     callable_targets = list(setup.get("callable_targets", []))
     # V-absorb uses a functional BMM, so nn.Module hooks only expose the broad
-    # self-attention wrapper.  Probe torch.bmm during the eager Decode pass;
-    # logging is still restricted to selected layers and profiler windows.
+    # self-attention wrapper. Probe torch.bmm during graph construction; logging
+    # remains restricted to selected layers and capture buckets.
     if decode_requested and "torch:bmm" not in callable_targets:
         callable_targets.append("torch:bmm")
     command = """
@@ -328,20 +292,33 @@ export GEAK_SEMANTICS_LAYERS=%s
 export GEAK_SEMANTICS_PHASES=%s
 export GEAK_SEMANTICS_FORWARDS_PER_BUCKET=%s
 export GEAK_SEMANTICS_CALLABLE_TARGETS=%s
-export GEAK_SEMANTICS_REQUIRE_PROFILER=1
-export PROFILE=1
-export SGLANG_TORCH_PROFILER_DIR=%s
+export GEAK_SEMANTICS_REQUIRE_PROFILER=0
+export GEAK_SEMANTICS_GRAPH_CAPTURE_TRACE=%s
+export EXTRA_SERVER_ARGS=%s
+export EXTRA_ENV=%s
+export PROFILE=0
+export REPEATS=%s
+export PROFILE_NUM_STEPS=%s
+export OUT_DIR=%s
 export MODEL=%s
 export TP=%s
+export GPU=%s
 export CONC=%s
 export ISL=%s
 export OSL=%s
 export RANDOM_RANGE_RATIO=%s
+export NUM_PROMPTS=%s
+export NUM_WARMUPS=%s
+export SEED=%s
+export MEM_FRACTION=%s
+export BENCH_CLIENT=%s
+export INFERENCEX_PATH=%s
+export BENCH_COLD_FINAL=%s
 export PORT=%s
 export RESULT_FILENAME=geak_semantics_1_2_capture
 export EVAL_ONLY=false
 export RUN_EVAL=false
-export ROCR_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export ROCR_VISIBLE_DEVICES=%s
 export GEAK_SERVER_PGID_FILE=%s
 export GEAK_BENCHMARK_SCRIPT=%s
 cd %s
@@ -352,20 +329,38 @@ wait "$geak_wrapper"
 """ % (
         shape_log, ",".join(str(layer) for layer in layers),
         ",".join(phases or []), forwards_per_bucket,
-        ",".join(callable_targets), trace_dir,
+        ",".join(callable_targets),
+        graph_capture_trace,
+        shlex.quote(extra_server_args), shlex.quote(extra_env),
+        int(setup.get("repeats", 1)),
+        int(setup.get("profile_num_steps", 1)),
+        out_dir,
         setup["model"], setup["tensor_parallel_size"],
+        setup.get("gpu_ids", "0"),
         workload["concurrency"], workload["input_length"],
         workload["output_length"], workload.get("random_range_ratio", 0.8),
-        setup["port"], pgid_path, benchmark, repository)
+        int(workload.get("num_prompts", 20)),
+        int(workload.get("num_warmups", min(workload["concurrency"], 8))),
+        int(workload.get("seed", 0)),
+        float(setup.get("mem_fraction", 0.8)),
+        setup.get("bench_client", "inferencex"),
+        setup.get("inferencex_path", repository),
+        "1" if setup.get("bench_cold_final", False) else "0",
+        setup["port"], setup.get("gpu_ids", "0"), pgid_path, benchmark,
+        repository)
     started = time.time()
     try:
+        _deploy(container, model_runner, runtime_module)
         with open(benchmark_log, "w") as log:
             _docker(container, command, stdout=log)
     finally:
         # Stop only the process group this replay started.
-        _stop_service(container, pgid_path, setup["port"])
-    traces_by_phase = _traces_by_phase(trace_dir, 0)
-    trace = _latest_trace(trace_dir)
+        try:
+            _stop_service(container, pgid_path, setup["port"])
+        finally:
+            _restore(container, model_runner, runtime_module)
+    graph_capture_trace_rank0 = graph_capture_trace.format(rank=0)
+    trace = graph_capture_trace_rank0
     if not os.path.exists(shape_log) or os.path.getsize(shape_log) == 0:
         raise RuntimeError(
             "GEAK runtime capture produced no shape metadata: %s" %
@@ -374,11 +369,15 @@ wait "$geak_wrapper"
         raise RuntimeError(
             "GEAK runtime capture produced no profiler trace: %s" %
             benchmark_log)
+    if not os.path.exists(trace):
+        raise RuntimeError(
+            "GEAK runtime capture trace is missing: %s (see %s)" %
+            (trace, benchmark_log))
     result = {
         "schema_version": 1,
         "status": "pass",
-        "capture_mode": "metadata_plus_runtime_markers",
-        "disable_cuda_graph": bool(disable_cuda_graph),
+        "capture_mode": "graph_capture_metadata_plus_runtime_markers",
+        "shape_capture_execution": "graph_capture",
         "capture_phases": list(phases or []),
         "forwards_per_bucket": int(forwards_per_bucket),
         "container": container,
@@ -390,7 +389,7 @@ wait "$geak_wrapper"
             setup.get("source_wrapper_map", [])),
         "shape_log": shape_log,
         "capture_trace": trace,
-        "capture_traces_by_phase": traces_by_phase,
+        "graph_capture_trace": graph_capture_trace_rank0,
         "phase_notes": phase_notes,
         "observed_phases": sorted(_observed_phases(shape_log)),
         "benchmark_log": benchmark_log,
@@ -417,18 +416,13 @@ def main():
     parser.add_argument("--setup", required=True)
     parser.add_argument("--capture-plan", required=True)
     parser.add_argument("--out-dir", required=True)
-    parser.add_argument("--disable-cuda-graph", action="store_true")
     parser.add_argument("--phase", action="append", default=[])
     parser.add_argument("--forwards-per-bucket", type=int, default=1)
-    parser.add_argument("--allow-decode-without-eager", action="store_true",
-                        help="do not auto-arm the eager probe when decode is "
-                             "requested (expect zero decode module spans)")
     parser.add_argument("--result-json", default="")
     args = parser.parse_args()
     result = capture(
         args.setup, args.capture_plan, args.out_dir,
-        args.disable_cuda_graph, args.phase,
-        args.forwards_per_bucket, args.allow_decode_without_eager)
+        args.phase, args.forwards_per_bucket)
     if args.result_json:
         with open(args.result_json, "w") as fh:
             json.dump(result, fh, indent=2)
