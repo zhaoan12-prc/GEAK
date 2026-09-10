@@ -370,8 +370,9 @@ class FusionCandidateHarnessTest(unittest.TestCase):
                 "requires plan 1 'norm + quant'" in error
                 for error in result["errors"]))
 
-    def test_requires_full_family_when_quant_is_non_adjacent(self):
-        # MoE-style: communication -> norm -> gemm(router) -> ... -> quant.
+    def test_non_adjacent_quant_is_not_claimed_by_collective_ladder(self):
+        # MoE-style: communication -> norm -> gemm/router -> ... -> quant.
+        # The later quant is a different data domain; only AR+norm is mandatory.
         with tempfile.TemporaryDirectory() as tmp:
             table_payload = self._table()
             rows = table_payload["tables"][0]["rows"]
@@ -391,13 +392,11 @@ class FusionCandidateHarnessTest(unittest.TestCase):
                 os.path.join(tmp, "validation.json"))
             self.assertEqual(result["status"], "fail")
             self.assertTrue(any(
+                "requires plan 1 'allreduce + norm'" in error
+                for error in result["errors"]))
+            self.assertFalse(any(
+                "allreduce + norm + quant" in error or
                 "requires plan 1 'norm + quant'" in error
-                for error in result["errors"]))
-            self.assertTrue(any(
-                "requires plan 3 'allreduce + norm + quant'" in error
-                for error in result["errors"]))
-            self.assertTrue(any(
-                "r3" in error and "allreduce + norm + quant" in error
                 for error in result["errors"]))
 
     # ---- boundary (cross-layer) fixtures: head norm/quant at low pos, the
@@ -901,9 +900,10 @@ class FusionCandidateHarnessTest(unittest.TestCase):
                 "existing_flag_or_env must record the enabling flag" in error
                 for error in result["errors"]))
 
-    def test_cluster_candidate_spanning_donor_fails(self):
-        # A *_cluster candidate whose members straddle a GEMM must fail: a fused
-        # kernel cannot cross a main donor.
+    def test_any_candidate_spanning_donor_fails(self):
+        # Donor-span validation applies to every non-boundary family.  This
+        # collective-named candidate deliberately has no *_cluster suffix; it
+        # must still fail when its members straddle a GEMM.
         with tempfile.TemporaryDirectory() as tmp:
             table_payload = self._table()  # r0 norm10, r1 quant11, r2 gemm12
             table_payload["tables"][0]["rows"].append({
@@ -914,7 +914,8 @@ class FusionCandidateHarnessTest(unittest.TestCase):
             payload["stage_inventory"][1]["row_ids"] = ["r2", "r3"]
             # cluster candidate members r0(seq10) + r3(seq13) span r2 gemm(seq12)
             payload["candidates"][0].update({
-                "candidate_id": "c_cluster", "family": "norm_quant_cluster",
+                "candidate_id": "c_collective",
+                "family": "collective_norm_quant",
                 "members": [
                     {"row_id": "r0", "pos": 0, "device_seq_index": 10,
                      "stream": 8, "duration_us": 6.0, "stage": "norm",
@@ -929,9 +930,9 @@ class FusionCandidateHarnessTest(unittest.TestCase):
             payload["summary_rows"][0]["source_row_ids"] = ["r0", "r3"]
             payload["summary_rows"][0]["current_chain_us_per_layer"] = 14.0
             payload["summary_rows"][0]["plans"][0].update({
-                "candidate_id": "c_cluster", "addressable_us_per_layer": 8.0,
+                "candidate_id": "c_collective", "addressable_us_per_layer": 8.0,
                 "current_chain_us_per_layer": 14.0})
-            payload["stage_inventory"][0]["candidate_ids"] = ["c_cluster"]
+            payload["stage_inventory"][0]["candidate_ids"] = ["c_collective"]
             table = self._write(tmp, "table.json", table_payload)
             candidates = self._write(tmp, "candidates.json", payload)
             result = harness.run(

@@ -302,23 +302,13 @@ def _collective_requirements(table):
                     and quant.get("stream") == norm.get("stream")
                     and int(quant.get("device_seq_index", -1))
                     == int(norm.get("device_seq_index", -2)) + 1)
-            # A post-collective residual norm is a norm position with the full
-            # narrow-to-broad family. The quant member is the fp8 quant that
-            # consumes the normed activation: the immediately-following row when
-            # present (dense FFN), otherwise the first later same-stream quant in
-            # the table (MoE expert-input quant; the router consumes the same
-            # normed activation in bf16 via the fused-AR emit_bf16 dual output).
-            # Only a norm whose activation is never quantized later collapses to
-            # allreduce + norm alone.
-            if has_quant:
-                quant_row = quant
-            else:
-                quant_row = None
-                for later in rows[index + 2:]:
-                    if (later.get("stage") == "quant"
-                            and later.get("stream") == norm.get("stream")):
-                        quant_row = later
-                        break
+            # A post-collective residual norm only forms the three-rung ladder
+            # when quant is the immediate next launch on the same stream.  A
+            # later quant after GEMM/router/MoE work is a different data domain;
+            # sequence proximity cannot prove that it consumes this norm output.
+            # Cross-donor fusions need an explicit candidate with its own
+            # producer/consumer evidence, never this structural fallback.
+            quant_row = quant if has_quant else None
             if quant_row is not None:
                 requirements.append((
                     key, 1, "norm+quant",
@@ -1150,16 +1140,14 @@ def validate(semantic_table_path, candidates_path,
                 "anchor %.3f): the surviving fused producer cannot be counted "
                 "as savings — keep it as the anchor (not removable)" % (
                     path, removable_total, merge_ceiling, anchor_duration))
-        # A fused kernel cannot cross a main donor. An aggregate "cluster"
-        # candidate (family *_cluster, from the sub-floor escalation) must be a
-        # CONTIGUOUS run — no donor-stage row (GEMM/Attention/MoE/Collective) may
-        # sit strictly between its members' device_seq span unless it is a member;
-        # scattered small helpers on both sides of an attention/GEMM are separate
-        # clusters. (Single producer→consumer folds like norm→downstream-quant,
-        # and collective dual-output fusions, are NOT clusters and are exempt —
-        # their non-adjacent member is the same data path emitted in one kernel.)
-        cand_family = str(candidate.get("family") or "")
-        if not is_boundary and cand_family.endswith("_cluster") and members:
+        # A fused kernel cannot cross a main donor. Every non-boundary candidate
+        # must be a contiguous run with respect to donor stages: no
+        # GEMM/Attention/MoE/Collective row may sit strictly between its member
+        # span unless that donor is itself a member and therefore the surviving
+        # fused producer/consumer. Scattered helpers on opposite sides of a
+        # donor are separate candidates. Restricting this invariant to
+        # *_cluster let collective candidates jump across GEMM/topk/MoE donors.
+        if not is_boundary and members:
             member_seqs = [
                 int(source_rows[(key[0], key[1], rid)].get(
                     "device_seq_index", -1))

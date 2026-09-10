@@ -1364,12 +1364,20 @@ if (!FAST_MODE && (FUSION_DISCOVERY_ON || fusionInputsComplete())) {
             }
           }
           const seenUnitCandidates = new Set();
-          const expand = (entry) => (entry.candidate_ids || [])
-            .filter(cid => !seenUnitCandidates.has(cid))
-            .map(cid => ({ exec_id: entry.exec_id, candidate_id: cid }));
+          // One recipe/cohort is one unit-side combination.  Measure its
+          // deterministic representative once; sibling occurrences are kept in
+          // the denominator and inherit that representative's auditable result.
+          const expand = (entry) => {
+            const cid = entry.unit_representative_candidate_id ||
+              (entry.candidate_ids || [])[0];
+            return cid && !seenUnitCandidates.has(cid)
+              ? [{ exec_id: entry.exec_id, candidate_id: cid }]
+              : [];
+          };
           const queue = [];
           for (const entry of tops) queue.push(entry);
           const subsumedCovered = [];
+          const equivalentCovered = [];
           const budgetSkipped = [];
           let spent = 0;
           // Advisory pass test, for ROUTING only: the authoritative pass/fail
@@ -1381,9 +1389,11 @@ if (!FAST_MODE && (FUSION_DISCOVERY_ON || fusionInputsComplete())) {
           while (queue.length) {
             const entry = queue.shift();
             let anyPass = false;
+            let representativeBudgetSkipped = false;
             for (const item of expand(entry)) {
               if (spent >= FUSION_UNITSIDE_BUDGET) {
                 seenUnitCandidates.add(item.candidate_id);
+                representativeBudgetSkipped = true;
                 budgetSkipped.push({ ...item,
                   reason: `unit-side budget ${FUSION_UNITSIDE_BUDGET} exhausted; NEVER MEASURED (not a waiver)` });
                 continue;
@@ -1403,8 +1413,25 @@ if (!FAST_MODE && (FUSION_DISCOVERY_ON || fusionInputsComplete())) {
                 { phase: 'KernelFusion', label: `fusion-unit:${item.candidate_id}`, schema: FUSION_UNIT_SCHEMA }, 1);
               if (unitPassed(r)) anyPass = true;
             }
+            if (representativeBudgetSkipped) {
+              for (const cid of (entry.unit_equivalent_candidate_ids || [])) {
+                if (seenUnitCandidates.has(cid)) continue;
+                seenUnitCandidates.add(cid);
+                budgetSkipped.push({ exec_id: entry.exec_id, candidate_id: cid,
+                  reason: `representative unit-side test was skipped after budget ${FUSION_UNITSIDE_BUDGET} was exhausted` });
+              }
+            }
             const held = heldByTop.get(entry.exec_id) || [];
-            if (!held.length) continue;
+            if (!representativeBudgetSkipped) {
+              const representative = entry.unit_representative_candidate_id ||
+                (entry.candidate_ids || [])[0];
+              for (const cid of (entry.unit_equivalent_candidate_ids || [])) {
+                if (seenUnitCandidates.has(cid)) continue;
+                seenUnitCandidates.add(cid);
+                equivalentCovered.push({ exec_id: entry.exec_id,
+                  candidate_id: cid, representative_candidate_id: representative });
+              }
+            }
             if (anyPass) {
               for (const child of held) {
                 for (const cid of (child.candidate_ids || [])) {
@@ -1414,8 +1441,10 @@ if (!FAST_MODE && (FUSION_DISCOVERY_ON || fusionInputsComplete())) {
                     ladder_top: entry.exec_id });
                 }
               }
-              log(`KernelFusion unit-side: ${entry.exec_id} passed; ${held.length} subsumed rung(s) covered without their own slot.`);
-            } else {
+              if (held.length) {
+                log(`KernelFusion unit-side: ${entry.exec_id} passed; ${held.length} subsumed rung(s) covered without their own slot.`);
+              }
+            } else if (held.length) {
               log(`KernelFusion unit-side: ${entry.exec_id} did NOT pass; releasing ${held.length} subsumed rung(s) to their own slot.`);
               for (const child of held) queue.unshift(child);
             }
@@ -1423,13 +1452,15 @@ if (!FAST_MODE && (FUSION_DISCOVERY_ON || fusionInputsComplete())) {
           const deferred = budgetSkipped.map(item => ({ ...item, disposition: 'budget_skipped' }));
           const aggregate = await safeAgent(
             roleAgent('fusion_unit_validator', 'aggregate',
-              'Aggregate only the Top-K execution_list candidate ids. Pass SUBSUMED_COVERED rows to the harness as ' +
+              'Aggregate only the Top-K execution_list candidate ids. Pass EQUIVALENT_COVERED rows as ' +
+              '--equivalent <id>=<representative_candidate_id> and SUBSUMED_COVERED rows as ' +
               '--subsumed <id>=<ladder_top> (covered: their ladder top was benched and passed) and BUDGET_SKIPPED rows as ' +
               '--budget-skipped <id>=<reason> (NOT covered — never measured). Do NOT launder a budget skip through --waive.', {
                 EVAL_DIR, FUSION_CANDIDATES_JSON: discover.fusion_candidates_json,
                 FUSION_TOPK_JSON: ranked.fusion_topk_json,
                 FUSION_DIR: discover.fusion_candidates_json.replace(/\/[^/]+$/, ''),
                 FUSION_UNITSIDE_BUDGET, DEFERRED_EXECUTIONS: deferred,
+                EQUIVALENT_COVERED: equivalentCovered,
                 SUBSUMED_COVERED: subsumedCovered, BUDGET_SKIPPED: budgetSkipped,
                 SKILL_DIR: WORKFLOW_DIR, ...FUSION_RUNTIME_INPUTS,
               }),

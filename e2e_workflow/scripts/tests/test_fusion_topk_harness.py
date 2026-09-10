@@ -436,6 +436,96 @@ class SubsumptionLadderTest(unittest.TestCase):
             self.assertEqual(alone["unit_cost"], 1)
             self.assertEqual(alone["subsumes"], [])
 
+    def test_same_recipe_uses_one_unit_representative(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            table = {"tables": [{
+                "phase": "decode", "pattern_id": "P0",
+                "rows": [
+                    {"row_id": "a1", "provider": "aiter"},
+                    {"row_id": "a2", "provider": "aiter"},
+                    {"row_id": "b1", "provider": "aiter"},
+                    {"row_id": "b2", "provider": "aiter"},
+                ]}]}
+            def cand(cid, rows):
+                return {
+                    "candidate_id": cid, "phase": "decode",
+                    "pattern_id": "P0", "family": "norm_quant",
+                    "implementation_class": "existing_api_needs_adapter",
+                    "readiness": "ready_for_api_validation",
+                    "exact_kernel_status": "yes",
+                    "members": [{"row_id": rid} for rid in rows],
+                    "removable_row_ids": [rows[-1]],
+                    "existing_apis": [{"name": "fused_norm_quant"}],
+                }
+            cands = {"candidates": [
+                cand("nq_z", ["a1", "a2"]),
+                cand("nq_a", ["b1", "b2"]),
+            ]}
+            val = {"metrics": {
+                "phase_total_forward_us": {"decode": 1000.0},
+                "candidate_savings": [
+                    {"candidate_id": "nq_z", "estimate_us": 5.0,
+                     "stack_estimate_us": 50.0, "basis": "roofline"},
+                    {"candidate_id": "nq_a", "estimate_us": 4.0,
+                     "stack_estimate_us": 40.0, "basis": "roofline"},
+                ]}}
+            result, _actions, _ = topk.rank(
+                self._write(tmp, "c.json", cands),
+                self._write(tmp, "v.json", val),
+                self._write(tmp, "t.json", table), 10)
+            self.assertEqual(len(result["execution_list"]), 1)
+            entry = result["execution_list"][0]
+            # The highest-benefit occurrence is representative even though its
+            # id sorts after the equivalent occurrence.
+            self.assertEqual(entry["unit_representative_candidate_id"], "nq_z")
+            self.assertEqual(entry["unit_equivalent_candidate_ids"], ["nq_a"])
+
+    def test_child_and_standalone_occurrences_of_one_recipe_are_split(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            table = {"tables": [{
+                "phase": "decode", "pattern_id": "P0",
+                "rows": [{"row_id": rid, "provider": "aiter"}
+                         for rid in ("ar", "n1", "q1", "n2", "q2")]}]}
+            def cand(cid, family, rows, removable, api):
+                return {
+                    "candidate_id": cid, "phase": "decode",
+                    "pattern_id": "P0", "family": family,
+                    "implementation_class": "existing_api_needs_adapter",
+                    "readiness": "ready_for_api_validation",
+                    "exact_kernel_status": "yes",
+                    "members": [{"row_id": rid} for rid in rows],
+                    "removable_row_ids": removable,
+                    "existing_apis": [{"name": api}],
+                }
+            cands = {"candidates": [
+                cand("wide", "collective_norm_quant", ["ar", "n1", "q1"],
+                     ["n1", "q1"], "fused_ar_nq"),
+                cand("nq_child", "norm_quant", ["n1", "q1"],
+                     ["q1"], "fused_nq"),
+                cand("nq_standalone", "norm_quant", ["n2", "q2"],
+                     ["q2"], "fused_nq"),
+            ]}
+            val = {"metrics": {
+                "phase_total_forward_us": {"decode": 1000.0},
+                "candidate_savings": [
+                    {"candidate_id": "wide", "estimate_us": 9.0,
+                     "stack_estimate_us": 90.0, "basis": "roofline"},
+                    {"candidate_id": "nq_child", "estimate_us": 5.0,
+                     "stack_estimate_us": 50.0, "basis": "roofline"},
+                    {"candidate_id": "nq_standalone", "estimate_us": 4.0,
+                     "stack_estimate_us": 40.0, "basis": "roofline"},
+                ]}}
+            result, _actions, _ = topk.rank(
+                self._write(tmp, "c.json", cands),
+                self._write(tmp, "v.json", val),
+                self._write(tmp, "t.json", table), 10)
+            rows = self._by_candidate(result)
+            self.assertNotEqual(rows["nq_child"]["exec_id"],
+                                rows["nq_standalone"]["exec_id"])
+            self.assertEqual(rows["nq_child"]["ladder_top"],
+                             rows["wide"]["exec_id"])
+            self.assertIsNone(rows["nq_standalone"]["ladder_top"])
+
     def test_every_rung_stays_on_the_board(self):
         # Subsumption changes who PAYS for the microbench. It must never drop a
         # row: the cheap/partial vs costly/fuller tradeoff is the reader's call.

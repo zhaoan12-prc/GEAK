@@ -207,6 +207,10 @@ def rank(candidates_path, validation_path, semantic_table_path, top_k,
             "readiness": cand.get("readiness"),
             "exact_kernel_status": cand.get("exact_kernel_status"),
             "implementation_class": cand.get("implementation_class"),
+            "member_row_ids": ([
+                member.get("row_id") for member in cand.get("members", [])
+                if member.get("row_id")]
+                or list(cand.get("removable_row_ids") or [])),
             "removable_row_ids": cand.get("removable_row_ids") or [],
             "estimate_us": sv.get("estimate_us"),
             "stack_estimate_us": sv.get("stack_estimate_us"),
@@ -217,13 +221,54 @@ def rank(candidates_path, validation_path, semantic_table_path, top_k,
             "actionable": _is_actionable(cand, sv, tier, guard_blocked_ids),
         }
 
+    # Candidate-level degradation is discovered before recipe aggregation.
+    # A narrow occurrence belongs below the smallest strict member-set
+    # superset in the SAME phase/pattern.  Using member rows expresses the
+    # actual fusion span; using removable rows made the relation depend on the
+    # arbitrary "heaviest row is anchor" choice and mixed independent QK
+    # norm+quant sites into the collective ladder.
+    for cid, info in annotated.items():
+        members = set(info.get("member_row_ids") or [])
+        parents = []
+        if members:
+            for other_id, other in annotated.items():
+                if other_id == cid:
+                    continue
+                if (other.get("phase"), other.get("pattern_id")) != (
+                        info.get("phase"), info.get("pattern_id")):
+                    continue
+                other_members = set(other.get("member_row_ids") or [])
+                if members < other_members:
+                    parents.append((len(other_members),
+                                    -(float(other.get("stack_estimate_us") or 0.0)),
+                                    other_id))
+        parent_id = min(parents)[2] if parents else None
+        info["parent_candidate_id"] = parent_id
+        info["parent_recipe_key"] = (
+            annotated[parent_id]["recipe_key"] if parent_id else None)
+
+    def _cohort_key(info):
+        """Split one API recipe only where its degradation context differs.
+
+        Occurrences of the same combination stay one unit-side test.  A
+        norm+quant occurrence below AR+norm+quant and an unrelated QK
+        norm+quant occurrence do not: only the former may be covered by the
+        wider collective test.
+        """
+        parent = info.get("parent_recipe_key")
+        return "%s :: %s" % (
+            info["recipe_key"],
+            "child-of=" + parent if parent else "standalone")
+
     # Group candidates into recipes; benefit aggregates across patterns within a
     # phase (additive), effort is counted once. Prefill and decode stay separate.
     recipes = {}
     for cid, info in annotated.items():
-        key = info["recipe_key"]
+        key = _cohort_key(info)
         recipe = recipes.setdefault(key, {
             "recipe_key": key,
+            "base_recipe_key": info["recipe_key"],
+            "parent_recipe_key": info.get("parent_recipe_key"),
             "family": info["family"],
             "tiers": Counter(),
             "occurrences": [],
@@ -301,6 +346,8 @@ def rank(candidates_path, validation_path, semantic_table_path, top_k,
             }
         ranked_recipes.append({
             "recipe_key": recipe["recipe_key"],
+            "base_recipe_key": recipe["base_recipe_key"],
+            "parent_recipe_key": recipe["parent_recipe_key"],
             "family": recipe["family"],
             "tier": global_tier,
             "route": TIER_ROUTE.get(global_tier, "?"),
@@ -456,6 +503,18 @@ def rank(candidates_path, validation_path, semantic_table_path, top_k,
     # the later phases are accounted against.
     exec_list = []
     for index, a in enumerate(actions, 1):
+        candidate_ids = a["candidate_ids"]
+        # One implementation is benched once.  Use the occurrence with the
+        # largest measured stack opportunity as the representative instead of
+        # relying on candidate-id sort order; this exercises the shape/site
+        # that matters most for the ranked benefit.
+        representative = max(
+            candidate_ids,
+            key=lambda cid: (
+                float(annotated[cid].get("stack_estimate_us") or 0.0),
+                float(annotated[cid].get("estimate_us") or 0.0),
+                cid),
+        ) if candidate_ids else None
         exec_list.append({
             "exec_id": "e%02d" % index,
             "rank": index,
@@ -463,7 +522,13 @@ def rank(candidates_path, validation_path, semantic_table_path, top_k,
             "tier": a["tier"],
             "action": a["action"],
             "handle": a["handle"],
-            "candidate_ids": a["candidate_ids"],
+            "candidate_ids": candidate_ids,
+            # One recipe/cohort is one concrete unit-side combination.  The
+            # representative is measured once; sibling occurrences are kept in
+            # the denominator and inherit the representative's auditable result.
+            "unit_representative_candidate_id": representative,
+            "unit_equivalent_candidate_ids": [
+                cid for cid in candidate_ids if cid != representative],
             "forward_us": a["forward_us"],
             "forward_pct": a["forward_pct"],
             "exclusive_group": None,
@@ -687,8 +752,8 @@ def _render_execution_list(result):
         "下面每一条都必须在 3.0 单侧 / 3.1 apply-back 里有明确结论："
         "**已落地 / 被挡（原因）/ 延后（原因）**。没提到 = 覆盖漏洞，不是「跳过」。")
     lines.append("")
-    lines.append("| exec | 阶段 | 难度 | 动作 | 候选 ID | 收益 | 互斥组 | 阶梯 |")
-    lines.append("|:--|:--:|:--:|---|---|---:|:--:|:--|")
+    lines.append("| exec | 阶段 | 难度 | 动作 | 候选 ID | 单侧代表 | 收益 | 互斥组 | 阶梯 |")
+    lines.append("|:--|:--:|:--:|---|---|---|---:|:--:|:--|")
     for entry in exec_list:
         if entry.get("subsumed_by"):
             ladder = "⊂ `%s`（单侧由其覆盖）" % entry["subsumed_by"]
@@ -697,10 +762,16 @@ def _render_execution_list(result):
                 "`%s`" % c for c in entry["subsumes"])
         else:
             ladder = "-"
-        lines.append("| `%s` | %s | **%s** | %s | %s | %s | %s | %s |" % (
+        representative = entry.get("unit_representative_candidate_id")
+        equivalent_count = len(entry.get("unit_equivalent_candidate_ids") or [])
+        unit_text = ("`%s`（+%d 等价实例）" %
+                     (representative, equivalent_count)
+                     if representative else "-")
+        lines.append("| `%s` | %s | **%s** | %s | %s | %s | %s | %s | %s |" % (
             entry["exec_id"], entry["phase"].capitalize(), entry["tier"],
             _esc(entry["action"]),
             ", ".join("`%s`" % c for c in entry["candidate_ids"]) or "-",
+            unit_text,
             ("%.2f%%" % entry["forward_pct"])
             if entry.get("forward_pct") is not None else "n/a",
             entry.get("exclusive_group") or "-", ladder))

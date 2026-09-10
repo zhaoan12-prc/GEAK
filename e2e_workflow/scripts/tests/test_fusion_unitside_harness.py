@@ -526,13 +526,36 @@ class BudgetVsSubsumptionTest(unittest.TestCase):
         self.assertEqual(res["coverage"]["subsumed_pass"], 1)
         self.assertEqual(res["coverage"]["not_validated"], 0)
 
+    def test_equivalent_pass_is_covered_by_one_representative_microbench(self):
+        res = self._run(self._cands(2), [self._verdict("c0")],
+                        equivalent={"c1": "c0"},
+                        require_phase_generalization=False)
+        self.assertEqual(res["status"], "pass")
+        self.assertEqual(self._status(res, "c1"), "equivalent_pass")
+        self.assertEqual(res["coverage"]["validated"], 1)
+        self.assertEqual(res["coverage"]["equivalent_pass"], 1)
+        self.assertEqual(res["coverage"]["not_validated"], 0)
+
+    def test_equivalent_inherits_a_failing_representative_once(self):
+        losing = self._verdict("c0")
+        losing["isolated_speedup"] = 0.9
+        res = self._run(self._cands(2), [losing],
+                        equivalent={"c1": "c0"},
+                        require_phase_generalization=False)
+        self.assertEqual(res["status"], "pass")
+        self.assertEqual(self._status(res, "c1"), "equivalent_fail")
+        self.assertTrue(res["coverage"]["complete"])
+        self.assertEqual(res["coverage"]["equivalent_covered"], 1)
+        self.assertEqual(res["coverage"]["equivalent_pass"], 0)
+
     def test_a_row_cannot_be_both_covered_and_never_measured(self):
         res = self._run(self._cands(2), [self._verdict("c0")],
                         subsumed={"c1": "e01"},
                         budget_skipped={"c1": "budget exhausted"},
                         require_phase_generalization=False)
         self.assertEqual(res["status"], "fail")
-        self.assertTrue(any("BOTH --subsumed" in e for e in res["errors"]))
+        self.assertTrue(any("covered and --budget-skipped" in e
+                            for e in res["errors"]))
 
     def test_unknown_ids_in_the_new_maps_are_errors(self):
         res = self._run(self._cands(1), [self._verdict("c0")],

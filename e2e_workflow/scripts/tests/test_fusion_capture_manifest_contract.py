@@ -89,7 +89,9 @@ class FusionCaptureManifestContractTest(unittest.TestCase):
             "label: 'fusion-unit:aggregate'", start)
         block = source[start:aggregate]
         self.assertIn("ranked.execution_list || []", block)
-        self.assertIn("candidate_ids", block)
+        self.assertIn("unit_representative_candidate_id", block)
+        self.assertIn("unit_equivalent_candidate_ids", block)
+        self.assertIn("equivalentCovered", block)
         self.assertIn("EXEC_ID: item.exec_id", block)
         self.assertIn("CANDIDATE_ID: item.candidate_id", block)
         self.assertIn(

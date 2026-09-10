@@ -129,8 +129,10 @@ If `EXEC_PREFIX` is non-empty, run executable commands as
 This is the KernelFusion apply-back driver — the orchestrator has no fs access, so YOU loop the candidates
 (one role call keeps the wins, like `config_tuner:sweep`):
 1. Read `FUSION_TOPK_JSON` + `FUSION_UNITSIDE_JSON`; take `unit_side_status` in
-   {`pass`, `subsumed_pass`} **tier-A or tier-B** candidates (tier-C is author work;
-   count it into `deferred_author_count`). `subsumed_pass` means the rung's ladder top
+   {`pass`, `equivalent_pass`, `subsumed_pass`} **tier-A or tier-B** candidates
+   (tier-C is author work; count it into `deferred_author_count`).
+   `equivalent_pass` means the same recipe/cohort passed once on this execution
+   row's declared representative. `subsumed_pass` means the rung's ladder top
    was benched and passed and that microbench covered this rung's rows — it is a pass,
    not a gap. `budget_skipped` / `not_validated` are NOT eligible: they were never
    measured, and they must be returned in `deferred[]` saying exactly that, never as

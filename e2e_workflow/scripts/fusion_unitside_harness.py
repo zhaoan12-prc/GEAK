@@ -54,6 +54,11 @@ So the denominator is now explicit. Every candidate that CITES an existing fused
 (i.e. is 单侧-testable at all) must end up in exactly one of:
 
   * a real verdict (pass / fail / blocked), or
+  * `--equivalent <candidate_id>=<representative_candidate_id>`: the same
+    recipe/cohort was measured once on its declared representative. The sibling
+    inherits an auditable `equivalent_pass`, `equivalent_fail`,
+    `equivalent_blocked`, or `equivalent_needs_diagnosis` result without
+    repeating an identical unit test, or
   * `--subsumed <candidate_id>=<ladder_top>` (status `subsumed_pass`): its
     ladder-top superset was benched and PASSED, and that microbench exercised
     every row this rung would remove. Covered, and cheap -- this is what lets a
@@ -332,15 +337,21 @@ def validate(candidates_path, verdicts_path, min_speedup=1.0,
              require_coverage=True, waivers=None, legacy_schema_ok=False,
              phase_waivers=None, require_phase_generalization=True,
              allow_shapeless_candidate="", topk_path=None,
-             subsumed=None, budget_skipped=None):
+             subsumed=None, equivalent=None, budget_skipped=None):
     payload = _load(candidates_path)
     candidate_list = payload.get("candidates", [])
     candidates = {c["candidate_id"]: c for c in candidate_list}
     topk_ids = None
+    candidate_exec = {}
     if topk_path:
         topk = _load(topk_path)
         topk_ids = {
             cid
+            for entry in (topk.get("execution_list") or [])
+            for cid in (entry.get("candidate_ids") or [])
+        }
+        candidate_exec = {
+            cid: entry.get("exec_id")
             for entry in (topk.get("execution_list") or [])
             for cid in (entry.get("candidate_ids") or [])
         }
@@ -358,6 +369,7 @@ def validate(candidates_path, verdicts_path, min_speedup=1.0,
     #               oproj candidate had never been measured. 「没测」不得渲染
     #               成「测过了」— a skipped row now counts against coverage.
     subsumed = dict(subsumed or {})
+    equivalent = dict(equivalent or {})
     budget_skipped = dict(budget_skipped or {})
 
     errors = []
@@ -609,6 +621,28 @@ def validate(candidates_path, verdicts_path, min_speedup=1.0,
                 "no existing fused kernel (tier-C, 需自写) — out of 单侧 scope, "
                 "counted but not benched"))
             continue
+        if cid in equivalent:
+            representative = equivalent[cid]
+            representative_row = next((
+                row for row in results
+                if row.get("candidate_id") == representative), None)
+            representative_status = (
+                representative_row.get("unit_side_status")
+                if representative_row else None)
+            if representative_status not in {
+                    "pass", "fail", "blocked", "needs_diagnosis"}:
+                coverage_rows.append(_row(
+                    cid, candidate, "not_validated",
+                    "declared equivalent to %s, but that representative did not "
+                    "produce a trustworthy verdict" % representative))
+                unvalidated.append(cid)
+            else:
+                equivalent_status = "equivalent_%s" % representative_status
+                coverage_rows.append(_row(
+                    cid, candidate, equivalent_status,
+                    "same recipe/cohort inherits representative %s result: %s"
+                    % (representative_status, representative)))
+            continue
         if cid in subsumed:
             coverage_rows.append(_row(
                 cid, candidate, "subsumed_pass",
@@ -630,17 +664,33 @@ def validate(candidates_path, verdicts_path, min_speedup=1.0,
             "NO verdict submitted — this candidate never reached the microbench"))
         unvalidated.append(cid)
     results.extend(coverage_rows)
+    status_by_id = {
+        row.get("candidate_id"): row.get("unit_side_status")
+        for row in results if row.get("candidate_id")}
     for cid in waived_unknown:
         errors.append("--waive references unknown candidate_id '%s'" % cid)
-    for flag, mapping in (("--subsumed", subsumed),
+    for flag, mapping in (("--equivalent", equivalent),
+                          ("--subsumed", subsumed),
                           ("--budget-skipped", budget_skipped)):
         for cid in sorted(set(mapping) - set(candidates)):
             errors.append("%s references unknown candidate_id '%s'" % (flag, cid))
-    # A row cannot be both covered-by-its-superset and never-measured.
-    for cid in sorted(set(subsumed) & set(budget_skipped)):
+    for cid, representative in sorted(equivalent.items()):
+        if representative not in candidates:
+            errors.append(
+                "--equivalent for '%s' references unknown representative '%s'"
+                % (cid, representative))
+        elif candidate_exec and candidate_exec.get(cid) != candidate_exec.get(representative):
+            errors.append(
+                "--equivalent requires candidate and representative in the same "
+                "execution_list row: %s=%s" % (cid, representative))
+    # A row cannot be both covered and never measured, or claim two coverage modes.
+    for cid in sorted((set(subsumed) | set(equivalent)) & set(budget_skipped)):
         errors.append(
-            "'%s' is marked BOTH --subsumed and --budget-skipped; a rung is "
-            "either covered by its ladder top or it was not measured" % cid)
+            "'%s' is marked covered and --budget-skipped; it is either covered "
+            "by a passing test or it was not measured" % cid)
+    for cid in sorted(set(subsumed) & set(equivalent)):
+        errors.append(
+            "'%s' is marked BOTH --subsumed and --equivalent" % cid)
 
     in_scope = [
         c for c in candidate_list
@@ -652,17 +702,24 @@ def validate(candidates_path, verdicts_path, min_speedup=1.0,
         ph = str(candidate.get("phase") or "?")
         slot = by_phase.setdefault(ph, {"in_scope": 0, "validated": 0,
                                         "waived": 0, "subsumed_pass": 0,
+                                        "equivalent_covered": 0,
+                                        "equivalent_pass": 0,
                                         "budget_skipped": 0,
                                         "not_validated": 0})
         slot["in_scope"] += 1
         cid = candidate.get("candidate_id")
+        status = status_by_id.get(cid)
         if cid in submitted:
             slot["validated"] += 1
-        elif cid in subsumed:
+        elif str(status or "").startswith("equivalent_"):
+            slot["equivalent_covered"] += 1
+            if status == "equivalent_pass":
+                slot["equivalent_pass"] += 1
+        elif status == "subsumed_pass":
             slot["subsumed_pass"] += 1
-        elif cid in budget_skipped:
+        elif status == "budget_skipped":
             slot["budget_skipped"] += 1
-        elif cid in waivers:
+        elif status == "waived":
             slot["waived"] += 1
         else:
             slot["not_validated"] += 1
@@ -671,18 +728,22 @@ def validate(candidates_path, verdicts_path, min_speedup=1.0,
         "in_scope": len(in_scope),
         "validated": sum(1 for c in in_scope if c.get("candidate_id") in submitted),
         "waived": sum(1 for c in in_scope
-                      if c.get("candidate_id") not in submitted
-                      and c.get("candidate_id") not in subsumed
-                      and c.get("candidate_id") not in budget_skipped
-                      and c.get("candidate_id") in waivers),
+                      if status_by_id.get(c.get("candidate_id")) == "waived"),
         # Covered without its own microbench: the ladder top above it passed.
         "subsumed_pass": sum(1 for c in in_scope
-                             if c.get("candidate_id") not in submitted
-                             and c.get("candidate_id") in subsumed),
+                             if status_by_id.get(c.get("candidate_id"))
+                             == "subsumed_pass"),
+        "equivalent_pass": sum(1 for c in in_scope
+                                if status_by_id.get(c.get("candidate_id"))
+                                == "equivalent_pass"),
+        "equivalent_covered": sum(
+            1 for c in in_scope
+            if str(status_by_id.get(c.get("candidate_id")) or "").startswith(
+                "equivalent_")),
         # NOT covered. Counted inside not_validated as well, on purpose.
         "budget_skipped": sum(1 for c in in_scope
-                              if c.get("candidate_id") not in submitted
-                              and c.get("candidate_id") in budget_skipped),
+                              if status_by_id.get(c.get("candidate_id"))
+                              == "budget_skipped"),
         "not_validated": len(unvalidated),
         "not_validated_ids": unvalidated,
         "deferred_author": sum(1 for c in candidate_list if not _in_scope(c)),
@@ -697,6 +758,9 @@ def validate(candidates_path, verdicts_path, min_speedup=1.0,
 
     counts = {"pass": 0, "fail": 0, "blocked": 0, "needs_diagnosis": 0,
               "not_validated": 0, "waived": 0, "subsumed_pass": 0,
+              "equivalent_pass": 0, "equivalent_fail": 0,
+              "equivalent_blocked": 0,
+              "equivalent_needs_diagnosis": 0,
               "budget_skipped": 0, "deferred_author": 0,
               "deferred_rank_budget": 0}
     for r in results:
@@ -784,10 +848,12 @@ def render_markdown(result):
     # failure this section exists to make impossible.
     if cov:
         lines.append(
-            "**覆盖率**：在范围内候选 **%d** / 已验证 **%d** / 阶梯代测 **%d** / "
+            "**覆盖率**：在范围内候选 **%d** / 已验证 **%d** / 等价代测 **%d**（其中通过 %d）/ 阶梯代测 **%d** / "
             "未验证 **%d**（其中预算跳过 %d）/ 豁免 %d"
             "；tier-C 待自写 %d（不计入范围）；Top-K 外延后 %d；候选总数 %d。"
             % (cov.get("in_scope", 0), cov.get("validated", 0),
+               cov.get("equivalent_covered", 0),
+               cov.get("equivalent_pass", 0),
                cov.get("subsumed_pass", 0),
                cov.get("not_validated", 0), cov.get("budget_skipped", 0),
                cov.get("waived", 0),
@@ -799,6 +865,7 @@ def render_markdown(result):
             lines.append("")
             lines.append("分阶段覆盖：" + "；".join(
                 "%s **%d/%d**" % (ph, v.get("validated", 0) + v.get("waived", 0)
+                                  + v.get("equivalent_covered", 0)
                                   + v.get("subsumed_pass", 0),
                                   v.get("in_scope", 0))
                 for ph, v in sorted(by_phase.items())) + "。")
@@ -894,7 +961,7 @@ def run(candidates_path, verdicts_path, out_md, out_json, min_speedup=1.0,
         require_coverage=True, waivers=None, legacy_schema_ok=False,
         phase_waivers=None, require_phase_generalization=True,
         allow_shapeless_candidate="", topk_path=None,
-        subsumed=None, budget_skipped=None):
+        subsumed=None, equivalent=None, budget_skipped=None):
     result = validate(candidates_path, verdicts_path, min_speedup,
                       require_coverage=require_coverage, waivers=waivers,
                       legacy_schema_ok=legacy_schema_ok,
@@ -902,6 +969,7 @@ def run(candidates_path, verdicts_path, out_md, out_json, min_speedup=1.0,
                       require_phase_generalization=require_phase_generalization,
                       allow_shapeless_candidate=allow_shapeless_candidate,
                       topk_path=topk_path, subsumed=subsumed,
+                      equivalent=equivalent,
                       budget_skipped=budget_skipped)
     os.makedirs(os.path.dirname(os.path.abspath(out_json)), exist_ok=True)
     with open(out_json, "w") as fh:
@@ -935,6 +1003,10 @@ def main():
                         help="this candidate's ladder-top superset was benched "
                              "and PASSED, so its removable rows are already "
                              "covered; counts as covered (repeatable)")
+    parser.add_argument("--equivalent", action="append",
+                        metavar="ID=REPRESENTATIVE_CANDIDATE", default=[],
+                        help="same recipe/cohort as a passing representative; "
+                             "counts as covered without another unit test")
     parser.add_argument("--budget-skipped", action="append",
                         metavar="ID=REASON", default=[],
                         help="this candidate never reached the microbench "
@@ -971,6 +1043,7 @@ def main():
                  allow_shapeless_candidate=args.allow_shapeless_candidate,
                  topk_path=args.topk,
                  subsumed=_parse_waivers(args.subsumed, "--subsumed"),
+                 equivalent=_parse_waivers(args.equivalent, "--equivalent"),
                  budget_skipped=_parse_waivers(
                      args.budget_skipped, "--budget-skipped"))
     cov = result.get("coverage") or {}
@@ -982,7 +1055,9 @@ def main():
                           "open_gaps": ["%s@%s" % (g["fused_fn"], g["phase"])
                                         for g in (pg.get("open_gaps") or [])]},
                       "coverage": {k: cov.get(k) for k in
-                                   ("in_scope", "validated", "subsumed_pass",
+                                   ("in_scope", "validated", "equivalent_covered",
+                                    "equivalent_pass",
+                                    "subsumed_pass",
                                     "budget_skipped", "not_validated",
                                     "waived", "deferred_author", "complete")}},
                      indent=2))

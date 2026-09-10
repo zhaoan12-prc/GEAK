@@ -163,22 +163,21 @@ or “融合…”.
 Mandatory collective coverage:
 
 - Every contiguous `communication -> norm` source chain is a residual-norm
-  position and must expose the full narrow-to-broad family in exactly this
-  order: ① `norm + quant`, ② `allreduce + norm`,
-  ③ `allreduce + norm + quant`.
-- The `quant` member is the fp8 quant that consumes the normed activation: the
-  row immediately after the norm when present (dense FFN), otherwise the first
-  later same-stream `quant` row in the same table (the MoE expert-input quant —
-  the router consumes the same normed activation in bf16, so a fused
-  all-reduce + norm + quant kernel emits both via its `emit_bf16` dual-output
-  path). Only a norm whose activation is never quantized later in the layer
-  collapses to ① `allreduce + norm` alone.
+  position. When `quant` is the immediate next launch on the same stream,
+  expose the full narrow-to-broad family in exactly this order: ①
+  `norm + quant`, ② `allreduce + norm`, ③
+  `allreduce + norm + quant`.
+- If the row after the norm is GEMM, router, MoE, attention, or another donor,
+  stop this ladder at ① `allreduce + norm`. Do not attach the first later
+  same-stream quant: sequence proximity across a donor does not prove that it
+  consumes this norm output. A real cross-donor dual-output fusion needs a
+  separate candidate with explicit producer/consumer evidence and must pass the
+  donor-span gate.
 - Each of ①②③ has its own `members` and
   `current_chain_us_per_layer`; calculate its duration only from those members.
-  ③'s members may be non-contiguous (comm, norm, later-quant): record the
-  parallel-consumer / `emit_bf16` runtime-source evidence and set readiness
-  accordingly (dense adjacent-quant is `ready_for_api_validation`; a
-  non-adjacent MoE quant is `needs_source_dependency_proof`).
+  For this in-layer ladder, ③ must be contiguous. Do not use
+  `needs_source_dependency_proof` to keep a structurally invalid cross-donor
+  candidate alive.
 Cross-layer (boundary) collective coverage:
 
 - Each layer's tail all-reduce (FFN/expert output) feeds the NEXT layer's input
@@ -1017,6 +1016,11 @@ The ranker now emits, alongside the ranked table:
   unit-side ONLY: at apply-back the integrator DESCENDS the ladder rung by rung,
   because a superset winning e2e does not mean the subset is worse (measured:
   superset −0.45%, subset +1.65%, same run).
+- `unit_representative_candidate_id` / `unit_equivalent_candidate_ids` — one
+  recipe/cohort runs exactly one unit-side microbench. The representative is
+  measured; sibling occurrences remain in the denominator and inherit its
+  pass/fail/blocked/needs-diagnosis result. Only `equivalent_pass` can proceed
+  to apply-back.
 - `exclusive_groups` — overlap is reported as a pairwise CONFLICT GRAPH, not as
   an equivalence class. `choose: 1` is claimed only when every pair in the group
   genuinely conflicts; otherwise `choose: "compatible_subset"` with the actual
