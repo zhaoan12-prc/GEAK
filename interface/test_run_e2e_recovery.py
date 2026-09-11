@@ -98,8 +98,12 @@ def test_recover_intermediate_keeps_original_baseline_and_sweep_config(tmp_path)
     wf = rx._recover_best_intermediate_win(eval_dir)
     assert wf["baseline_throughput_tok_s"] == pytest.approx(400.0)
     assert wf["throughput_speedup"] == pytest.approx(535.352 / 400.0)
+    # Recovery must reproduce the stack that the winning A/B actually ran:
+    # the earlier ConfigSweep choice plus the later TuningSkillset config.
     assert wf["accepted_config"] == {
-        "flags": "--banked-config", "env": "BANKED=1"}
+        "flags": "--max-num-batched-tokens 16384 --banked-config",
+        "env": "VLLM_TUNED_CONFIG_FOLDER=/x/config/integrate_moe_tuned BANKED=1",
+    }
 
 
 def test_normalize_does_not_invent_missing_report(tmp_path):
