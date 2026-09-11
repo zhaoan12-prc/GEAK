@@ -398,6 +398,21 @@ def map_args(h: dict, timeout_s: int | None = None) -> dict:
     # subset of {setup,profile,config,tune,head,kernel,final} (default unset => "all").
     if h.get("phases"):
         ps_args["phases"] = str(h["phases"])
+    if h.get("exec_prefix"):
+        ps_args["exec_prefix"] = str(h["exec_prefix"])
+    if h.get("runtime_image") or h.get("image"):
+        ps_args["runtime_image"] = str(h.get("runtime_image") or h.get("image"))
+    if isinstance(h.get("fusion"), dict):
+        ps_args["fusion"] = dict(h["fusion"])
+    for key in ("fusion_discovery", "fusion_top_k", "fusion_budget",
+                "fusion_unitside_budget"):
+        if h.get(key) is not None:
+            ps_args[key] = h[key]
+    if h.get("semantics_shape_capture") is not None:
+        ps_args["semantics_shape_capture"] = h["semantics_shape_capture"]
+    if isinstance(h.get("semantics_shape_capture_setup"), dict):
+        ps_args["semantics_shape_capture_setup"] = dict(
+            h["semantics_shape_capture_setup"])
     # Legacy A/B repeat override. Isolated-server handoffs use the purpose-specific
     # replica counts above; retain this pass-through for explicitly legacy runs.
     if h.get("e2e_repeats") is not None:
@@ -2726,6 +2741,7 @@ def normalize_result(h: dict, wf: dict) -> dict:
         # What the kernel phase actually did (req: report must carry this).
         "accepted_kernels": wf.get("accepted_kernels") or [],
         "accepted_heads": wf.get("accepted_heads") or [],
+        "accepted_fusions": wf.get("accepted_fusions") or [],
         "accepted_config": _accepted_config_with_env_map(wf.get("accepted_config") or {}),
         # Self-describing baseline measurement-protocol + Hyperloom cross-check (see baseline_basis above).
         "baseline_basis": baseline_basis,

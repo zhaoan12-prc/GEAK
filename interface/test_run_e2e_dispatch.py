@@ -245,12 +245,46 @@ class TestMapArgs(_RunE2ECase):
             eval_dir=str(self.tmp / "e2e_pinned"),
             launch_recipe="/recipes/launch_vllm.sh",
             phases="final",
+            exec_prefix="docker exec geak-runtime",
+            runtime_image="lmsysorg/sglang:test",
+            fusion={"topk_json": "/prior/topk.json",
+                    "candidates_json": "/prior/candidates.json",
+                    "unitside_json": "/prior/unitside.json"},
+            fusion_discovery="false",
+            fusion_unitside_budget=4,
+            semantics_shape_capture=True,
+            semantics_shape_capture_setup={
+                "container": "geak-runtime",
+                "model": "/models/test",
+                "benchmark": "benchmarks/sglang/bench_serving.sh",
+                "port": 31017,
+                "tensor_parallel_size": 4,
+                "workload": {
+                    "input_length": 1024,
+                    "output_length": 256,
+                    "concurrency": 8,
+                },
+            },
             e2e_repeats=1,
             state={"headQueue": [{"short_name": "h0"}]},
         )
         ps = rx.map_args(h, timeout_s=3600)
         self.assertEqual(ps["launch_script"], "/recipes/launch_vllm.sh")
         self.assertEqual(ps["phases"], "final")
+        self.assertEqual(ps["exec_prefix"], "docker exec geak-runtime")
+        self.assertEqual(ps["runtime_image"], "lmsysorg/sglang:test")
+        self.assertEqual(ps["fusion"]["topk_json"], "/prior/topk.json")
+        self.assertEqual(ps["fusion_discovery"], "false")
+        self.assertEqual(ps["fusion_unitside_budget"], 4)
+        self.assertIs(ps["semantics_shape_capture"], True)
+        self.assertEqual(
+            ps["semantics_shape_capture_setup"]["container"],
+            "geak-runtime",
+        )
+        self.assertEqual(
+            ps["semantics_shape_capture_setup"]["workload"]["concurrency"],
+            8,
+        )
         self.assertEqual(ps["e2e_repeats"], 1)
         self.assertEqual(ps["state"], {"headQueue": [{"short_name": "h0"}]})
         self.assertEqual(ps["time_budget_s"], 3600)
