@@ -190,6 +190,46 @@ class DecodeProbeTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "requires CUDA/HIP"):
                     capture.capture(setup, plan, os.path.join(tmp, "out"))
 
+    def test_local_capture_uses_no_docker_and_restores(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            setup = os.path.join(tmp, "setup.json")
+            plan = os.path.join(tmp, "plan.json")
+            out_dir = os.path.join(tmp, "out")
+            with open(setup, "w") as fh:
+                json.dump({
+                    "execution_mode": "local", "model": "/model",
+                    "benchmark_repository": "/repo", "benchmark": "/repo/bench.sh",
+                    "port": 0, "tensor_parallel_size": 1,
+                    "workload": {"concurrency": 1, "input_length": 8,
+                                 "output_length": 8},
+                }, fh)
+            with open(plan, "w") as fh:
+                json.dump({"target_buckets": [{"phase": "decode"}],
+                           "capture_targets": [{"representative_layer_id": 0}]}, fh)
+
+            def fake_run(command, stdout=None):
+                os.makedirs(out_dir, exist_ok=True)
+                with open(os.path.join(out_dir, "shape.jsonl"), "w") as fh:
+                    fh.write(json.dumps({"phase": "decode"}) + "\n")
+                with open(os.path.join(out_dir, "graph_capture-TP-0.trace.json"), "w") as fh:
+                    json.dump({"traceEvents": []}, fh)
+                return mock.Mock(returncode=0)
+
+            with mock.patch.object(capture, "_free_local_port", return_value=32123), \
+                    mock.patch.object(capture, "_local_port_free", return_value=True), \
+                    mock.patch.object(capture, "_deploy_local") as deploy, \
+                    mock.patch.object(capture, "_restore_local") as restore, \
+                    mock.patch.object(capture, "_stop_service_local") as stop, \
+                    mock.patch.object(capture, "_run", side_effect=fake_run), \
+                    mock.patch.object(capture, "_docker") as docker:
+                result = capture.capture(setup, plan, out_dir, phases=["decode"])
+            docker.assert_not_called()
+            deploy.assert_called_once()
+            stop.assert_called_once_with(os.path.join(out_dir, "server.pgid"), 32123)
+            restore.assert_called_once()
+            self.assertEqual(result["execution_mode"], "local")
+            self.assertEqual(result["port"], 32123)
+
 
 if __name__ == "__main__":
     unittest.main()

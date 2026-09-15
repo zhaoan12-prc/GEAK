@@ -695,6 +695,7 @@ python3 "$SKILL_DIR/scripts/fusion_candidate_harness.py" \
   --candidates "$EVAL_DIR/profile/round_${ROUND}/fusion/fusion_candidates.json" \
   --out-md "$EVAL_DIR/02_FUSION_CANDIDATES.md" \
   --result-json "$EVAL_DIR/profile/round_${ROUND}/fusion/fusion_candidate_result.json" \
+  --roofline-json "$PROFILE_ROOFLINE_JSON" \
   --catalog "$EVAL_DIR/profile/round_${ROUND}/fusion/available_fusion_kernels.json" \
   --fusion-priors "$SKILL_DIR/knowledge/fusion/fusion_strategies.json" \
   --priors-index "${LEARNED_INDEX:-$SKILL_DIR/knowledge/learned/INDEX.md}"

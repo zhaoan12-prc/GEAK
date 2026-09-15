@@ -5,6 +5,8 @@ import base64
 import json
 import os
 import shlex
+import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -57,6 +59,17 @@ def _assert_port_free(container, port):
             "port %s is already serving inside container %s; this run will "
             "not pattern-kill a process it did not start -- stop it from the "
             "session that owns it, then retry" % (port, container))
+
+
+def _local_port_free(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        return sock.connect_ex(("127.0.0.1", int(port))) != 0
+
+
+def _free_local_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 def _stop_service(container, pgid_path, port, timeout=90):
@@ -155,6 +168,67 @@ fi
     _docker(container, command)
 
 
+def _deploy_local(model_runner, runtime_module):
+    runtime_backup = runtime_module + ".geak_semantics_bak"
+    if os.path.exists(runtime_module) and not os.path.exists(runtime_backup):
+        shutil.copyfile(runtime_module, runtime_backup)
+    os.makedirs(os.path.dirname(runtime_module), exist_ok=True)
+    shutil.copyfile(RUNTIME_CAPTURE, runtime_module)
+    model_backup = model_runner + ".geak_semantics_bak"
+    if not os.path.exists(model_backup):
+        shutil.copyfile(model_runner, model_backup)
+    with open(model_runner) as fh:
+        text = fh.read()
+    if SENTINEL not in text:
+        bootstrap = """
+
+# GEAK_SEMANTICS_CAPTURE_BOOTSTRAP_V1
+import os as _geak_os
+if _geak_os.environ.get("GEAK_SEMANTICS_CAPTURE", "0") in ("1", "true", "True"):
+    import sys as _geak_sys
+    try:
+        from sglang.srt import geak_semantic_runtime_capture as _geak_capture
+        _geak_original_load_model = ModelRunner.load_model
+        def _geak_load_model(self, *args, **kwargs):
+            result = _geak_original_load_model(self, *args, **kwargs)
+            _geak_capture.install_on_model(self.model)
+            return result
+        ModelRunner.load_model = _geak_load_model
+        _geak_sys.stderr.write("[GEAK_SEMANTICS] ModelRunner.load_model wrapped\\n")
+    except Exception as _geak_error:
+        _geak_sys.stderr.write("[GEAK_SEMANTICS] bootstrap failed: %s\\n" % _geak_error)
+"""
+        with open(model_runner, "a") as fh:
+            fh.write(bootstrap)
+
+
+def _restore_local(model_runner, runtime_module):
+    for path in (model_runner, runtime_module):
+        backup = path + ".geak_semantics_bak"
+        if os.path.exists(backup):
+            shutil.copyfile(backup, path)
+            os.remove(backup)
+        elif path == runtime_module and os.path.exists(path):
+            os.remove(path)
+
+
+def _stop_service_local(pgid_path, port, timeout=90):
+    command = """
+pgid_file=%s
+[ -s "$pgid_file" ] || exit 0
+pgid=$(cat "$pgid_file")
+case "$pgid" in ''|*[!0-9]*) exit 0;; esac
+kill -TERM -"$pgid" 2>/dev/null || true
+for _ in $(seq 1 %d); do
+  if ! (exec 3<>/dev/tcp/127.0.0.1/%d) 2>/dev/null; then exit 0; fi
+  exec 3<&- 3>&-
+  sleep 1
+done
+kill -KILL -"$pgid" 2>/dev/null || true
+""" % (shlex.quote(str(pgid_path)), int(timeout), int(port))
+    subprocess.run(["bash", "-lc", command], check=True)
+
+
 _MODEL_PHASES = ("prefill", "decode")
 
 
@@ -233,14 +307,17 @@ def capture(setup_path, capture_plan_path, out_dir, phases=None,
     phase_notes = _warn_narrowed_phases(phases, plan, phase_source)
 
     decode_requested = "decode" in phases
-    required = ("container", "model", "benchmark", "port",
-                "tensor_parallel_size", "workload")
+    execution_mode = str(setup.get("execution_mode", "docker")).lower()
+    if execution_mode not in ("docker", "local"):
+        raise ValueError("unsupported shape capture execution_mode: %s" % execution_mode)
+    required = (("container",) if execution_mode == "docker" else ()) + (
+        "model", "benchmark", "port", "tensor_parallel_size", "workload")
     missing = [name for name in required if setup.get(name) is None]
     if missing:
         raise ValueError(
             "shape capture setup missing: %s" % ", ".join(missing))
 
-    container = setup["container"]
+    container = setup.get("container", "")
     model_runner = setup.get("sglang_model_runner", DEFAULT_MODEL_RUNNER)
     runtime_module = setup.get(
         "geak_runtime_capture_module", DEFAULT_RUNTIME_MODULE)
@@ -261,7 +338,14 @@ def capture(setup_path, capture_plan_path, out_dir, phases=None,
         if os.path.exists(path):
             os.remove(path)
 
-    _assert_port_free(container, setup["port"])
+    port = int(setup["port"])
+    if execution_mode == "local" and port == 0:
+        port = _free_local_port()
+    if execution_mode == "local":
+        if not _local_port_free(port):
+            raise RuntimeError("port %s is already serving locally" % port)
+    else:
+        _assert_port_free(container, port)
     workload = setup["workload"]
     repository = setup.get(
         "benchmark_repository",
@@ -346,19 +430,31 @@ wait "$geak_wrapper"
         setup.get("bench_client", "inferencex"),
         setup.get("inferencex_path", repository),
         "1" if setup.get("bench_cold_final", False) else "0",
-        setup["port"], setup.get("gpu_ids", "0"), pgid_path, benchmark,
+        port, setup.get("gpu_ids", "0"), pgid_path, benchmark,
         repository)
     started = time.time()
     try:
-        _deploy(container, model_runner, runtime_module)
+        if execution_mode == "local":
+            _deploy_local(model_runner, runtime_module)
+        else:
+            _deploy(container, model_runner, runtime_module)
         with open(benchmark_log, "w") as log:
-            _docker(container, command, stdout=log)
+            if execution_mode == "local":
+                _run(["bash", "-lc", command], stdout=log)
+            else:
+                _docker(container, command, stdout=log)
     finally:
         # Stop only the process group this replay started.
         try:
-            _stop_service(container, pgid_path, setup["port"])
+            if execution_mode == "local":
+                _stop_service_local(pgid_path, port)
+            else:
+                _stop_service(container, pgid_path, port)
         finally:
-            _restore(container, model_runner, runtime_module)
+            if execution_mode == "local":
+                _restore_local(model_runner, runtime_module)
+            else:
+                _restore(container, model_runner, runtime_module)
     graph_capture_trace_rank0 = graph_capture_trace.format(rank=0)
     trace = graph_capture_trace_rank0
     if not os.path.exists(shape_log) or os.path.getsize(shape_log) == 0:
@@ -381,6 +477,8 @@ wait "$geak_wrapper"
         "capture_phases": list(phases or []),
         "forwards_per_bucket": int(forwards_per_bucket),
         "container": container,
+        "execution_mode": execution_mode,
+        "port": port,
         "representative_layers": layers,
         "callable_targets": callable_targets,
         "callable_kernel_map": list(

@@ -304,6 +304,38 @@ class TestMapArgs(_RunE2ECase):
         )
         self.assertNotIn("time_budget_s", ps_zero)
 
+    def test_fusion_defaults_build_local_shape_capture_setup(self):
+        ps = rx.map_args(self._handoff(
+            eval_dir=str(self.tmp / "e2e_x"), framework="sglang",
+            accepted_flags="--disable-radix-cache",
+            accepted_env="SGLANG_USE_AITER=1",
+            bench_protocol={"num_prompts": 96, "num_warmups": 16, "seed": 7},
+        ))
+        setup = ps["semantics_shape_capture_setup"]
+        self.assertEqual(setup["execution_mode"], "local")
+        self.assertEqual(setup["model"], "/models/fake-8b")
+        self.assertEqual(setup["benchmark"], str(rx.BENCH_SCRIPT))
+        self.assertEqual(setup["port"], 0)
+        self.assertEqual(setup["tensor_parallel_size"], 4)
+        self.assertEqual(setup["gpu_ids"], "0,1,2,3")
+        self.assertEqual(setup["workload"]["concurrency"], 8)
+        self.assertEqual(setup["workload"]["num_prompts"], 96)
+        self.assertEqual(setup["extra_server_args"], "--disable-radix-cache")
+        self.assertEqual(setup["extra_env"], "SGLANG_USE_AITER=1")
+
+    def test_explicit_shape_capture_setup_remains_authoritative(self):
+        explicit = {"execution_mode": "docker", "container": "chosen"}
+        ps = rx.map_args(self._handoff(
+            eval_dir=str(self.tmp / "e2e_x"), framework="sglang",
+            semantics_shape_capture_setup=explicit))
+        self.assertEqual(ps["semantics_shape_capture_setup"], explicit)
+
+    def test_non_fusion_run_does_not_gain_implicit_capture_setup(self):
+        ps = rx.map_args(self._handoff(
+            eval_dir=str(self.tmp / "e2e_x"), framework="sglang",
+            fusion_discovery=False))
+        self.assertNotIn("semantics_shape_capture_setup", ps)
+
     def test_unparseable_fidelity_knobs_are_dropped_not_raised(self):
         """A junk max_model_len/mem_fraction must degrade to the adapter default,
         never abort the run before it starts."""

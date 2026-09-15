@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
 
 import fusion_priors
@@ -84,13 +85,48 @@ _DTYPE_BYTES = {
 
 
 def _gfx_key(environment):
-    """Extract a gfxNNN key from anywhere in the environment inventory."""
-    match = re.search(r"gfx\d+", json.dumps(environment or {}))
-    return match.group(0) if match else None
+    """Read a structured arch field; never guess from agent prose."""
+    env = environment or {}
+    gpu = env.get("gpu") if isinstance(env.get("gpu"), dict) else {}
+    for value in (gpu.get("gcn_arch_name"), gpu.get("arch"),
+                  env.get("gcn_arch_name"), env.get("gpu_arch")):
+        value = str(value or "").split(":", 1)[0].strip()
+        if value.startswith("gfx") and value[3:].isdigit():
+            return value
+    return None
 
 
-def _hbm_bw_bytes_per_us(environment):
-    gfx = _gfx_key(environment)
+def _runtime_gfx_key():
+    try:
+        import torch
+        value = str(torch.cuda.get_device_properties(0).gcnArchName).split(":", 1)[0]
+        if value.startswith("gfx") and value[3:].isdigit():
+            return value
+    except Exception:
+        pass
+    try:
+        output = subprocess.run(
+            ["rocminfo"], check=True, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True).stdout
+        for line in output.splitlines():
+            value = line.strip().split()[-1] if line.strip() else ""
+            value = value.split(":", 1)[0]
+            if value.startswith("gfx") and value[3:].isdigit():
+                return value
+    except Exception:
+        pass
+    return None
+
+
+def _hbm_bw_bytes_per_us(environment, roofline_path=""):
+    if roofline_path and os.path.exists(roofline_path):
+        try:
+            bandwidth = float(_load(roofline_path).get("hbm_bw_bytes_s") or 0)
+            if bandwidth > 0:
+                return bandwidth / 1e6
+        except (OSError, TypeError, ValueError):
+            pass
+    gfx = _gfx_key(environment) or _runtime_gfx_key()
     if _roofline is not None and gfx:
         try:
             peaks = _roofline.load_peaks(_PEAKS_MD, gfx)
@@ -833,7 +869,8 @@ def validate(semantic_table_path, candidates_path,
              escalate_floor=DEFAULT_ESCALATE_FLOOR_US,
              agg_escalate_floor=DEFAULT_AGG_ESCALATE_FLOOR_US,
              allow_partial_phase_coverage=None,
-             priors_index=None, catalog_path="", strategies_path=""):
+             priors_index=None, catalog_path="", strategies_path="",
+             roofline_path=""):
     table = _load(semantic_table_path)
     payload = _load(candidates_path)
     tables, source_rows, table_order = _semantic_index(table)
@@ -898,7 +935,7 @@ def validate(semantic_table_path, candidates_path,
         if not environment.get("inspection_evidence"):
             errors.append(
                 "environment API inventory must record inspection_evidence")
-        bw_per_us = _hbm_bw_bytes_per_us(environment)
+        bw_per_us = _hbm_bw_bytes_per_us(environment, roofline_path)
         # Collective fused-AR size guard becomes a machine-checked fact so the
         # prefill=no / decode=yes Exact decision is deterministic instead of
         # re-derived (and mis-numbered) by the model each run.
@@ -1860,11 +1897,12 @@ def run(semantic_table_path, candidates_path, out_md, result_json,
         escalate_floor=DEFAULT_ESCALATE_FLOOR_US,
         agg_escalate_floor=DEFAULT_AGG_ESCALATE_FLOOR_US,
         allow_partial_phase_coverage=None,
-        priors_index=None, catalog_path="", strategies_path=""):
+        priors_index=None, catalog_path="", strategies_path="",
+        roofline_path=""):
     payload, table, errors, warnings, metrics = validate(
         semantic_table_path, candidates_path, helper_floor, escalate_floor,
         agg_escalate_floor, allow_partial_phase_coverage, priors_index,
-        catalog_path, strategies_path)
+        catalog_path, strategies_path, roofline_path)
     result = {
         "schema_version": 2,
         "status": "pass" if not errors else "fail",
@@ -1927,6 +1965,7 @@ def main():
     parser.add_argument("--candidates", required=True)
     parser.add_argument("--out-md", required=True)
     parser.add_argument("--result-json", required=True)
+    parser.add_argument("--roofline-json", default="")
     parser.add_argument(
         "--helper-floor", type=float, default=DEFAULT_HELPER_FLOOR_US,
         help="min duration (us) a non-donor helper row must clear before it "
@@ -1978,7 +2017,8 @@ def main():
         args.semantic_table, args.candidates,
         args.out_md, args.result_json, args.helper_floor, args.escalate_floor,
         args.agg_escalate_floor, args.allow_partial_phase_coverage,
-        args.priors_index, args.catalog, args.fusion_priors)
+        args.priors_index, args.catalog, args.fusion_priors,
+        args.roofline_json)
     print(json.dumps(result, indent=2))
     return 0 if result["status"] == "pass" else 1
 

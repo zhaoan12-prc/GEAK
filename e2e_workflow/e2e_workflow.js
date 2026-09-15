@@ -3119,6 +3119,7 @@ if (!FAST_MODE && (FUSION_DISCOVERY_ON || fusionInputsComplete())) {
             STRUCTURAL_PATTERNS_JSON: semantics.structural_patterns_json || '',
             SEMANTIC_QUALITY_JSON: semantics.quality_json || '',
             SEMANTICS_RUN_JSON: semantics.semantic_report_json || '',
+            PROFILE_ROOFLINE_JSON: `${EVAL_DIR}/profile/round_0/profile_roofline.json`,
             RUNTIME_IMAGE, TP: SERVING_TP,
             PERF_KNOWLEDGE_DIR: KERNEL_KNOWLEDGE_DIR, SKILL_DIR: WORKFLOW_DIR,
             ...FUSION_RUNTIME_INPUTS,

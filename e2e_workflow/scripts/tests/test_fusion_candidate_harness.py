@@ -18,6 +18,22 @@ class FusionCandidateHarnessTest(unittest.TestCase):
             json.dump(value, fh)
         return path
 
+    def test_roofline_json_is_preferred_over_unstructured_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            roofline = self._write(tmp, "profile_roofline.json", {
+                "hbm_bw_bytes_s": 5.3e12})
+            self.assertEqual(
+                harness._hbm_bw_bytes_per_us(
+                    {"inspection_evidence": ["GPU prose without arch"]}, roofline),
+                5.3e6)
+
+    def test_structured_arch_does_not_scan_free_text(self):
+        self.assertIsNone(harness._gfx_key({
+            "inspection_evidence": ["some sentence containing gfx942"]}))
+        self.assertEqual(
+            harness._gfx_key({"gpu": {"gcn_arch_name": "gfx942:sramecc+"}}),
+            "gfx942")
+
     def _env(self, root, threshold_bytes=67108864, hidden_size=16,
              dtype_bytes=2, aiter_commit=None):
         env = {
