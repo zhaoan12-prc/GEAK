@@ -3110,7 +3110,7 @@ if (!FAST_MODE && (FUSION_DISCOVERY_ON || fusionInputsComplete())) {
       semantics = { status: 'failed', notes: 'fusion capture produced no usable trace manifest' };
     }
 
-    if (semantics && semantics.semantic_table_json) {
+    if (semantics && semantics.status === 'pass' && semantics.semantic_table_json) {
       const discover = await safeAgent(
         roleAgent('kernel_fusion_analyst', 'generate_plans',
           'Generate and deterministically validate the complete run-local fusion inventory. If EXEC_PREFIX is set, use it as the literal command prefix.', {
@@ -3465,7 +3465,7 @@ if (!FAST_MODE && (FUSION_DISCOVERY_ON || fusionInputsComplete())) {
   // One-shot, non-gating baseline sidecar. KernelFusion may already have
   // produced it; otherwise preserve the original fallback.
   const haveFusionSemantics = !!(semantics && semantics.semantic_table_json &&
-    semantics.status !== 'failed' && semantics.status !== 'fail');
+    semantics.status === 'pass');
   if (!haveFusionSemantics && SEMANTICS_MAPPING_ON && profile && profile.trace_manifest_json) {
     semantics = await safeAgent(
       roleAgent('semantics_mapper', 'build_table',

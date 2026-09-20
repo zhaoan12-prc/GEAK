@@ -23,6 +23,14 @@ class RunSemanticShapeCaptureTest(unittest.TestCase):
         self.assertEqual(
             capture._required_phases(plan), ["decode", "prefill"])
 
+    def test_required_phase_contract_wins_when_a_table_is_still_missing(self):
+        plan = {
+            "phase_coverage": {"required_phases": ["prefill", "decode"]},
+            "target_buckets": [{"phase": "prefill"}],
+        }
+        self.assertEqual(
+            capture._required_phases(plan), ["decode", "prefill"])
+
 class OwnProcessGroupTeardownTest(unittest.TestCase):
     """Regression tests for B6 (docs/decode-coverage-bugs.md)."""
 
@@ -150,6 +158,7 @@ class DecodeProbeTest(unittest.TestCase):
             self.assertIn("--enable-profile-cuda-graph", command)
             self.assertNotIn("--disable-cuda-graph", command)
             self.assertIn("GEAK_SEMANTICS_REQUIRE_PROFILER=0", command)
+            self.assertIn("GEAK_SEMANTICS_LAYER_SCOPES=1", command)
             self.assertIn("export PROFILE=0", command)
             self.assertIn("export GPU=0,1,2,3,4,5,6,7", command)
             self.assertIn(
@@ -158,6 +167,7 @@ class DecodeProbeTest(unittest.TestCase):
             self.assertIn("export MEM_FRACTION=0.8", command)
             self.assertIn("export OUT_DIR=", command)
             self.assertEqual(result["shape_capture_execution"], "graph_capture")
+            self.assertTrue(result["all_main_layer_scopes"])
             self.assertEqual(
                 result["capture_trace"],
                 os.path.join(out_dir, "graph_capture-TP-0.trace.json"))

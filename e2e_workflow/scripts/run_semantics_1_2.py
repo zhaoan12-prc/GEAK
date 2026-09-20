@@ -9,6 +9,7 @@ import sys
 
 import semantic_kernel_mapping
 import semantic_evidence_ledger
+import semantic_layer_boundary_transfer
 import semantic_runtime_marker_mapping
 import semantic_shape_merge
 import semantic_source_mapping
@@ -28,30 +29,16 @@ def _sha256(path):
     return digest.hexdigest()
 
 
-def _verified_graph_capture_phases(capture_results):
-    """Phases whose clean rows were fully checked against graph-capture data."""
-    verified = set()
-    for capture in capture_results:
-        if capture.get("shape_capture_execution") != "graph_capture":
-            continue
-        mapping = capture.get("runtime_marker_mapping") or {}
-        audit = mapping.get("clean_table_sequence_audit") or {}
-        passed_groups = {}
-        for group in audit.get("groups", []):
-            phase = str(group.get("phase") or "").lower()
-            passed_groups.setdefault(phase, []).append(
-                group.get("status") == "pass")
-        for phase, stats in (mapping.get(
-                "shape_mapping_by_phase") or {}).items():
-            phase = str(phase or "").lower()
-            eligible = int(stats.get("shape_eligible_target_count", 0) or 0)
-            matched = int(
-                stats.get("shape_eligible_matched_target_count", 0) or 0)
-            if (eligible > 0 and matched == eligible
-                    and passed_groups.get(phase)
-                    and all(passed_groups[phase])):
-                verified.add(phase)
-    return verified
+def _representative_hints(table_path):
+    with open(table_path) as fh:
+        document = json.load(fh)
+    hints = {}
+    for table in document.get("tables", []):
+        pattern_id = table.get("pattern_id")
+        layer_id = table.get("representative_layer_id")
+        if pattern_id is not None and layer_id is not None:
+            hints.setdefault(pattern_id, set()).add(int(layer_id))
+    return {key: sorted(values) for key, values in hints.items()}
 
 
 def run(config_path, trace_path, shape_log_path, out_dir,
@@ -123,12 +110,10 @@ def run(config_path, trace_path, shape_log_path, out_dir,
         trace_path, patterns_path, out_dir, require_phases=require_phases)
 
     # --- Initial layer-boundary evidence -------------------------------------
-    # semantic_kernel_mapping resolves per-layer boundaries from python_function
-    # `nn.Module: ...DecoderLayer_<id>` spans, captured only when the torch
-    # profiler ran with with_stack/with_modules. Without them the boundary step
-    # degrades to sequence segmentation.  Do not accept that evidence by itself;
-    # graph-capture completion below must independently verify every degraded
-    # phase against the clean Kernel sequence before the run can pass.
+    # semantic_kernel_mapping resolves per-layer boundaries only from complete
+    # independent scopes. A graph-replayed phase without Python module spans
+    # stays unresolved until the graph-construction all-layer marker transfer
+    # below supplies validated cuts.
     with open(semantic["layer_instance_audit_json"]) as fh:
         module_scope_count = int(
             json.load(fh).get("module_scope_count", 0) or 0)
@@ -168,6 +153,44 @@ def run(config_path, trace_path, shape_log_path, out_dir,
         raise ValueError(
             "shape_log_path, capture_setup_path, or capture_result_path "
             "is required")
+
+    # A graph-replayed Clean Trace has correct device timing but may have no
+    # Python layer scopes.  The graph-construction replay now emits one
+    # lightweight marker for every main layer.  Transfer only those validated
+    # cuts, then rebuild the Clean Trace table before any Shape evidence is
+    # merged.  Shape completion is never allowed to upgrade a bad boundary.
+    boundary_transfers = []
+    boundary_map_paths = []
+    initial_hints = _representative_hints(phase_1_1_json)
+    for index, capture_result in enumerate(capture_results):
+        if (capture_result.get("shape_capture_execution") != "graph_capture"
+                or not capture_result.get("capture_trace")):
+            continue
+        boundary_dir = os.path.join(
+            out_dir, "boundary_transfers", "run_%02d" % index)
+        boundary_path = os.path.join(
+            boundary_dir, "LAYER_BOUNDARY_TRANSFER.json")
+        transfer = semantic_layer_boundary_transfer.transfer(
+            capture_result["capture_trace"], trace_path,
+            patterns_path, boundary_path)
+        capture_result["layer_boundary_transfer"] = transfer
+        boundary_transfers.append(transfer)
+        if transfer.get("status") == "pass":
+            boundary_map_paths.append(boundary_path)
+
+    if boundary_map_paths:
+        semantic = semantic_kernel_mapping.build(
+            trace_path, patterns_path, out_dir,
+            require_phases=require_phases,
+            boundary_map_paths=boundary_map_paths,
+            representative_layer_hints=initial_hints)
+        shutil.copyfile(semantic["semantic_table_json"], phase_1_1_json)
+        shutil.copyfile(semantic["semantic_table_md"], phase_1_1_md)
+        semantic["semantic_table_json"] = phase_1_1_json
+        semantic["semantic_table_md"] = phase_1_1_md
+        semantic_source_mapping.map_plan(
+            semantic["shape_capture_plan_json"], runtime_sources,
+            source_plan_path)
 
     probe_tables = []
     probe_runs = []
@@ -220,18 +243,30 @@ def run(config_path, trace_path, shape_log_path, out_dir,
         capture.get("runtime_marker_mapping", {}).get(
             "phase_coverage_complete", False)
         for capture in capture_results)
-    graph_capture_verified_phases = _verified_graph_capture_phases(
-        capture_results)
+    graph_capture_verified_phases = sorted({
+        str(group.get("phase") or "").lower()
+        for transfer in boundary_transfers
+        if transfer.get("status") == "pass"
+        for group in transfer.get("mapped_groups", [])
+        if group.get("phase")})
+    boundary_match_rules = sorted({
+        str(group.get("match_rule") or "")
+        for transfer in boundary_transfers
+        if transfer.get("status") == "pass"
+        for group in transfer.get("mapped_groups", [])
+        if group.get("match_rule")})
     boundary_rebuild = {
-        "applied": bool(graph_capture_verified_phases),
+        "applied": bool(boundary_map_paths),
         "status": (
-            "graph_capture_sequence_verified"
-            if graph_capture_verified_phases else "unavailable"),
+            "validated_graph_capture_layer_scopes_applied"
+            if boundary_map_paths else "unavailable"),
         "reason": (
-            "degraded clean-trace layer boundaries are accepted only for "
-            "phases whose graph-capture shape-eligible rows all mapped and "
-            "whose pattern Kernel sequences matched the clean table"),
-        "verified_phases": sorted(graph_capture_verified_phases),
+            "complete 0..N-1 graph-construction layer markers supplied cuts; "
+            "the donor-to-Clean-Trace transfer passed an audited exact "
+            "identity rule for the same phase and workload bucket"),
+        "match_rules": boundary_match_rules,
+        "verified_phases": graph_capture_verified_phases,
+        "transfers": boundary_transfers,
         "traces": [
             os.path.abspath(capture["capture_trace"])
             for capture in capture_results
@@ -240,10 +275,9 @@ def run(config_path, trace_path, shape_log_path, out_dir,
     }
     # --- Per-phase boundary evidence -----------------------------------------
     # `boundary_evidence` above is an AGGREGATE over the whole run: prefill's 61
-    # module spans set it to "module_span" even when every decode layer fell
-    # back to anchor_repeat_segmentation.  That fail-open is what let a rotated,
-    # identity-less decode table reach the fusion analyst marked healthy.  Grade
-    # each phase separately and require BOTH.
+    # module spans can set it to "module_span" even when another phase has no
+    # authoritative boundary at all. Grade each phase separately and require
+    # every published table to carry module or validated donor scope evidence.
     phase_boundary_evidence = {}
     try:
         with open(phase_1_1_json) as fh:
@@ -255,21 +289,20 @@ def run(config_path, trace_path, shape_log_path, out_dir,
                           for row in table.get("rows", [])}
                 degraded = {level for level in levels
                             if not str(level).startswith(
-                                ("module_span", "python_module_span"))}
+                                ("module_span", "python_module_span",
+                                 "validated_graph_capture_layer_scope"))}
                 phase_boundary_evidence[phase] = (
                     "degraded:" + ",".join(sorted(str(x) for x in degraded))
-                    if degraded else "module_span")
+                    if degraded else "authoritative_scope")
     except Exception as exc:  # pragma: no cover - diagnostics only
         phase_boundary_evidence = {"error": str(exc)}
     degraded_phases = sorted(
         phase for phase, level in phase_boundary_evidence.items()
-        if level != "module_span")
-    blocking_degraded_phases = [
-        phase for phase in degraded_phases
-        if phase not in graph_capture_verified_phases]
+        if level != "authoritative_scope")
+    blocking_degraded_phases = list(degraded_phases)
 
     status = "pass" if (
-        semantic["status"] != "fail"
+        semantic["status"] == "pass"
         and merged["status"] == "pass"
         and capture_phase_coverage_complete
         and not blocking_degraded_phases
@@ -280,7 +313,9 @@ def run(config_path, trace_path, shape_log_path, out_dir,
         "evidence_policy": {
             "levels": ["K", "P", "U"],
             "K": "clean trace Input Dims via External id",
-            "P": "runtime shape_logger probe (kernel or wrapper scope)",
+            "P": (
+                "graph-capture trace External-ID shape or runtime "
+                "shape_logger probe (kernel or wrapper scope)"),
             "U": "unavailable after probes with mandatory reason_code",
             "priority": ["K", "P(kernel)", "P(wrapper)", "U"],
             "additive_across_probe_runs": True,

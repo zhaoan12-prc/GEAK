@@ -1,29 +1,38 @@
 #!/usr/bin/env python3
-"""Validate Agent-defined structural Layer Patterns without defining them."""
+"""Validate per-layer body descriptors and derive structural Patterns.
+
+The semantics Agent interprets arbitrary model config/runtime source and emits
+one descriptor per main decoder layer. It does not decide Pattern identity.
+This validator groups identical canonical ``body_signature`` objects and keeps
+position/cross-layer effects in ``instance_context`` so first/last-layer
+epilogues cannot manufacture singleton Patterns.
+"""
 import argparse
 import copy
 import hashlib
 import json
 import os
+import re
 
 
-REQUIRED_SIGNATURE_FIELDS = (
-    "attention_type",
-    "model_native_attention_name",
-    "attention_config_fields",
-    "runtime_attention_module_class",
-    "ffn_type",
-    "is_moe",
-    "num_experts",
-    "topk",
-    "shared_expert",
-    "router_family",
+_CONTEXT_ONLY_KEYS = {
+    "boundary_dispatch",
+    "entry_handoff",
+    "exit_handoff",
+    "is_first_layer",
+    "is_first_main_layer",
+    "is_last_layer",
+    "is_last_main_layer",
+    "model_entry",
+    "model_epilogue",
+    "model_exit",
+    "post_layer_region",
+    "pre_layer_region",
     "special_layer_role",
-    "runtime_dispatch_branch",
-)
+}
 
 
-def _reject_trace_derived_definition(value, path="pattern"):
+def _reject_trace_derived_definition(value, path="definition"):
     forbidden_keys = (
         "trace_evidence",
         "trace_signature",
@@ -45,12 +54,25 @@ def _reject_trace_derived_definition(value, path="pattern"):
                         "trace", "profiler_trace", "kernel_trace")):
                 raise ValueError(
                     "Trace may validate but not define Pattern structure")
-            _reject_trace_derived_definition(
-                item, "%s.%s" % (path, key))
+            _reject_trace_derived_definition(item, "%s.%s" % (path, key))
     elif isinstance(value, list):
         for index, item in enumerate(value):
-            _reject_trace_derived_definition(
-                item, "%s[%d]" % (path, index))
+            _reject_trace_derived_definition(item, "%s[%d]" % (path, index))
+
+
+def _reject_context_in_body(value, path="body_signature"):
+    """Keep positional/cross-layer decoration out of Pattern identity."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            lowered = str(key).strip().lower()
+            if lowered in _CONTEXT_ONLY_KEYS:
+                raise ValueError(
+                    "%s.%s is instance context and may not define a Pattern"
+                    % (path, key))
+            _reject_context_in_body(item, "%s.%s" % (path, key))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _reject_context_in_body(item, "%s[%d]" % (path, index))
 
 
 def _sha256(path):
@@ -66,28 +88,48 @@ def _text_config(config):
     return value if isinstance(value, dict) else config
 
 
+_CONFIG_PATH_PART = re.compile(r"([^\[\]]+)|\[(\d+)\]")
+
+
 def _config_value(config, dotted_path):
+    """Resolve dotted config paths, including optional ``field[3]`` indices."""
     value = config
-    for part in str(dotted_path).split("."):
-        if not isinstance(value, dict) or part not in value:
+    for component in str(dotted_path).split("."):
+        parts = list(_CONFIG_PATH_PART.finditer(component))
+        if not parts:
             raise ValueError(
-                "config evidence path does not exist: %s" % dotted_path)
-        value = value[part]
+                "invalid config evidence path: %s" % dotted_path)
+        for match in parts:
+            key, index = match.groups()
+            if key is not None:
+                if not isinstance(value, dict) or key not in value:
+                    raise ValueError(
+                        "config evidence path does not exist: %s"
+                        % dotted_path)
+                value = value[key]
+            else:
+                position = int(index)
+                if (not isinstance(value, list)
+                        or position < 0 or position >= len(value)):
+                    raise ValueError(
+                        "config evidence index does not exist: %s"
+                        % dotted_path)
+                value = value[position]
     return value
 
 
 def _signature_hash(signature):
     payload = json.dumps(
-        signature, sort_keys=True, separators=(",", ":"))
+        signature, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
-def _validate_config_evidence(pattern, config):
-    evidence = pattern.get("config_evidence")
+def _validate_config_evidence(owner, config):
+    evidence = owner.get("config_evidence")
     if not isinstance(evidence, list) or not evidence:
         raise ValueError(
-            "%s requires non-empty config_evidence list"
-            % pattern.get("pattern_id"))
+            "layer %s requires non-empty config_evidence list"
+            % owner.get("layer_id"))
     for item in evidence:
         path = item.get("config_path")
         if not path or "value" not in item or not item.get("claim"):
@@ -98,12 +140,12 @@ def _validate_config_evidence(pattern, config):
                 "config evidence mismatch at %s" % path)
 
 
-def _validate_source_evidence(pattern, source_by_path):
-    evidence = pattern.get("source_evidence")
+def _validate_source_evidence(owner, source_by_path):
+    evidence = owner.get("source_evidence")
     if not isinstance(evidence, list) or not evidence:
         raise ValueError(
-            "%s requires runtime source evidence"
-            % pattern.get("pattern_id"))
+            "layer %s requires runtime source evidence"
+            % owner.get("layer_id"))
     for item in evidence:
         path = os.path.abspath(str(item.get("path") or ""))
         if path not in source_by_path:
@@ -120,17 +162,34 @@ def _validate_source_evidence(pattern, source_by_path):
         item["sha256"] = source_by_path[path]["sha256"]
 
 
+def _is_contextual_representative(layer):
+    context = layer.get("instance_context") or {}
+    return any(bool(context.get(key)) for key in (
+        "is_first_layer", "is_first_main_layer", "is_last_layer",
+        "is_last_main_layer", "model_entry", "model_exit",
+        "model_epilogue"))
+
+
+def _semantic_label(signature, name):
+    labels = signature.get("semantic_labels") or {}
+    value = labels.get(name)
+    return value if value is not None else signature.get(name)
+
+
 def validate(pattern_path, config_path, runtime_sources, out_path=""):
     with open(pattern_path) as fh:
         draft = json.load(fh)
     with open(config_path) as fh:
         config = json.load(fh)
+
     definition = draft.get("pattern_definition") or {}
     if definition.get("producer") != "semantics_mapper_agent":
         raise ValueError(
-            "patterns must be produced by semantics_mapper_agent")
-    if definition.get("method") != "config_runtime_source_analysis":
-        raise ValueError("unsupported Agent pattern definition method")
+            "layer descriptors must be produced by semantics_mapper_agent")
+    if definition.get("method") != "config_runtime_body_analysis":
+        raise ValueError(
+            "unsupported Agent definition method; expected "
+            "config_runtime_body_analysis")
     if definition.get("trace_used_for_definition") is not False:
         raise ValueError("Trace may not define structural Patterns")
     if not definition.get("analysis_summary"):
@@ -152,100 +211,160 @@ def validate(pattern_path, config_path, runtime_sources, out_path=""):
         raise ValueError(
             "Agent structural analysis requires current runtime source")
 
-    count = int(_text_config(config).get("num_hidden_layers", 0) or 0)
+    text_config = _text_config(config)
+    count = int(text_config.get("num_hidden_layers", 0) or 0)
     if count <= 0:
         raise ValueError("config has no positive num_hidden_layers")
-    patterns = draft.get("patterns")
-    if not isinstance(patterns, list) or not patterns:
-        raise ValueError("Agent must define at least one Pattern")
-
-    pattern_ids = set()
-    signature_hashes = set()
-    covered = []
-    for pattern in patterns:
-        pattern_id = str(pattern.get("pattern_id") or "")
-        if not pattern_id or pattern_id in pattern_ids:
-            raise ValueError("pattern_id must be non-empty and unique")
-        pattern_ids.add(pattern_id)
-        _reject_trace_derived_definition(pattern)
-        if not pattern.get("pattern_display_name"):
-            raise ValueError("%s requires pattern_display_name" % pattern_id)
-        signature = pattern.get("structural_signature")
-        if not isinstance(signature, dict):
-            raise ValueError("%s requires structural_signature" % pattern_id)
-        missing = [
-            key for key in REQUIRED_SIGNATURE_FIELDS
-            if key not in signature]
-        if missing:
-            raise ValueError(
-                "%s missing signature fields: %s"
-                % (pattern_id, ", ".join(missing)))
-        if not isinstance(signature["attention_config_fields"], dict):
-            raise ValueError("attention_config_fields must be an object")
-        signature_hash = _signature_hash(signature)
-        if signature_hash in signature_hashes:
-            raise ValueError(
-                "identical structural signatures must be merged")
-        signature_hashes.add(signature_hash)
-        pattern["signature_hash"] = signature_hash
-        layer_ids = pattern.get("layer_ids")
-        if (not isinstance(layer_ids, list)
-                or any(not isinstance(value, int) for value in layer_ids)):
-            raise ValueError("%s layer_ids must be integers" % pattern_id)
-        if layer_ids != sorted(set(layer_ids)):
-            raise ValueError("%s layer_ids must be sorted and unique" % pattern_id)
-        if any(value < 0 or value >= count for value in layer_ids):
-            raise ValueError("%s layer_id outside main model" % pattern_id)
-        if not layer_ids:
-            raise ValueError("%s has no layers" % pattern_id)
-        if pattern.get("representative_candidates") != layer_ids:
-            raise ValueError(
-                "%s representative_candidates must equal layer_ids"
-                % pattern_id)
-        pattern["layer_count"] = len(layer_ids)
-        pattern["attention_type"] = signature["attention_type"]
-        pattern["ffn_type"] = signature["ffn_type"]
-        _validate_config_evidence(pattern, config)
-        _validate_source_evidence(pattern, source_by_path)
-        covered.extend(layer_ids)
-
-    mutually_exclusive = len(covered) == len(set(covered))
-    full_coverage = sorted(covered) == list(range(count))
-    if not mutually_exclusive or not full_coverage:
+    scope = draft.get("main_layer_scope") or {}
+    declared_count = int(scope.get("num_hidden_layers", 0) or 0)
+    if declared_count != count:
         raise ValueError(
-            "Agent Patterns must cover every main layer exactly once")
+            "main_layer_scope.num_hidden_layers=%d does not match config=%d"
+            % (declared_count, count))
+
+    layers = draft.get("layers")
+    if not isinstance(layers, list) or not layers:
+        raise ValueError(
+            "Agent must emit one body descriptor per main layer")
+
+    by_id = {}
+    grouped = {}
+    for raw_layer in layers:
+        layer = copy.deepcopy(raw_layer)
+        layer_id = layer.get("layer_id")
+        if not isinstance(layer_id, int):
+            raise ValueError("layer_id must be an integer")
+        if layer_id < 0 or layer_id >= count:
+            raise ValueError("layer_id outside main model: %s" % layer_id)
+        if layer_id in by_id:
+            raise ValueError("duplicate layer_id: %s" % layer_id)
+        signature = layer.get("body_signature")
+        if not isinstance(signature, dict) or not signature:
+            raise ValueError(
+                "layer %d requires non-empty body_signature" % layer_id)
+        context = layer.get("instance_context", {})
+        if not isinstance(context, dict):
+            raise ValueError(
+                "layer %d instance_context must be an object" % layer_id)
+        _reject_trace_derived_definition(layer, "layers[%d]" % layer_id)
+        _reject_context_in_body(signature)
+        _validate_config_evidence(layer, config)
+        _validate_source_evidence(layer, source_by_path)
+        signature_hash = _signature_hash(signature)
+        layer["body_signature_hash"] = signature_hash
+        layer["instance_context"] = context
+        by_id[layer_id] = layer
+        grouped.setdefault(signature_hash, []).append(layer)
+
+    covered = sorted(by_id)
+    if covered != list(range(count)):
+        missing = sorted(set(range(count)) - set(covered))
+        raise ValueError(
+            "Agent layer descriptors must cover every main layer exactly once; "
+            "missing=%s" % missing)
+
+    groups = sorted(grouped.values(), key=lambda values: min(
+        layer["layer_id"] for layer in values))
+    patterns = []
+    for pattern_index, values in enumerate(groups):
+        values.sort(key=lambda layer: layer["layer_id"])
+        signature = values[0]["body_signature"]
+        display_names = sorted(set(
+            str(layer.get("body_display_name") or "").strip()
+            for layer in values))
+        non_empty_names = [name for name in display_names if name]
+        if len(non_empty_names) > 1:
+            raise ValueError(
+                "identical body_signature has inconsistent display names: %s"
+                % non_empty_names)
+        layer_ids = [layer["layer_id"] for layer in values]
+        ordinary = [
+            layer["layer_id"] for layer in values
+            if not _is_contextual_representative(layer)]
+        candidates = ordinary or layer_ids
+        config_evidence = []
+        source_evidence = []
+        seen_config = set()
+        seen_source = set()
+        for layer in values:
+            for item in layer["config_evidence"]:
+                key = json.dumps(item, sort_keys=True)
+                if key not in seen_config:
+                    seen_config.add(key)
+                    config_evidence.append(item)
+            for item in layer["source_evidence"]:
+                key = json.dumps(item, sort_keys=True)
+                if key not in seen_source:
+                    seen_source.add(key)
+                    source_evidence.append(item)
+        pattern = {
+            "pattern_id": "P%d" % pattern_index,
+            "pattern_display_name": (
+                non_empty_names[0] if non_empty_names
+                else "Body pattern %d" % pattern_index),
+            "body_signature": signature,
+            # Compatibility alias for existing table/report readers. Pattern
+            # identity is nevertheless defined only by body_signature.
+            "structural_signature": signature,
+            "signature_hash": values[0]["body_signature_hash"],
+            "layer_ids": layer_ids,
+            "layer_count": len(layer_ids),
+            "representative_candidates": candidates,
+            "config_evidence": config_evidence,
+            "source_evidence": source_evidence,
+            "structural_context": {
+                "body_signature": signature,
+                "shape_parameters": signature.get("shape_parameters", {}),
+                "semantic_labels": signature.get("semantic_labels", {}),
+            },
+        }
+        attention_type = _semantic_label(signature, "attention_type")
+        ffn_type = _semantic_label(signature, "ffn_type")
+        if attention_type is not None:
+            pattern["attention_type"] = attention_type
+        if ffn_type is not None:
+            pattern["ffn_type"] = ffn_type
+        patterns.append(pattern)
 
     result = copy.deepcopy(draft)
-    result["schema_version"] = 2
+    result["schema_version"] = 3
     result["config_path"] = os.path.abspath(config_path)
     result["config_sha256"] = _sha256(config_path)
     result["model_type"] = config.get("model_type")
     result["num_hidden_layers_main"] = count
+    result["layers"] = [by_id[layer_id] for layer_id in range(count)]
+    result["layer_contexts"] = {
+        str(layer_id): by_id[layer_id].get("instance_context", {})
+        for layer_id in range(count)
+    }
     result["patterns"] = patterns
     result["coverage_check"] = {
         "total_main_layers": count,
         "covered": len(covered),
-        "mutually_exclusive": mutually_exclusive,
-        "full_coverage": full_coverage,
+        "mutually_exclusive": True,
+        "full_coverage": True,
     }
     result["quality"] = {
         "status": "pass",
         "confidence": "high",
-        "reason": "Agent definition passed deterministic evidence and coverage validation",
+        "reason": (
+            "Per-layer body descriptors passed deterministic evidence, "
+            "coverage, context-separation, and canonical grouping checks"),
     }
     result["validation"] = {
         "validator": "validate_structural_patterns.py",
+        "agent_layer_descriptors_preserved": True,
         "definition_preserved": True,
+        "patterns_derived_deterministically": True,
         "checks": [
             "agent_provenance",
             "trace_not_used_for_definition",
-            "no_trace_or_kernel_derived_pattern_evidence",
             "config_evidence_values",
             "runtime_source_hashes_and_line_ranges",
-            "required_structural_signature",
-            "identical_signatures_merged",
-            "layer_ids_mutually_exclusive",
-            "all_main_layers_covered",
+            "main_layer_exact_coverage",
+            "context_excluded_from_body_identity",
+            "canonical_body_signature_grouping",
+            "contextual_representatives_deprioritized",
         ],
         "runtime_sources": list(source_by_path.values()),
     }
@@ -263,8 +382,7 @@ def main():
     parser.add_argument("--runtime-source", action="append", default=[])
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
-    validate(
-        args.input, args.config, args.runtime_source, args.out)
+    validate(args.input, args.config, args.runtime_source, args.out)
     print(args.out)
 
 

@@ -35,7 +35,8 @@ class RunSemantics12Test(unittest.TestCase):
                     "event_count": 1, "layer_total_us": 1.0,
                     "rows": [{"pos": 0, "row_id": "event-1",
                               "short_name": "kernel", "duration_us": 1.0,
-                              "layer_evidence": "anchor_repeat_segmentation"}],
+                              "layer_evidence": (
+                                  "validated_graph_capture_layer_scope_transfer")}],
                 }]}, fh)
             with open(table_md, "w") as fh:
                 fh.write("# clean\n")
@@ -78,13 +79,20 @@ class RunSemantics12Test(unittest.TestCase):
                     return_value={"patterns": [], "validation": {}}), \
                     mock.patch.object(
                         runner.semantic_kernel_mapping, "build",
-                        return_value=semantic), \
+                        side_effect=lambda *args, **kwargs: dict(semantic)), \
                     mock.patch.object(
                         runner.semantic_source_mapping, "map_plan",
                         return_value={}), \
                     mock.patch.object(
                         runner.run_semantic_shape_capture, "capture",
                         return_value=capture_result) as capture_call, \
+                    mock.patch.object(
+                        runner.semantic_layer_boundary_transfer, "transfer",
+                        return_value={
+                            "status": "pass",
+                            "mapped_groups": [{"phase": "decode"}],
+                            "failures": [],
+                        }), \
                     mock.patch.object(
                         runner.semantic_runtime_marker_mapping, "map_plan",
                         return_value=marker_result) as map_call, \

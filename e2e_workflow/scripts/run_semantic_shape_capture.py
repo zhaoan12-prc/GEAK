@@ -233,6 +233,14 @@ _MODEL_PHASES = ("prefill", "decode")
 
 
 def _required_phases(plan):
+    required = {
+        str(phase).lower()
+        for phase in (plan.get("phase_coverage") or {}).get(
+            "required_phases", [])
+        if phase
+    }
+    if required:
+        return sorted(required)
     return sorted({
         str(bucket.get("phase")).lower()
         for bucket in plan.get("target_buckets", [])
@@ -325,6 +333,11 @@ def capture(setup_path, capture_plan_path, out_dir, phases=None,
         int(target["representative_layer_id"])
         for target in plan.get("capture_targets", [])
         if target.get("representative_layer_id") is not None))
+    layers = sorted(set(layers) | {
+        int(layer_id)
+        for layer_id in plan.get("representative_layer_filter", [])
+        if layer_id is not None
+    })
     if not layers:
         raise ValueError("capture plan has no representative layers")
 
@@ -374,6 +387,7 @@ export GEAK_SEMANTICS_SHAPE_LOG=%s
 export GEAK_SEMANTICS_RANK=0
 export GEAK_SEMANTICS_LAYERS=%s
 export GEAK_SEMANTICS_PHASES=%s
+export GEAK_SEMANTICS_LAYER_SCOPES=1
 export GEAK_SEMANTICS_FORWARDS_PER_BUCKET=%s
 export GEAK_SEMANTICS_CALLABLE_TARGETS=%s
 export GEAK_SEMANTICS_REQUIRE_PROFILER=0
@@ -480,6 +494,8 @@ wait "$geak_wrapper"
         "execution_mode": execution_mode,
         "port": port,
         "representative_layers": layers,
+        "all_main_layer_scopes": True,
+        "workload": workload,
         "callable_targets": callable_targets,
         "callable_kernel_map": list(
             setup.get("callable_kernel_map", [])),

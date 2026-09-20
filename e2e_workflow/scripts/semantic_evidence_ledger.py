@@ -51,14 +51,19 @@ def _normalise_probe(row, source_path):
     scope = evidence.get("probe_scope")
     if not scope:
         scope = "kernel" if evidence.get("level") == "P" else "wrapper"
+    graph_trace_shape = (
+        evidence.get("source") == "graph_capture_trace_external_id")
     evidence.update({
         "level": "P",
         "probe_scope": scope,
-        "evidence_origin": "shape_logger",
+        "evidence_origin": (
+            "graph_capture_trace" if graph_trace_shape else "shape_logger"),
         "probe_table": os.path.abspath(source_path),
     })
     value["semantic_evidence"] = evidence
-    value.setdefault("shape", {})["source"] = "runtime_probe_%s" % scope
+    shape = value.setdefault("shape", {})
+    if not graph_trace_shape:
+        shape["source"] = "runtime_probe_%s" % scope
     return value
 
 

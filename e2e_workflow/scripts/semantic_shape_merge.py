@@ -348,6 +348,44 @@ def _tensor_schema(group, row, table, exact_bucket):
     return {"tensors": tensors, "linear_interface": linear}
 
 
+def _kernel_trace_schema(trace_shape):
+    """Build a display/audit schema from one-to-one graph-trace operands.
+
+    ``Input Dims`` is intentionally preserved verbatim in ``row.shape``.  The
+    compact tensor list below omits scalar/empty slots only for presentation;
+    argument indexes remain stable through ``trace_arg_index``.
+    """
+    dims = trace_shape.get("input_dims") or []
+    types = trace_shape.get("input_types") or []
+    tensors = []
+    for index, shape in enumerate(dims):
+        if not isinstance(shape, list) or not shape:
+            continue
+        dtype = types[index] if index < len(types) else "Tensor"
+        tensors.append({
+            "io": "operand",
+            "tensor_path": "trace_args[%d]" % index,
+            "arg_name": "arg_%d" % index,
+            "trace_arg_index": index,
+            "shape": list(shape),
+            "logger_shape": list(shape),
+            "effective_shape": list(shape),
+            "dtype": dtype,
+            "axes": [
+                _axis(value, "unresolved", "graph_capture_trace")
+                for value in shape],
+        })
+    return {
+        "source": "graph_capture_trace_external_id",
+        "operator": trace_shape.get("op_name"),
+        "external_id": trace_shape.get("external_id"),
+        "cpu_event_index": trace_shape.get("cpu_event_index"),
+        "runtime_launch_count": trace_shape.get("runtime_launch_count"),
+        "tensors": tensors,
+        "linear_interface": None,
+    }
+
+
 def _bucket_status(table, group):
     clean = table.get("selected_bucket") or {}
     same_bs = clean.get("batch_size") in (None, group["batch_size"])
@@ -629,47 +667,31 @@ def _context_value(fields, name):
 
 def _structural_summary(table):
     context = table.get("structural_context") or {}
-    static = context.get("static_model_context") or {}
-    runtime = context.get("runtime_context") or {}
-    scope = context.get("pattern_scope") or {}
-    attention_type = str(scope.get("attention_type", "")).lower()
-    ffn_type = str(scope.get("ffn_type", "")).lower()
-    attention_categories = (
-        {"mla"} if "mla" in attention_type else
-        {"linear_attention"} if "linear" in attention_type else
-        {"full_attention"})
-    ffn_categories = (
-        {"moe"} if ffn_type == "moe" else {"dense_ffn"})
-    enabled_categories = (
-        {"common", "quantization"} | attention_categories | ffn_categories)
+    body = context.get("body_signature") or context
+    labels = context.get("semantic_labels") or body.get(
+        "semantic_labels", {})
+    parameters = context.get("shape_parameters") or body.get(
+        "shape_parameters", {})
+
+    def flatten(prefix, value):
+        if isinstance(value, dict):
+            result = []
+            for key in sorted(value):
+                result.extend(flatten(
+                    "%s.%s" % (prefix, key) if prefix else str(key),
+                    value[key]))
+            return result
+        if isinstance(value, list):
+            return [(prefix, value)]
+        return [(prefix, _context_value({"value": value}, "value"))]
+
     values = []
-    for category, fields in (
-            ("common", ("hidden_size", "model_dtype", "norm_type")),
-            ("full_attention", (
-                "num_attention_heads", "num_key_value_heads", "head_dim")),
-            ("mla", (
-                "q_lora_rank", "kv_lora_rank", "qk_nope_head_dim",
-                "qk_rope_head_dim", "v_head_dim")),
-            ("linear_attention", (
-                "key_heads", "key_head_dim", "value_heads",
-                "value_head_dim", "conv_kernel_dim")),
-            ("dense_ffn", ("intermediate_size", "activation")),
-            ("moe", (
-                "num_experts", "experts_per_token", "num_shared_experts",
-                "shared_expert_intermediate_size", "moe_intermediate_size")),
-            ("quantization", (
-                "quant_method", "weight_block_size", "activation_scheme"))):
-        if category not in enabled_categories:
-            continue
-        category_fields = static.get(category) or {}
-        for name in fields:
-            value = _context_value(category_fields, name)
-            if value is not None:
-                values.append("%s.%s=%s" % (category, name, value))
-    for name in ("tensor_parallel_size", "expert_parallel_size"):
-        value = _context_value(runtime, name)
+    for name, value in flatten("label", labels):
         if value is not None:
-            values.append("runtime.%s=%s" % (name, value))
+            values.append("%s=%s" % (name, value))
+    for name, value in flatten("shape", parameters):
+        if value is not None:
+            values.append("%s=%s" % (name, value))
     return ", ".join(values) if values else "unavailable"
 
 
@@ -866,98 +888,153 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir):
                     clean_row_binding = "verified_pattern_position"
                 target = target or {}
                 runtime_internal = _is_runtime_internal(row)
-                candidates = (
-                    [] if runtime_internal
-                    else _candidate_groups(
-                        row, target, groups, table,
-                        clean_row_binding == "verified_pattern_position"))
-                alignment_source = False
-                if len(candidates) == 1:
-                    group = candidates[0]
-                    bucket_status = _bucket_status(table, group)
-                    cardinality = target.get(
-                        "mapping_cardinality", "unresolved")
-                    kernel_exact = (
-                        cardinality == "1:1"
-                        and bool(target.get("candidate_terminal_launcher"))
-                        and not alignment_source)
-                    level = "P"
-                    probe_scope = "kernel" if kernel_exact else "wrapper"
+                kernel_trace_shape = (
+                    {} if runtime_internal
+                    else target.get("kernel_trace_shape") or {})
+                if (kernel_trace_shape.get("mapping_cardinality") == "1:1"
+                        and kernel_trace_shape.get("input_dims")):
+                    trace_schema = _kernel_trace_schema(kernel_trace_shape)
                     evidence = {
-                        "level": level,
-                        "probe_scope": probe_scope,
+                        "level": "P",
+                        "probe_scope": "kernel",
                         "status": "matched",
-                        "source": (
-                            "shape_logger_terminal_launcher"
-                            if kernel_exact else
-                            "ordered_parent_wrapper_alignment"
-                            if alignment_source else
-                            "shape_logger_parent_wrapper"),
-                        "contained_by": group["op_path"],
-                        "op_instance_id": group["op_instance_id"],
-                        "confidence": "medium" if alignment_source else "high",
+                        "source": "graph_capture_trace_external_id",
+                        "contained_by": target.get("candidate_wrapper"),
+                        "op_instance_id": target.get(
+                            "candidate_op_instance_id"),
+                        "confidence": "high",
                         "mapping_basis": (
-                            "ordered leaf-wrapper sequence advanced only by "
-                            "a matching semantic anchor"
-                            if alignment_source else
-                            "unique source/runtime candidate"),
+                            "one shape-bearing CPU op and one GPU launch "
+                            "share the same graph-capture External ID"),
                         "clean_row_binding": clean_row_binding,
-                        "wrapper_scope": (
-                            target.get("shape_log_layer_evidence", {})
-                            .get("scope")),
-                        "source_evidence": target.get("source_evidence", []),
-                        "bucket_match": bucket_status,
-                        "schema": _tensor_schema(
-                            group, row, table, bucket_status == "exact"),
+                        "bucket_match": kernel_trace_shape.get(
+                            "bucket_match", "exact"),
+                        "schema": trace_schema,
                     }
-                    wrapper_scope = evidence.get("wrapper_scope")
-                    region_only = (
-                        wrapper_scope == "phase_layer_semantic_region")
-                    canonical_op = (
-                        target.get("candidate_op_path")
-                        if region_only else group["op_path"])
                     row["parent_operator"] = {
                         **row.get("parent_operator", {}),
-                        "canonical_op": canonical_op,
-                        "mapping_level": (
-                            "logger_one_to_one" if probe_scope == "kernel"
-                            else "parent_wrapper_context"),
-                        "confidence": (
-                            "high" if probe_scope == "kernel" else "medium"),
+                        "canonical_op": kernel_trace_shape.get(
+                            "op_name", "unresolved"),
+                        "mapping_level": "graph_capture_external_id",
+                        "mapping_cardinality": "1:1",
+                        "device_launch_count": 1,
+                        "confidence": "high",
+                        "evidence_event_index": kernel_trace_shape.get(
+                            "cpu_event_index"),
                     }
                     row["shape"] = {
                         **row.get("shape", {}),
-                        "source": (
-                            "runtime_probe_kernel"
-                            if probe_scope == "kernel"
-                            else "runtime_probe_region_context"
-                            if region_only else "runtime_probe_wrapper"),
-                        # Publish P-level probe shapes through the same canonical
-                        # contract consumed by candidate grafting and unitside
-                        # provenance. `logger_schema` remains the rich evidence.
-                        "input_dims": [] if region_only else [
-                            tensor.get("effective_shape") or tensor.get("shape")
-                            for tensor in evidence["schema"].get("tensors", [])
-                            if (tensor.get("effective_shape") or tensor.get("shape"))
-                        ],
-                        "input_types": [] if region_only else [
-                            tensor.get("dtype") or "Tensor"
-                            for tensor in evidence["schema"].get("tensors", [])
-                            if (tensor.get("effective_shape") or tensor.get("shape"))
-                        ],
-                        "logger_schema": evidence["schema"],
+                        "source": "runtime_trace_kernel",
+                        "input_dims": kernel_trace_shape.get(
+                            "input_dims") or [],
+                        "input_types": kernel_trace_shape.get(
+                            "input_types") or [],
+                        "logger_schema": trace_schema,
                     }
                 else:
-                    reason_code, reason = _unavailable_reason(
-                        row, target, len(candidates))
-                    evidence = {
-                        "level": "U",
-                        "status": "unavailable",
-                        "source": "no_unique_parent_wrapper",
-                        "candidate_count": len(candidates),
-                        "reason_code": reason_code,
-                        "reason": reason,
-                    }
+                    candidates = (
+                        [] if runtime_internal
+                        else _candidate_groups(
+                            row, target, groups, table,
+                            clean_row_binding == "verified_pattern_position"))
+                    alignment_source = False
+                    if len(candidates) == 1:
+                        group = candidates[0]
+                        bucket_status = _bucket_status(table, group)
+                        cardinality = target.get(
+                            "mapping_cardinality", "unresolved")
+                        kernel_exact = (
+                            cardinality == "1:1"
+                            and bool(target.get("candidate_terminal_launcher"))
+                            and not alignment_source)
+                        level = "P"
+                        probe_scope = "kernel" if kernel_exact else "wrapper"
+                        evidence = {
+                            "level": level,
+                            "probe_scope": probe_scope,
+                            "status": "matched",
+                            "source": (
+                                "shape_logger_terminal_launcher"
+                                if kernel_exact else
+                                "ordered_parent_wrapper_alignment"
+                                if alignment_source else
+                                "shape_logger_parent_wrapper"),
+                            "contained_by": group["op_path"],
+                            "op_instance_id": group["op_instance_id"],
+                            "confidence": (
+                                "medium" if alignment_source else "high"),
+                            "mapping_basis": (
+                                "ordered leaf-wrapper sequence advanced only by "
+                                "a matching semantic anchor"
+                                if alignment_source else
+                                "unique source/runtime candidate"),
+                            "clean_row_binding": clean_row_binding,
+                            "wrapper_scope": (
+                                target.get("shape_log_layer_evidence", {})
+                                .get("scope")),
+                            "source_evidence": target.get(
+                                "source_evidence", []),
+                            "bucket_match": bucket_status,
+                            "schema": _tensor_schema(
+                                group, row, table,
+                                bucket_status == "exact"),
+                        }
+                        wrapper_scope = evidence.get("wrapper_scope")
+                        region_only = (
+                            wrapper_scope == "phase_layer_semantic_region")
+                        canonical_op = (
+                            target.get("candidate_op_path")
+                            if region_only else group["op_path"])
+                        row["parent_operator"] = {
+                            **row.get("parent_operator", {}),
+                            "canonical_op": canonical_op,
+                            "mapping_level": (
+                                "logger_one_to_one"
+                                if probe_scope == "kernel"
+                                else "parent_wrapper_context"),
+                            "confidence": (
+                                "high" if probe_scope == "kernel"
+                                else "medium"),
+                        }
+                        row["shape"] = {
+                            **row.get("shape", {}),
+                            "source": (
+                                "runtime_probe_kernel"
+                                if probe_scope == "kernel"
+                                else "runtime_probe_region_context"
+                                if region_only else "runtime_probe_wrapper"),
+                            # Publish P-level probe shapes through the same
+                            # canonical contract consumed by candidate grafting
+                            # and unitside provenance. `logger_schema` remains
+                            # the rich evidence.
+                            "input_dims": [] if region_only else [
+                                tensor.get("effective_shape")
+                                or tensor.get("shape")
+                                for tensor in evidence["schema"].get(
+                                    "tensors", [])
+                                if (tensor.get("effective_shape")
+                                    or tensor.get("shape"))
+                            ],
+                            "input_types": [] if region_only else [
+                                tensor.get("dtype") or "Tensor"
+                                for tensor in evidence["schema"].get(
+                                    "tensors", [])
+                                if (tensor.get("effective_shape")
+                                    or tensor.get("shape"))
+                            ],
+                            "logger_schema": evidence["schema"],
+                        }
+                    else:
+                        reason_code, reason = _unavailable_reason(
+                            row, target, len(candidates))
+                        evidence = {
+                            "level": "U",
+                            "status": "unavailable",
+                            "source": "no_unique_parent_wrapper",
+                            "candidate_count": len(candidates),
+                            "reason_code": reason_code,
+                            "reason": reason,
+                        }
             row["semantic_evidence"] = evidence
             audits.append({
                 "phase": table["phase"],

@@ -23,6 +23,21 @@ class _Logger(object):
 
 
 class SemanticRuntimeCaptureTest(unittest.TestCase):
+    def test_all_layer_scope_ignores_representative_shape_filter(self):
+        logger = capture.SemanticRuntimeLogger.__new__(
+            capture.SemanticRuntimeLogger)
+        logger.layer_scopes = True
+        logger.layers = {3}
+        logger.phases = {"DECODE"}
+        logger.max_forwards = 1
+        logger._bucket_forwards = {}
+        logger._context = {
+            "phase": "DECODE", "batch_size": 4, "input_tokens": 4}
+        with mock.patch.object(logger, "active", return_value=True):
+            self.assertTrue(logger._layer_scope_allowed(17))
+        self.assertTrue(capture._MAIN_LAYER_RE.search("model.layers.17"))
+        self.assertFalse(capture._MAIN_LAYER_RE.search("model.layers.17.mlp"))
+
     def test_prefill_phase_filter_accepts_extend_runtime_mode(self):
         logger = capture.SemanticRuntimeLogger.__new__(
             capture.SemanticRuntimeLogger)

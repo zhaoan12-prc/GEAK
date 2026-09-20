@@ -21,6 +21,104 @@ class SemanticShapeMergeTest(unittest.TestCase):
                 json.dump(value, fh)
         return path
 
+    def test_kernel_trace_shape_has_priority_over_wrapper_shape_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            table = {
+                "schema_version": 2,
+                "tables": [{
+                    "phase": "decode",
+                    "pattern_id": "P0",
+                    "pattern_layer_ids": [26],
+                    "pattern_layer_count": 1,
+                    "representative_layer_id": 26,
+                    "selected_bucket": {
+                        "phase": "decode", "batch_size": 4,
+                        "input_tokens": 0},
+                    "event_count": 1,
+                    "layer_total_us": 6.0,
+                    "rows": [{
+                        "pos": 0, "row_id": "event-1",
+                        "raw_event_index": 1, "device_seq_index": 1,
+                        "raw_name": "quant_kernel",
+                        "short_name": "quant_kernel",
+                        "duration_us": 6.0, "stage": "quant",
+                        "event_type": "kernel",
+                        "shape": {"source": "unresolved",
+                                  "input_dims": []},
+                        "parent_operator": {
+                            "canonical_op": "unresolved"},
+                    }],
+                }],
+            }
+            plan = {
+                "runtime_marker_mapping": {
+                    "clean_table_sequence_audit": {"status": "pass"}},
+                "capture_targets": [{
+                    "row_id": "event-1", "phase": "decode",
+                    "pattern_id": "P0", "pos": 0,
+                    "representative_layer_id": 26,
+                    "candidate_op_instance_id": "wrapper-op",
+                    "candidate_wrapper": "model.layers.26.proj",
+                    "candidate_terminal_launcher": (
+                        "aiter::dynamic_per_token_scaled_quant"),
+                    "mapping_cardinality": "1:1",
+                    "kernel_trace_shape": {
+                        "source": "graph_capture_trace_external_id",
+                        "mapping_cardinality": "1:1",
+                        "op_name": (
+                            "aiter::dynamic_per_token_scaled_quant"),
+                        "external_id": 7,
+                        "cpu_event_index": 10,
+                        "runtime_launch_count": 1,
+                        "bucket_match": "exact",
+                        "input_dims": [
+                            [4, 4096], [128, 128], [4, 32], []],
+                        "input_types": [
+                            "float8_e4m3fnuz", "bfloat16", "float32", ""],
+                    },
+                }],
+            }
+            # Deliberately wrong/broad wrapper tensors.  They must remain
+            # contextual and must not overwrite the one-to-one trace shape.
+            records = [{
+                "phase": "decode", "rank": 0, "layer_id": 26,
+                "batch_size": 4, "input_tokens": 4,
+                "op_instance_id": "wrapper-op", "op_name": "proj",
+                "op_type": "MergedColumnParallelLinear",
+                "op_path": "model.layers.26.proj",
+                "io": "input", "tensor_path": "args[0]",
+                "shape": [4, 4096], "dtype": "bfloat16",
+            }, {
+                "phase": "decode", "rank": 0, "layer_id": 26,
+                "batch_size": 4, "input_tokens": 4,
+                "op_instance_id": "wrapper-op", "op_name": "proj",
+                "op_type": "MergedColumnParallelLinear",
+                "op_path": "model.layers.26.proj",
+                "io": "weight", "tensor_path": "parameters.weight",
+                "shape": [2560, 4096], "dtype": "float8_e4m3fnuz",
+            }]
+            result = merge.merge(
+                self._write(tmp, "table.json", table),
+                self._write(tmp, "plan.json", plan),
+                self._write(tmp, "shape.jsonl", records, jsonl=True),
+                os.path.join(tmp, "out"))
+            with open(result["semantic_table_json"]) as fh:
+                row = json.load(fh)["tables"][0]["rows"][0]
+            self.assertEqual(row["semantic_evidence"]["level"], "P")
+            self.assertEqual(
+                row["semantic_evidence"]["probe_scope"], "kernel")
+            self.assertEqual(
+                row["semantic_evidence"]["source"],
+                "graph_capture_trace_external_id")
+            self.assertEqual(row["shape"]["source"], "runtime_trace_kernel")
+            self.assertEqual(
+                row["shape"]["input_dims"],
+                [[4, 4096], [128, 128], [4, 32], []])
+            self.assertNotIn([2560, 4096], row["shape"]["input_dims"])
+            self.assertEqual(
+                row["parent_operator"]["canonical_op"],
+                "aiter::dynamic_per_token_scaled_quant")
+
     def test_layer_wrapper_shape_does_not_claim_kernel_operand_roles(self):
         row = {
             "stage": "gemm",

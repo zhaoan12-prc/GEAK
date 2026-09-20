@@ -30,6 +30,7 @@ class SemanticKernelMappingTest(unittest.TestCase):
         with open(path, "w") as fh:
             json.dump({
                 "schema_version": 1,
+                "num_hidden_layers_main": 2,
                 "patterns": [{
                     "pattern_id": "P_DENSE",
                     "pattern_display_name": "Dense",
@@ -62,6 +63,11 @@ class SemanticKernelMappingTest(unittest.TestCase):
             cursor = base
             for layer_id, duration in enumerate(durations):
                 ext += 1
+                events.append({
+                    "cat": "python_function",
+                    "name": "nn.Module: GenericDecoderLayer_%d" % layer_id,
+                    "ts": cursor - 1, "dur": duration + 1,
+                })
                 events.append({
                     "cat": "cpu_op", "name": "model.layers.%d.mlp" % layer_id,
                     "ts": cursor - 1, "dur": duration + 2,
@@ -137,7 +143,7 @@ class SemanticKernelMappingTest(unittest.TestCase):
         self.assertEqual(gate["status"], "fail")
         self.assertEqual(gate["tables"][0]["dropped_row_ids"], ["event-2"])
 
-    def test_non_dominant_metadata_prefix_is_demoted_losslessly(self):
+    def test_authoritative_boundary_is_not_rewritten_by_stage_similarity(self):
         rows = []
         sequence = 0
         for layer_id, stages in (
@@ -155,33 +161,23 @@ class SemanticKernelMappingTest(unittest.TestCase):
                     "layer_instance_id": "instance-%d" % layer_id,
                     "pattern_id": "P_DENSE",
                     "stage": stage,
-                    "layer_evidence": "module_span_sequence_medoid",
+                    "layer_evidence": "python_module_span_external_id",
                     "layer_region": "layer_body",
                     "boundary_role": (
                         "body_start_kernel" if index == 0 else None),
                 })
                 sequence += 1
-        diagnostics = [{
-            "step_id": "step-1",
-            "mapped_event_count": len(rows),
-            "layer_boundaries": [
-                {"layer_id": 0, "body_start_event": "event-0"},
-                {"layer_id": 1, "body_start_event": "event-3"},
-                {"layer_id": 2, "body_start_event": "event-5"},
-            ],
-        }]
-        demotions = mapping._demote_non_dominant_prefixes(
-            rows, diagnostics)
-        self.assertEqual(len(demotions), 1)
-        self.assertEqual(rows[0]["assignment"], "transition_global")
-        self.assertEqual(
-            rows[0]["layer_evidence"],
-            "pattern_variant_prefix_demoted")
-        self.assertEqual(rows[1]["boundary_role"], "body_start_kernel")
+        diagnostics, _ = mapping._authoritative_layer_partition(rows, {
+            "num_hidden_layers_main": 3,
+            "patterns": [{"pattern_id": "P_DENSE", "layer_ids": [0, 1, 2]}],
+        })
+        self.assertEqual(diagnostics[0]["status"], "mapped")
+        self.assertEqual(rows[0]["assignment"], "layer_body")
+        self.assertEqual(rows[0]["layer_id"], 0)
+        self.assertEqual(rows[0]["boundary_role"], "body_start_kernel")
         self.assertEqual(
             diagnostics[0]["layer_boundaries"][0]["body_start_event"],
-            "event-1")
-        self.assertEqual(diagnostics[0]["mapped_event_count"], 6)
+            "event-0")
 
     def test_shared_external_id_is_parent_context_not_kernel_exact(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -202,25 +198,24 @@ class SemanticKernelMappingTest(unittest.TestCase):
             trace = os.path.join(tmp, "trace.json")
             with open(trace, "w") as fh:
                 json.dump({"traceEvents": events}, fh)
-            result = mapping.build(trace, patterns, os.path.join(tmp, "out"))
-            with open(result["semantic_table_json"]) as fh:
-                rows = json.load(fh)["tables"][0]["rows"]
+            with open(trace) as fh:
+                events = json.load(fh)["traceEvents"]
+            with open(patterns) as fh:
+                pattern_doc = json.load(fh)
+            rows, _, _, _, _ = mapping._event_rows(events, pattern_doc)
             self.assertEqual(
                 [row["shape"]["source"] for row in rows],
                 ["parent_context", "parent_context"])
             self.assertTrue(all(
                 row["parent_operator"]["mapping_cardinality"] == "1:N"
                 for row in rows))
-            with open(result["shape_capture_plan_json"]) as fh:
-                plan = json.load(fh)
-            self.assertEqual(plan["target_count"], 2)
 
     def test_missing_annotations_degrades_phase_without_losing_events(self):
         with tempfile.TemporaryDirectory() as tmp:
             result = mapping.build(
                 self._trace(tmp, annotated=False), self._patterns(tmp),
                 os.path.join(tmp, "out"))
-            self.assertEqual(result["status"], "partial")
+            self.assertEqual(result["status"], "fail")
             with open(result["quality_json"]) as fh:
                 quality = json.load(fh)
             self.assertEqual(quality["gates"]["phase"]["status"], "partial")
@@ -313,7 +308,7 @@ class SemanticKernelMappingTest(unittest.TestCase):
         self.assertEqual(diagnostics[0]["full_passes"], 1)
         self.assertEqual([s["layer_id"] for s in scopes], [0, 1, 2])
 
-    def test_module_medoid_partitions_moduleless_decode_without_named_anchor(self):
+    def test_moduleless_decode_is_not_partitioned_from_recurring_stages(self):
         with tempfile.TemporaryDirectory() as tmp:
             patterns = os.path.join(tmp, "patterns.json")
             with open(patterns, "w") as fh:
@@ -373,13 +368,12 @@ class SemanticKernelMappingTest(unittest.TestCase):
             result = mapping.build(trace, patterns, os.path.join(tmp, "out"))
             with open(result["layer_instance_audit_json"]) as fh:
                 audit = json.load(fh)
-            diag = next(
-                item for item in audit["boundary_partition_diagnostics"]
-                if item["partition_method"] != "module_span_sequence_medoid")
-            self.assertEqual(diag["status"], "mapped")
-            self.assertIn(
-                diag["partition_method"],
-                {"repeated_sequence_medoid", "forced_best_alignment"})
+            diag = next(item for item in
+                        audit["boundary_partition_diagnostics"]
+                        if item["phase"] == "decode")
+            self.assertEqual(diag["status"], "boundary_unresolved")
+            self.assertEqual(diag["partition_method"], "none")
+            self.assertIn("diagnostic_only_recurring_stages", diag)
             self.assertEqual({item["layer_id"] for item in audit["instances"]}, {0, 1})
 
     def test_module_span_is_not_overridden_by_sequence_partition(self):
@@ -441,13 +435,13 @@ class SemanticKernelMappingTest(unittest.TestCase):
                 for item in audit["instances"]))
             self.assertEqual(
                 audit["boundary_partition_diagnostics"][0]["partition_method"],
-                "module_span_sequence_medoid")
+                "authoritative_scope_ownership")
             self.assertTrue(all(
-                any(source == "module_span_sequence_medoid"
+                any(source.startswith("python_module_span")
                     for source in item["boundary_evidence"]["sources"])
                 for item in audit["instances"]))
 
-    def test_sequence_partition_counts_fused_boundary_kernel_once(self):
+    def test_recurring_fused_kernel_never_creates_layer_boundaries(self):
         with tempfile.TemporaryDirectory() as tmp:
             patterns = os.path.join(tmp, "patterns.json")
             with open(patterns, "w") as fh:
@@ -492,17 +486,19 @@ class SemanticKernelMappingTest(unittest.TestCase):
             result = mapping.build(trace, patterns, os.path.join(tmp, "out"))
             with open(result["layer_instance_audit_json"]) as fh:
                 audit = json.load(fh)
-            self.assertEqual(len(audit["instances"]), 2)
-            self.assertTrue(all(
-                item["boundary_complete"] for item in audit["instances"]))
+            self.assertEqual(audit["instances"], [])
+            self.assertEqual(
+                audit["boundary_partition_diagnostics"][0]["status"],
+                "boundary_unresolved")
             with open(result["semantic_event_audit_jsonl"]) as fh:
                 rows = [json.loads(line) for line in fh]
             fused_rows = [row for row in rows if row["raw_name"] == fusion]
             self.assertEqual(len(fused_rows), 2)
-            self.assertEqual(
-                len({row["layer_instance_id"] for row in fused_rows}), 2)
-            self.assertEqual(
-                sum(item["event_count"] for item in audit["instances"]), 6)
+            self.assertTrue(all(
+                row["layer_instance_id"] is None for row in fused_rows))
+            self.assertTrue(all(
+                row["assignment"] == "transition_global"
+                for row in fused_rows))
 
 
 class PhaseCoverageTest(unittest.TestCase):
@@ -601,84 +597,60 @@ class PhaseCoverageTest(unittest.TestCase):
             self.assertEqual([e["name"] for e in merged], ["e", "l"])
 
 
-class TruncatedWindowSegmentationTest(unittest.TestCase):
-    """A module-less window holds the layer bodies it holds -- no more."""
+class DiagnosticStageRecurrenceTest(unittest.TestCase):
+    def test_periodic_stage_is_diagnostic_only(self):
+        rows = []
+        for index in range(60):
+            rows.append({
+                "row_id": "event-%d" % index,
+                "device_seq_index": index,
+                "phase": "decode",
+                "step_id": "step-1",
+                "stage": "opaque_periodic" if index % 4 == 3 else "other",
+                "assignment": "concurrent_unresolved",
+                "layer_id": None,
+                "layer_instance_id": None,
+                "pattern_id": None,
+                "layer_evidence": "unresolved",
+                "layer_region": None,
+                "boundary_role": None,
+            })
+        diagnostics, _ = mapping._authoritative_layer_partition(rows, {
+            "num_hidden_layers_main": 60,
+            "patterns": [{"pattern_id": "P0", "layer_ids": list(range(60))}],
+        })
+        self.assertEqual(diagnostics[0]["status"], "boundary_unresolved")
+        self.assertTrue(diagnostics[0]["diagnostic_only_recurring_stages"])
+        self.assertTrue(all(row["layer_id"] is None for row in rows))
 
-    PATTERNS = {
-        "num_hidden_layers_main": 61,
-        "patterns": [
-            {"pattern_id": "P0", "ffn_type": "dense_mlp",
-             "attention_type": "MLA", "layer_ids": [0, 1, 2]},
-            {"pattern_id": "P1", "ffn_type": "moe_with_shared_expert",
-             "attention_type": "MLA", "layer_ids": list(range(3, 61))},
-        ],
-    }
+    def test_stage_names_do_not_change_authoritative_boundaries(self):
+        def make_rows(prefix):
+            rows = []
+            for layer_id in range(2):
+                for offset in range(2):
+                    rows.append({
+                        "row_id": "%s-%d-%d" % (prefix, layer_id, offset),
+                        "device_seq_index": layer_id * 2 + offset,
+                        "phase": "decode", "step_id": "step-1",
+                        "stage": "%s-stage-%d" % (prefix, offset),
+                        "assignment": "layer_body", "layer_id": layer_id,
+                        "layer_instance_id": "instance-%d" % layer_id,
+                        "pattern_id": "P0",
+                        "layer_evidence": "explicit_layer_marker_test",
+                        "layer_region": "layer_body", "boundary_role": None,
+                    })
+            return rows
 
-    def _runs(self, stages):
-        runs, index = [], 0
-        for stage in stages:
-            runs.append({"stage": stage, "start": index, "end": index})
-            index += 1
-        return runs
-
-    def _window(self, dense_bodies, moe_bodies):
-        """A window of whole layer bodies, dense ones first."""
-        stages = []
-        for _ in range(dense_bodies):
-            stages += ["norm", "attn", "gemm", "activation", "gemm"]
-        for _ in range(moe_bodies):
-            stages += ["norm", "attn", "gemm", "topk", "moe", "activation",
-                       "moe", "gemm"]
-        return self._runs(stages)
-
-    def test_counts_bodies_present_not_layers_configured(self):
-        runs = self._window(3, 18)
-        patterns = mapping._pattern_index(self.PATTERNS)
-        anchored = mapping._anchor_runs(runs, 61, patterns)
-        self.assertIsNotNone(anchored)
-        # 21 bodies are physically present; the config declares 61.
-        self.assertEqual(anchored["observed_layer_bodies"], 21)
-        self.assertEqual(anchored["segment_validity"], 1.0)
-        self.assertEqual(anchored["layer_id_offset"], 0)
-
-    def test_anchor_rejects_stage_firing_twice_per_layer(self):
-        """A stage that fires twice per layer halves every body."""
-        runs = self._window(3, 18)
-        patterns = mapping._pattern_index(self.PATTERNS)
-        anchored = mapping._anchor_runs(runs, 61, patterns)
-        # "gemm" appears twice per body and would report ~42 bodies.
-        self.assertNotEqual(anchored["anchor_stage"], "gemm")
-
-    def test_offset_recovers_window_starting_mid_model(self):
-        runs = self._window(0, 12)
-        patterns = mapping._pattern_index(self.PATTERNS)
-        anchored = mapping._anchor_runs(runs, 61, patterns)
-        self.assertIsNotNone(anchored)
-        # No dense bodies -> the window cannot start at layer 0.
-        self.assertGreaterEqual(anchored["layer_id_offset"], 3)
-
-    def test_plausibility_gate_rejects_degenerate_moe_representative(self):
-        """The defect this gate exists for: a 2-kernel 'MoE layer'."""
-        rows = [{"stage": stage} for stage in
-                ("norm", "attn", "gemm", "topk", "moe", "activation")]
-        tables = [{"pattern_id": "P1", "phase": "decode",
-                   "representative_layer_id": 28,
-                   "rows": [{"stage": "gemm"}, {"stage": "elementwise"}]}]
-        gate = mapping._representative_plausibility(self.PATTERNS, tables, rows)
-        self.assertEqual(gate["status"], "fail")
-        self.assertEqual(gate["tables"][0]["missing_stages"],
-                         ["attn", "moe", "topk"])
-
-    def test_plausibility_gate_ignores_stages_absent_from_the_trace(self):
-        """No expert kernels anywhere means the capture, not a bad cut."""
-        rows = [{"stage": stage} for stage in ("norm", "attn", "gemm")]
-        tables = [{"pattern_id": "P1", "phase": "decode",
-                   "representative_layer_id": 28,
-                   "rows": [{"stage": "attn"}, {"stage": "gemm"}]}]
-        gate = mapping._representative_plausibility(self.PATTERNS, tables, rows)
-        self.assertEqual(gate["status"], "pass")
-        self.assertEqual(gate["tables"][0]["unobserved_in_trace"],
-                         ["moe", "topk"])
+        patterns = {"num_hidden_layers_main": 2,
+                    "patterns": [{"pattern_id": "P0", "layer_ids": [0, 1]}]}
+        first, second = make_rows("a"), make_rows("randomized")
+        first_diag, _ = mapping._authoritative_layer_partition(first, patterns)
+        second_diag, _ = mapping._authoritative_layer_partition(second, patterns)
+        self.assertEqual(first_diag[0]["status"], "mapped")
+        self.assertEqual(second_diag[0]["status"], "mapped")
+        self.assertEqual(
+            [row["layer_id"] for row in first],
+            [row["layer_id"] for row in second])
 
 
 if __name__ == "__main__":

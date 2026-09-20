@@ -55,8 +55,11 @@ def _kernel_key(name):
 def _runtime_entries(events):
     markers = []
     device_by_correlation = {}
+    cpu_shapes_by_external_id = collections.defaultdict(list)
+    runtime_launch_count_by_external_id = collections.Counter()
     for index, event in enumerate(events):
         name = str(event.get("name", ""))
+        args = event.get("args") or {}
         if (event.get("cat") == "user_annotation"
                 and name.startswith(MARKER_PREFIX)
                 and event.get("ts") is not None
@@ -76,11 +79,30 @@ def _runtime_entries(events):
                 "ts": float(event["ts"]),
                 "end": float(event["ts"]) + float(event["dur"]),
                 "duration_us": float(event["dur"]),
-                "external_id": (event.get("args") or {}).get("External id"),
+                "external_id": args.get("External id"),
             })
+        if event.get("cat") == "cpu_op":
+            external_id = args.get("External id")
+            input_dims = args.get("Input Dims") or []
+            if external_id is not None and any(
+                    isinstance(dim, list) and dim for dim in input_dims):
+                cpu_shapes_by_external_id[external_id].append({
+                    "op_name": name,
+                    "external_id": external_id,
+                    "cpu_event_index": index,
+                    "input_dims": input_dims,
+                    "input_types": args.get("Input type") or [],
+                })
+        if event.get("cat") in RUNTIME_CATEGORIES:
+            external_id = args.get("External id")
+            correlation = args.get(
+                "correlation", args.get("Correlation ID"))
+            if (external_id is not None and args.get("kernel")
+                    and correlation is not None):
+                runtime_launch_count_by_external_id[external_id] += 1
         if event.get("cat") in DEVICE_CATEGORIES:
-            correlation = (event.get("args") or {}).get(
-                "correlation", (event.get("args") or {}).get("Correlation ID"))
+            correlation = args.get(
+                "correlation", args.get("Correlation ID"))
             if correlation is not None:
                 device_by_correlation.setdefault(correlation, []).append(event)
 
@@ -104,13 +126,26 @@ def _runtime_entries(events):
         marker = min(containing, key=lambda item: item["duration_us"])
         device_matches = device_by_correlation.get(correlation, [])
         device = device_matches[0] if len(device_matches) == 1 else None
+        external_id = args.get("External id")
+        cpu_shapes = cpu_shapes_by_external_id.get(external_id, [])
+        kernel_trace_shape = None
+        if (external_id is not None and len(cpu_shapes) == 1
+                and runtime_launch_count_by_external_id[external_id] == 1):
+            kernel_trace_shape = dict(cpu_shapes[0])
+            kernel_trace_shape.update({
+                "source": "graph_capture_trace_external_id",
+                "mapping_cardinality": "1:1",
+                "runtime_launch_count": 1,
+            })
         entries.append({
             "runtime_event_index": index,
             "runtime_name": event.get("name"),
+            "runtime_external_id": external_id,
             "correlation": correlation,
             "raw_name": kernel,
             "kernel_key": _kernel_key(kernel),
             "marker": marker,
+            "kernel_trace_shape": kernel_trace_shape,
             "device_event": {
                 "name": device.get("name"),
                 "ts": device.get("ts"),
@@ -263,14 +298,33 @@ def _first_forward_marker_ids(markers, bucket):
 def _apply_mapping(
         target, candidate, capture_trace_path, rule, marker_launch_count):
     marker = candidate["marker"]
+    kernel_trace_shape = candidate.get("kernel_trace_shape")
     target["candidate_op_path"] = marker["op_path"]
     target["candidate_op_instance_id"] = marker["op_instance_id"]
     target["candidate_wrapper"] = marker["op_path"]
-    target["candidate_terminal_launcher"] = candidate["runtime_name"]
+    target["candidate_terminal_launcher"] = (
+        kernel_trace_shape.get("op_name")
+        if kernel_trace_shape else candidate["runtime_name"])
     targeted_launcher = "::launcher:" in str(marker.get("op_path") or "")
     target["mapping_cardinality"] = (
-        "1:1" if targeted_launcher and marker_launch_count == 1 else "1:N")
-    target["source_mapping_status"] = "runtime_marker_contained"
+        "1:1" if kernel_trace_shape
+        or (targeted_launcher and marker_launch_count == 1) else "1:N")
+    target["source_mapping_status"] = (
+        "runtime_kernel_trace_shape"
+        if kernel_trace_shape else "runtime_marker_contained")
+    if kernel_trace_shape:
+        kernel_trace_shape = dict(kernel_trace_shape)
+        bucket = _target_bucket(target)
+        kernel_trace_shape["bucket_match"] = (
+            "exact" if bucket and _marker_matches_bucket(marker, bucket)
+            else "compatible")
+        kernel_trace_shape["marker_context"] = {
+            "phase": marker["phase"],
+            "layer_id": marker["layer_id"],
+            "batch_size": marker["batch_size"],
+            "input_tokens": marker["input_tokens"],
+        }
+        target["kernel_trace_shape"] = kernel_trace_shape
     target["runtime_marker_mapping_status"] = "matched"
     target.pop("runtime_marker_candidate_count", None)
     target["runtime_marker_evidence"] = {
@@ -279,9 +333,11 @@ def _apply_mapping(
         "marker_external_id": marker["external_id"],
         "runtime_event_index": candidate["runtime_event_index"],
         "runtime_name": candidate["runtime_name"],
+        "runtime_external_id": candidate.get("runtime_external_id"),
         "runtime_correlation": candidate["correlation"],
         "captured_kernel": candidate["raw_name"],
         "targeted_launcher_probe": targeted_launcher,
+        "kernel_trace_shape_exact": bool(kernel_trace_shape),
         "marker_launch_count": marker_launch_count,
         "capture_device_event": candidate["device_event"],
         "rule": rule,
@@ -930,12 +986,16 @@ def map_plan(
                 "candidate_wrapper", "candidate_terminal_launcher",
                 "mapping_cardinality", "source_mapping_status",
                 "runtime_marker_evidence", "source_callable_evidence",
-                "source_wrapper_evidence", "shape_log_layer_evidence"):
+                "source_wrapper_evidence", "shape_log_layer_evidence",
+                "kernel_trace_shape"):
             target.pop(key, None)
         target["runtime_marker_mapping_status"] = "clean_sequence_mismatch"
     statuses = [
         target.get("runtime_marker_mapping_status")
         for target in plan.get("capture_targets", [])]
+    kernel_trace_shape_matched = sum(
+        bool(target.get("kernel_trace_shape"))
+        for target in plan.get("capture_targets", []))
     matched = statuses.count("matched")
     ambiguous = statuses.count("ambiguous_count")
     unmatched = statuses.count("not_found")
@@ -985,6 +1045,8 @@ def map_plan(
         "marker_count": len(markers),
         "contained_runtime_kernel_count": len(entries),
         "matched_target_count": matched,
+        "kernel_trace_shape_matched_target_count": (
+            kernel_trace_shape_matched),
         "source_callable_matched_target_count": source_callable_matched,
         "vabsorb_probe_matched_target_count": vabsorb_probe_matched,
         "shape_log_region_fallback_matched_target_count": (

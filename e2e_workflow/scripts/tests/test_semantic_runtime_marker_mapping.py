@@ -11,6 +11,103 @@ import semantic_runtime_marker_mapping as mapping
 
 
 class RuntimeMarkerMappingTest(unittest.TestCase):
+    def test_graph_trace_external_id_shape_beats_broad_wrapper(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = os.path.join(tmp, "plan.json")
+            trace_path = os.path.join(tmp, "trace.json")
+            out_path = os.path.join(tmp, "mapped.json")
+            with open(plan_path, "w") as fh:
+                json.dump({"capture_targets": [{
+                    "row_id": "event-1",
+                    "phase": "decode",
+                    "pattern_id": "P0",
+                    "representative_layer_id": 26,
+                    "pos": 0,
+                    "raw_name": "quant_kernel",
+                    "selected_bucket": {
+                        "phase": "decode",
+                        "batch_size": 4,
+                        "input_tokens": 0,
+                    },
+                }]}, fh)
+            marker = (
+                "GEAK_SEMANTICS|op=op-1|phase=DECODE|bs=4|toks=4|"
+                "layer=26|path=model.layers.26.proj")
+            with open(trace_path, "w") as fh:
+                json.dump({"traceEvents": [
+                    {"cat": "user_annotation", "name": marker,
+                     "pid": 1, "tid": 2, "ts": 10, "dur": 50,
+                     "args": {"External id": 90}},
+                    {"cat": "cpu_op",
+                     "name": "aiter::dynamic_per_token_scaled_quant",
+                     "pid": 1, "tid": 2, "ts": 20, "dur": 5,
+                     "args": {
+                         "External id": 7,
+                         "Input Dims": [
+                             [4, 4096], [128, 128], [4, 32], []],
+                         "Input type": [
+                             "float8_e4m3fnuz", "bfloat16", "float32", ""],
+                     }},
+                    {"cat": "hip_runtime", "name": "hipLaunchKernel",
+                     "pid": 1, "tid": 2, "ts": 22, "dur": 1,
+                     "args": {"kernel": "quant_kernel",
+                              "correlation": 1, "External id": 7}},
+                    # A second launch in the same broad module marker must not
+                    # prevent the External-ID-exact quant shape from winning.
+                    {"cat": "hip_runtime", "name": "hipModuleLaunchKernel",
+                     "pid": 1, "tid": 2, "ts": 30, "dur": 1,
+                     "args": {"kernel": "gemm_kernel",
+                              "correlation": 2}},
+                    {"cat": "kernel", "name": "quant_kernel", "ts": 100,
+                     "dur": 2, "args": {"correlation": 1}},
+                    {"cat": "kernel", "name": "gemm_kernel", "ts": 103,
+                     "dur": 8, "args": {"correlation": 2}},
+                ]}, fh)
+            result = mapping.map_plan(plan_path, trace_path, out_path)
+            self.assertEqual(
+                result["kernel_trace_shape_matched_target_count"], 1)
+            with open(out_path) as fh:
+                target = json.load(fh)["capture_targets"][0]
+            self.assertEqual(target["mapping_cardinality"], "1:1")
+            self.assertEqual(
+                target["source_mapping_status"],
+                "runtime_kernel_trace_shape")
+            self.assertEqual(
+                target["candidate_terminal_launcher"],
+                "aiter::dynamic_per_token_scaled_quant")
+            self.assertEqual(
+                target["kernel_trace_shape"]["input_dims"],
+                [[4, 4096], [128, 128], [4, 32], []])
+            self.assertEqual(
+                target["kernel_trace_shape"]["bucket_match"], "exact")
+
+    def test_graph_trace_shape_requires_one_launch_per_external_id(self):
+        marker = {
+            "index": 0,
+            "name": "GEAK_SEMANTICS|op=x|phase=DECODE|bs=4|toks=4|"
+                    "layer=1|path=model.layers.1.proj",
+            "cat": "user_annotation", "pid": 1, "tid": 2,
+            "ts": 0, "dur": 100,
+        }
+        events = [
+            marker,
+            {"cat": "cpu_op", "name": "custom::compound",
+             "args": {"External id": 7, "Input Dims": [[4, 8]],
+                      "Input type": ["bfloat16"]}},
+            {"cat": "hip_runtime", "name": "hipLaunchKernel",
+             "pid": 1, "tid": 2, "ts": 10,
+             "args": {"External id": 7, "correlation": 1,
+                      "kernel": "kernel_a"}},
+            {"cat": "hip_runtime", "name": "hipLaunchKernel",
+             "pid": 1, "tid": 2, "ts": 20,
+             "args": {"External id": 7, "correlation": 2,
+                      "kernel": "kernel_b"}},
+        ]
+        _, entries = mapping._runtime_entries(events)
+        self.assertEqual(len(entries), 2)
+        self.assertTrue(all(
+            entry["kernel_trace_shape"] is None for entry in entries))
+
     def test_missing_required_phase_marker_fails_coverage_gate(self):
         with tempfile.TemporaryDirectory() as tmp:
             plan_path = os.path.join(tmp, "plan.json")

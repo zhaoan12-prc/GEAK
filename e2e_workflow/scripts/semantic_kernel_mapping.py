@@ -79,8 +79,9 @@ def _collect_step_spans(events):
     # bottleneck), so using the GPU window to contain CPU module spans happened
     # to work.  In eager decode the host runs ~40x longer than the device
     # (1794ms CPU vs 45ms GPU on DSR1/MI308X), so 52 of 61 DecoderLayer spans
-    # fall outside the GPU window, `full_passes` drops to 0, and every decode
-    # layer boundary silently degrades to anchor_repeat_segmentation.
+    # fall outside the GPU window and `full_passes` drops to 0. Historically
+    # that triggered unsafe stage-recurrence segmentation; incomplete module
+    # passes now stay unresolved.
     #
     # Carry the CPU window alongside each span (indices 7,8) so CPU-side
     # containment can use it.  Falls back to the GPU window when a trace has no
@@ -225,6 +226,24 @@ def _sibling_phase_traces(path):
     return found
 
 
+def _resolve_trace_paths(trace_path, auto_sibling=True):
+    """Return the exact trace set consumed by mapping and its adopted files."""
+    trace_paths = (
+        [trace_path] if isinstance(trace_path, str) else list(trace_path))
+    if not trace_paths:
+        raise ValueError("at least one trace is required")
+    adopted_siblings = []
+    if auto_sibling:
+        known = {os.path.abspath(path) for path in trace_paths}
+        for path in list(trace_paths):
+            for phase, sibling in sorted(_sibling_phase_traces(path).items()):
+                if os.path.abspath(sibling) not in known:
+                    known.add(os.path.abspath(sibling))
+                    trace_paths.append(sibling)
+                    adopted_siblings.append({"phase": phase, "path": sibling})
+    return trace_paths, adopted_siblings
+
+
 def _load_events(path):
     with _open(path) as fh:
         data = json.load(fh)
@@ -288,16 +307,6 @@ def _step_at(ts, spans, starts):
     return None
 
 
-def _expected_layer_type(pattern):
-    pid = str((pattern or {}).get("pattern_id", "")).lower()
-    attention = str((pattern or {}).get("attention_type", "")).lower()
-    if "full" in pid or "full" in attention:
-        return "full"
-    if "linear" in pid or "linear" in attention:
-        return "linear"
-    return ""
-
-
 def _module_layer_scopes(events, spans, pattern_doc):
     """Resolve outer DecoderLayer python spans to global layer ordinals.
 
@@ -353,19 +362,17 @@ def _module_layer_scopes(events, spans, pattern_doc):
             chunk = values[pass_index * expected_count:(pass_index + 1) * expected_count]
             for layer_id, item in enumerate(chunk):
                 item = dict(item)
-                expected_type = _expected_layer_type(pattern_by_layer.get(layer_id))
-                actual_type = ("full" if "AttentionDecoderLayer" in item["name"]
-                               else "linear" if "LinearDecoderLayer" in item["name"]
-                               else "")
                 item.update({
                     "layer_id": layer_id,
                     "pattern_id": (pattern_by_layer.get(layer_id) or {}).get("pattern_id"),
                     "pass_index": pass_index,
                     "layer_instance_id": "%s:pass-%d:layer-%d" % (
                         step_id, pass_index, layer_id),
-                    "type_validation": (
-                        "pass" if not expected_type or expected_type == actual_type
-                        else "mismatch"),
+                    # Class-local numeric suffixes and class names are not a
+                    # model-independent Pattern taxonomy.  The complete count
+                    # and execution order establish the global layer ordinal;
+                    # the raw name remains available as audit evidence.
+                    "type_validation": "not_applicable",
                 })
                 scopes.append(item)
     scopes.sort(key=lambda item: (item["ts"], item["end"]))
@@ -382,9 +389,10 @@ def _module_scope_at(ts, scopes, starts):
             matches.append(item)
     if not matches:
         return None
-    # Prefer a type-validated outer decoder span, then the narrowest interval.
-    return min(matches, key=lambda item: (
-        item["type_validation"] != "pass", item["end"] - item["ts"]))
+    # Prefer the narrowest enclosing DecoderLayer scope. Pattern identity was
+    # already derived from config/runtime source and must not be re-inferred
+    # from model-specific class-name substrings here.
+    return min(matches, key=lambda item: item["end"] - item["ts"])
 
 
 def _scope_at(ts, scopes, starts):
@@ -565,58 +573,128 @@ def _event_rows(events, pattern_doc):
     return rows, spans, out_of_scope, module_scopes, module_diagnostics
 
 
-def _complete_module_ranges(rows, module_scopes, patterns):
-    """Fill ext-less launches between module-backed layer launch ranges.
+def _boundary_identity(value, event_type=None):
+    """Normalize profiler spelling differences, not operator semantics."""
+    value = str(value or "")
+    # Graph-construction traces expose HIP memset nodes using the generic
+    # profiler label, while graph replay can expose the ROCclr implementation
+    # kernel name.  They are the same device primitive and are safe to compare
+    # as one identity; this rule is backend-generic and carries no layer/stage
+    # meaning.
+    if (value == "Memset (Device)"
+            or "__amd_rocclr_fillBuffer" in value):
+        return "__GEAK_DEVICE_MEMSET__"
+    value = re.sub(r"GRID_MN_\d+", "GRID_MN_*", value)
+    value = re.sub(r"(_grid_)\d+(?=_|$)", r"\1*", value, flags=re.I)
+    return value
 
-    The interpolation never crosses a measured module pass and only fills the
-    interval between its first and last module-backed GPU launches.
-    """
-    backed = {}
+
+def _boundary_sequence_sha(rows):
+    values = []
     for row in rows:
-        if row.get("layer_instance_id"):
-            backed.setdefault(row["layer_instance_id"], []).append(row)
-    by_pass = {}
-    for scope in module_scopes:
-        key = (scope["step_id"], scope["pass_index"])
-        if scope["layer_instance_id"] in backed:
-            group = backed[scope["layer_instance_id"]]
-            by_pass.setdefault(key, []).append({
-                "scope": scope,
-                "first": min(row["device_seq_index"] for row in group),
-                "last": max(row["device_seq_index"] for row in group),
-            })
-    filled = 0
-    for (step_id, _), intervals in by_pass.items():
-        intervals.sort(key=lambda item: item["scope"]["layer_id"])
-        if len(intervals) < 2:
+        values.append(_boundary_identity(
+            row.get("raw_name"), row.get("event_type")))
+    payload = json.dumps(
+        values, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _apply_boundary_map(rows, map_path, pattern_doc, trace_paths=None,
+                        pattern_path="", already_applied=None):
+    """Apply a validated all-layer boundary artifact by step-local positions."""
+    with open(map_path) as fh:
+        document = json.load(fh)
+    if document.get("status") != "pass":
+        raise ValueError(
+            "refusing non-passing layer boundary map %s: %s" % (
+                map_path, document.get("failures", [])))
+    expected = int(pattern_doc.get("num_hidden_layers_main", 0) or 0)
+    if int(document.get("expected_main_layers", 0) or 0) != expected:
+        raise ValueError("layer boundary map main-layer count mismatch")
+    if pattern_path:
+        declared = (document.get("patterns") or {}).get("sha256")
+        if declared != _sha(pattern_path):
+            raise ValueError("layer boundary map structural-pattern hash mismatch")
+    if trace_paths:
+        actual = {
+            (os.path.abspath(path), _sha(path)) for path in trace_paths}
+        declared = {
+            (item.get("path"), item.get("sha256"))
+            for item in (document.get("recipient") or {}).get("traces", [])}
+        if actual != declared:
+            raise ValueError("layer boundary map recipient trace set mismatch")
+
+    patterns = _pattern_index(pattern_doc)
+    by_step = {}
+    for row in rows:
+        if row.get("step_id"):
+            by_step.setdefault(row["step_id"], []).append(row)
+    applied = already_applied if already_applied is not None else set()
+    diagnostics = []
+    for group in document.get("mapped_groups", []):
+        step_id = group.get("recipient_step_id")
+        if step_id in applied:
             continue
-        centers = [(item["first"] + item["last"]) / 2.0 for item in intervals]
-        bounds = [(centers[index] + centers[index + 1]) / 2.0
-                  for index in range(len(centers) - 1)]
-        pass_start = intervals[0]["first"]
-        pass_end = intervals[-1]["last"]
-        for row in rows:
-            if (row.get("step_id") != step_id or row.get("layer_instance_id")
-                    or not (pass_start <= row["device_seq_index"] <= pass_end)):
-                continue
-            pos = bisect.bisect_right(bounds, row["device_seq_index"])
-            target = intervals[min(pos, len(intervals) - 1)]["scope"]
-            row["layer_id"] = target["layer_id"]
-            row["layer_instance_id"] = target["layer_instance_id"]
-            row["pattern_id"] = (patterns.get(target["layer_id"]) or {}).get("pattern_id")
-            row["assignment"] = "layer_body"
-            row["layer_evidence"] = "module_sequence_interpolation"
-            filled += 1
-    return filled
+        step_rows = sorted(
+            by_step.get(step_id, []),
+            key=lambda row: row["device_seq_index"])
+        if not step_rows:
+            raise ValueError(
+                "layer boundary map references absent step %s" % step_id)
+        if len(step_rows) != int(group.get("recipient_row_count", -1)):
+            raise ValueError(
+                "layer boundary map row-count mismatch for %s" % step_id)
+        if _boundary_sequence_sha(step_rows) != group.get(
+                "recipient_sequence_sha256"):
+            raise ValueError(
+                "layer boundary map sequence hash mismatch for %s" % step_id)
+        starts = [int(value) for value in group.get(
+            "layer_start_positions", [])]
+        end = int(group.get("body_end_position", -1))
+        if (len(starts) != expected or starts != sorted(starts)
+                or len(set(starts)) != len(starts)
+                or starts[0] < 0 or end > len(step_rows)
+                or end <= starts[-1]):
+            raise ValueError(
+                "invalid transferred layer cuts for %s" % step_id)
 
-
-def _deduped_stage_sequence(group):
-    sequence = []
-    for row in sorted(group, key=lambda item: item["device_seq_index"]):
-        stage = row["stage"]
-        if not sequence or sequence[-1] != stage:
-            sequence.append(stage)
-    return sequence
+        _clear_step_layer_assignments(
+            step_rows, "outside_validated_graph_capture_layer_scope")
+        for layer_id, start in enumerate(starts):
+            stop = starts[layer_id + 1] if layer_id + 1 < expected else end
+            if stop <= start:
+                raise ValueError(
+                    "empty transferred layer %d in %s" % (layer_id, step_id))
+            instance_id = "%s:graph-capture-donor:layer-%d" % (
+                step_id, layer_id)
+            for position in range(start, stop):
+                row = step_rows[position]
+                row["assignment"] = "layer_body"
+                row["layer_id"] = layer_id
+                row["layer_instance_id"] = instance_id
+                row["pattern_id"] = (patterns.get(layer_id) or {}).get(
+                    "pattern_id")
+                row["layer_evidence"] = (
+                    "validated_graph_capture_layer_scope_transfer")
+                row["layer_region"] = "layer_body"
+            step_rows[start]["boundary_role"] = "body_start_kernel"
+            step_rows[stop - 1]["boundary_role"] = "end_kernel"
+        applied.add(step_id)
+        diagnostics.append({
+            "map_path": os.path.abspath(map_path),
+            "step_id": step_id,
+            "phase": group.get("phase"),
+            "batch_size": group.get("batch_size"),
+            "input_tokens": group.get("input_tokens"),
+            "body_start_position": starts[0],
+            "body_end_position": end,
+            "prefix_row_count": group.get("prefix_row_count", starts[0]),
+            "suffix_row_count": group.get(
+                "suffix_row_count", len(step_rows) - end),
+            "layer_widths": group.get("layer_widths", []),
+            "match_rule": group.get("match_rule"),
+        })
+    return diagnostics
 
 
 def _sequence_ratio(left, right):
@@ -644,100 +722,12 @@ def _sequence_medoid(sequences):
     return list(min(scored)[2])
 
 
-def _module_pattern_templates(rows):
-    """Learn full Pattern medoids plus exact External-ID core medoids."""
-    full_groups = {}
-    core_groups = {}
-    for row in rows:
-        instance_id = row.get("layer_instance_id")
-        if not instance_id or row.get("assignment") != "layer_body":
-            continue
-        evidence = row.get("layer_evidence", "")
-        if (evidence.startswith("python_module_span")
-                or evidence == "module_sequence_interpolation"):
-            full_groups.setdefault(instance_id, []).append(row)
-        if evidence == "python_module_span_external_id":
-            core_groups.setdefault(instance_id, []).append(row)
-
-    def collect(groups):
-        result = {}
-        for group in groups.values():
-            sequence = _deduped_stage_sequence(group)
-            if sequence:
-                key = (group[0].get("phase"), group[0].get("pattern_id"))
-                result.setdefault(key, []).append(sequence)
-        return result
-
-    full_by_pattern = collect(full_groups)
-    core_by_pattern = collect(core_groups)
-    templates, core_templates, core_prefixes = {}, {}, {}
-    evidence = {}
-    pattern_ids = sorted(set(
-        pid for source in (full_by_pattern, core_by_pattern)
-        for _, pid in source if pid))
-    for pattern_id in pattern_ids:
-        full_prefill = full_by_pattern.get(("prefill", pattern_id), [])
-        full_values = full_prefill or [
-            sequence for (phase, pid), sequences in full_by_pattern.items()
-            if pid == pattern_id for sequence in sequences]
-        core_prefill = core_by_pattern.get(("prefill", pattern_id), [])
-        core_values = core_prefill or [
-            sequence for (phase, pid), sequences in core_by_pattern.items()
-            if pid == pattern_id for sequence in sequences]
-        full_template = _sequence_medoid(full_values)
-        core_template = _sequence_medoid(core_values)
-        if full_template:
-            templates[pattern_id] = full_template
-        if core_template:
-            core_templates[pattern_id] = core_template
-            prefixes = []
-            for sequence in full_values:
-                candidates = [
-                    position for position, stage in enumerate(sequence)
-                    if stage == core_template[0]]
-                if not candidates:
-                    continue
-                position = min(candidates, key=lambda value: (
-                    -_sequence_ratio(core_template, sequence[value:]),
-                    value,
-                ))
-                if position:
-                    prefixes.append(sequence[max(0, position - 4):position])
-            prefix = _sequence_medoid(prefixes)
-            if prefix:
-                core_prefixes[pattern_id] = prefix
-        if full_template or core_template:
-            evidence[pattern_id] = {
-                "source": "module_full_and_external_core_medoids",
-                "full_instance_count": len(full_values),
-                "full_stage_count": len(full_template),
-                "core_instance_count": len(core_values),
-                "core_stage_count": len(core_template),
-                "learned_core_prefix": core_prefixes.get(pattern_id, []),
-            }
-    return templates, core_templates, core_prefixes, evidence
-
-
-_MOE_MARKER_STAGES = ("moe", "topk")
 _ANCHOR_MIN_BODIES = 2
 _ANCHOR_MAX_GAP_CV = 0.35
 
 
-def _pattern_is_moe(pattern):
-    """True when the structural pattern declares a routed-expert FFN."""
-    ffn = str((pattern or {}).get("ffn_type", "")).lower()
-    return "moe" in ffn or "expert" in ffn
-
-
-def _required_stages(pattern):
-    required = {"attn", "gemm"}
-    if _pattern_is_moe(pattern):
-        required = required | {"moe", "topk"}
-    return required
-
-
 def _anchor_candidates(runs, layer_count):
-    """Stages that could mark the start of every layer body in the window."""
+    """Report recurring stages for diagnostics; never assign layer identity."""
     positions = {}
     for index, run in enumerate(runs):
         positions.setdefault(run["stage"], []).append(index)
@@ -766,115 +756,6 @@ def _anchor_candidates(runs, layer_count):
     return candidates
 
 
-def _anchor_bounds(runs, starts):
-    return [(starts[i],
-             (starts[i + 1] - 1) if i + 1 < len(starts) else len(runs) - 1)
-            for i in range(len(starts))]
-
-
-def _anchor_runs(runs, layer_count, patterns):
-    """Find the stage that starts every layer body in a module-less window.
-
-    Returns the run indices where each physical layer body begins, or None when
-    no stage repeats regularly enough to be a per-layer anchor.  This counts the
-    layer bodies that are ACTUALLY in the window instead of assuming the window
-    holds all `layer_count` of them -- a profiler window that stops mid-forward
-    holds fewer, and forcing `layer_count` cuts onto it manufactures degenerate
-    one- and two-kernel "layers".
-
-    Candidates are scored on whether the segments they produce actually look
-    like the declared layers, not on how many segments they produce: a stage
-    that fires twice per layer cuts every layer in half and yields twice as many
-    "bodies", none of which contain a whole layer.
-    """
-    if len(runs) < _ANCHOR_MIN_BODIES:
-        return None
-    best = None
-    for candidate in _anchor_candidates(runs, layer_count):
-        bounds = _anchor_bounds(runs, candidate["anchor_runs"])
-        # A window that starts or stops mid-forward has an incomplete body at
-        # each end by construction (and pre-layer setup kernels can open a
-        # spurious one), so trim the ends until both are whole layers.  Only the
-        # ends are trimmed; a gap in the middle stays a failure.
-        for _ in range(2):
-            if not bounds:
-                break
-            offset, agreement = _anchor_layer_offset(
-                [_segment_is_moe(runs, lo, hi) for lo, hi in bounds],
-                patterns, layer_count)
-            ok = [not (_required_stages(patterns.get(offset + i) or {})
-                       - set(runs[j]["stage"] for j in range(lo, hi + 1)))
-                  for i, (lo, hi) in enumerate(bounds)]
-            if not any(ok):
-                bounds = []
-                break
-            first, last = ok.index(True), len(ok) - 1 - ok[::-1].index(True)
-            if first == 0 and last == len(ok) - 1:
-                break
-            bounds = bounds[first:last + 1]
-        if len(bounds) < _ANCHOR_MIN_BODIES:
-            continue
-        offset, agreement = _anchor_layer_offset(
-            [_segment_is_moe(runs, lo, hi) for lo, hi in bounds],
-            patterns, layer_count)
-        satisfied = 0
-        for body_index, (lo, hi) in enumerate(bounds):
-            stages = set(runs[i]["stage"] for i in range(lo, hi + 1))
-            pattern = patterns.get(offset + body_index) or {}
-            if not (_required_stages(pattern) - stages):
-                satisfied += 1
-        validity = satisfied / len(bounds) if bounds else 0.0
-        candidate = dict(candidate,
-                         anchor_runs=[lo for lo, _ in bounds],
-                         observed_layer_bodies=len(bounds))
-        # An anchor that only marks SOME layer kinds (a router stage fires in
-        # MoE layers but never in dense ones) segments those perfectly while
-        # leaving the rest of the window unassigned, so weigh how much of the
-        # window the segmentation actually claims.
-        claimed = sum(runs[hi]["end"] - runs[lo]["start"] + 1
-                      for lo, hi in bounds)
-        span = runs[-1]["end"] - runs[0]["start"] + 1
-        coverage = claimed / span if span else 0.0
-        key = (round(validity, 4), round(coverage, 4), round(agreement, 4),
-               candidate["observed_layer_bodies"])
-        if best is None or key > best[0]:
-            best = (key, dict(candidate,
-                              layer_id_offset=offset,
-                              pattern_class_agreement=round(agreement, 6),
-                              segment_validity=round(validity, 6),
-                              window_coverage=round(coverage, 6),
-                              anchor_bounds=bounds))
-    if best is None or best[1]["segment_validity"] < 0.9:
-        return None
-    return best[1]
-
-
-def _segment_is_moe(runs, first_run, last_run):
-    stages = set(
-        runs[index]["stage"] for index in range(first_run, last_run + 1))
-    return any(marker in stages for marker in _MOE_MARKER_STAGES)
-
-
-def _anchor_layer_offset(observed_moe, patterns, layer_count):
-    """Align the observed dense/MoE class sequence onto the declared chain.
-
-    A truncated window does not have to start at layer 0, so slide the observed
-    classes along the configured chain and keep the offset that agrees most.
-    """
-    expected = [_pattern_is_moe(patterns.get(layer_id))
-                for layer_id in range(layer_count)]
-    span = len(observed_moe)
-    if span > layer_count:
-        return 0, 0.0
-    best_offset, best_hits = 0, -1
-    for offset in range(layer_count - span + 1):
-        hits = sum(1 for i in range(span)
-                   if expected[offset + i] == observed_moe[i])
-        if hits > best_hits:
-            best_offset, best_hits = offset, hits
-    return best_offset, (best_hits / span if span else 0.0)
-
-
 def _stage_runs(step_rows):
     """Return lossless row ranges for continuously deduplicated stages."""
     runs = []
@@ -886,360 +767,127 @@ def _stage_runs(step_rows):
     return runs
 
 
-def _bootstrap_missing_templates(runs, patterns, templates, layer_count):
-    """Build deterministic medoids when no module-backed template exists."""
-    if not runs or layer_count <= 0:
-        return dict(templates), {}
-    provisional = {}
-    run_count = len(runs)
-    for layer_id in range(layer_count):
-        start = int(round(float(layer_id) * run_count / layer_count))
-        end = int(round(float(layer_id + 1) * run_count / layer_count))
-        if end <= start:
-            end = min(run_count, start + 1)
-        pattern_id = (patterns.get(layer_id) or {}).get("pattern_id")
-        sequence = [run["stage"] for run in runs[start:end]]
-        if pattern_id and sequence:
-            provisional.setdefault(pattern_id, []).append(sequence)
-    result = dict(templates)
-    evidence = {}
-    for pattern_id, sequences in sorted(provisional.items()):
-        if pattern_id not in result:
-            result[pattern_id] = _sequence_medoid(sequences)
-            evidence[pattern_id] = {
-                "source": "self_bootstrap_medoid",
-                "instance_count": len(sequences),
-                "stage_count": len(result[pattern_id]),
-            }
-    return result, evidence
+def _clear_step_layer_assignments(step_rows, evidence):
+    for row in step_rows:
+        row["assignment"] = "transition_global"
+        row["layer_id"] = None
+        row["layer_instance_id"] = None
+        row["pattern_id"] = None
+        row["layer_evidence"] = evidence
+        row["layer_region"] = "transition_global"
+        row["boundary_role"] = None
 
 
-def _rough_alignment_bounds(observed, expected):
-    """Map expected positions to observed positions using matching blocks."""
-    observed_count, expected_count = len(observed), len(expected)
-    if not observed_count or not expected_count:
-        mapped = [
-            int(round(float(index) * observed_count / max(expected_count, 1)))
-            for index in range(expected_count + 1)]
-        return 0, observed_count, mapped
-    matcher = difflib.SequenceMatcher(
-        None, tuple(expected), tuple(observed), autojunk=False)
-    blocks = [block for block in matcher.get_matching_blocks() if block.size]
-    if not blocks:
-        mapped = [
-            int(round(float(index) * observed_count / expected_count))
-            for index in range(expected_count + 1)]
-        return 0, observed_count, mapped
-    scale = float(observed_count) / expected_count
-    first, last = blocks[0], blocks[-1]
-    start = max(0, int(round(first.b - first.a * scale)))
-    expected_tail = expected_count - (last.a + last.size)
-    end = min(observed_count, int(round(
-        last.b + last.size + expected_tail * scale)))
-    if end - start < 1:
-        start, end = 0, observed_count
-    anchors = [(0, start), (expected_count, end)]
-    for block in blocks:
-        anchors.extend([
-            (block.a, block.b),
-            (block.a + block.size, block.b + block.size),
-        ])
-    anchors = sorted(set(anchors))
-    expected_anchors = [item[0] for item in anchors]
-    mapped = []
-    for expected_pos in range(expected_count + 1):
-        right = bisect.bisect_left(expected_anchors, expected_pos)
-        if right <= 0:
-            observed_pos = anchors[0][1]
-        elif right >= len(anchors):
-            observed_pos = anchors[-1][1]
-        else:
-            left_item, right_item = anchors[right - 1], anchors[right]
-            width = right_item[0] - left_item[0]
-            fraction = (
-                float(expected_pos - left_item[0]) / width if width else 0.0)
-            observed_pos = int(round(
-                left_item[1] + fraction * (right_item[1] - left_item[1])))
-        mapped.append(max(start, min(end, observed_pos)))
-    return start, end, mapped
-
-
-def _segment_alignment_score(observed, template, target_length):
-    ratio = _sequence_ratio(observed, template)
-    length_penalty = (
-        abs(len(observed) / float(target_length) - 1.0)
-        if target_length else 0.0)
-    return ratio - 0.15 * length_penalty, ratio
-
-
-def _align_pattern_chain(runs, patterns, templates, layer_count):
-    """Globally align one full step to the config-declared Pattern chain."""
-    observed = [run["stage"] for run in runs]
-    chain = []
-    expected = []
-    cumulative = [0]
-    for layer_id in range(layer_count):
-        pattern_id = (patterns.get(layer_id) or {}).get("pattern_id")
-        template = list(templates.get(pattern_id) or ["unknown"])
-        chain.append((layer_id, pattern_id, template))
-        expected.extend(template)
-        cumulative.append(len(expected))
-    start, end, mapped = _rough_alignment_bounds(observed, expected)
-    if end - start < layer_count:
-        start, end = 0, len(observed)
-    available = max(end - start, layer_count)
-    scale = float(available) / max(len(expected), 1)
-    average = float(available) / max(layer_count, 1)
-    # Rough matching blocks already provide the global position. A narrow,
-    # deterministic refinement band keeps long graph-replay traces linear-ish.
-    radius = max(2, int(round(average * 0.15)))
-    candidates = [[start]]
-    for layer_index in range(1, layer_count):
-        center = mapped[cumulative[layer_index]]
-        low = max(start + layer_index, center - radius)
-        high = min(end - (layer_count - layer_index), center + radius)
-        values = list(range(low, high + 1))
-        if not values:
-            values = [max(start + layer_index, min(
-                end - (layer_count - layer_index), center))]
-        candidates.append(values)
-    candidates.append([end])
-    states = {start: [(0.0, [], [])]}
-    for layer_index, (_, _, template) in enumerate(chain):
-        next_states = {}
-        target = max(1.0, len(template) * scale)
-        for stop in candidates[layer_index + 1]:
-            options = []
-            for begin, records in states.items():
-                if stop <= begin:
-                    continue
-                sequence = observed[begin:stop]
-                segment_score, ratio = _segment_alignment_score(
-                    sequence, template, target)
-                for score, path, ratios in records:
-                    options.append((
-                        score + segment_score,
-                        path + [stop],
-                        ratios + [ratio],
-                    ))
-            if options:
-                options.sort(key=lambda item: (-item[0], item[1]))
-                next_states[stop] = options[:2]
-        states = next_states
-    records = states.get(end, [])
-    if not records:
-        cuts = [start]
-        for index in range(1, layer_count):
-            cuts.append(int(round(
-                start + float(index) * (end - start) / layer_count)))
-        cuts.append(end)
-        for index in range(1, len(cuts)):
-            cuts[index] = max(cuts[index], cuts[index - 1] + 1)
-        return cuts, float("-inf"), None, 0.0, chain
-    best = records[0]
-    second_score = records[1][0] if len(records) > 1 else None
-    mean_ratio = sum(best[2]) / len(best[2]) if best[2] else 0.0
-    return ([start] + best[1], best[0], second_score, mean_ratio, chain)
-
-
-def _refine_cuts_with_core_medoids(
-        runs, cuts, chain, core_templates, core_prefixes, allow_lookback):
-    """Split bridge runs once between adjacent aligned Pattern cores."""
-    core_ranges = []
-    average_width = float(cuts[-1] - cuts[0]) / max(len(chain), 1)
-    lookback = (
-        max(3, int(round(average_width * 0.6))) if allow_lookback else 0)
-    for index, (_, pattern_id, full_template) in enumerate(chain):
-        start, end = cuts[index], cuts[index + 1]
-        core = core_templates.get(pattern_id) or []
-        search_end = min(
-            end, start + max(6, int(round((end - start) * 0.35))))
-        pattern_transition = (
-            index > 0 and chain[index - 1][1] != pattern_id)
-        effective_lookback = (
-            lookback if allow_lookback else
-            max(3, int(round(average_width * 0.6)))
-            if pattern_transition else 0)
-        search_start = max(0, start - effective_lookback)
-        candidates = [
-            position for position in range(search_start, search_end)
-            if core and runs[position]["stage"] == core[0]]
-        if candidates:
-            prefix = core_prefixes.get(pattern_id) or []
-
-            def prefix_match_width(position):
-                for width in range(min(len(prefix), position), 0, -1):
-                    observed_prefix = [
-                        run["stage"] for run in runs[position - width:position]]
-                    if observed_prefix == prefix[-width:]:
-                        return width
-                return 0
-
-            core_start = min(candidates, key=lambda position: (
-                -prefix_match_width(position),
-                -_sequence_ratio(
-                    core, [run["stage"] for run in runs[position:end]]),
-                abs(position - start),
-                position,
-            ))
-        else:
-            core_start = start
-        observed = [run["stage"] for run in runs[core_start:end]]
-        blocks = [
-            block for block in difflib.SequenceMatcher(
-                None, tuple(core), tuple(observed),
-                autojunk=False).get_matching_blocks()
-            if block.size]
-        if blocks:
-            core_ranges.append((
-                core_start,
-                core_start + blocks[-1].b + blocks[-1].size,
-            ))
-        else:
-            core_ranges.append((start, end))
-    if not core_ranges:
-        return cuts
-    refined = []
-    for index, (core_start, _) in enumerate(core_ranges):
-        boundary = core_start
-        prefix = core_prefixes.get(chain[index][1]) or []
-        for width in range(min(len(prefix), core_start), 0, -1):
-            observed_prefix = [
-                run["stage"] for run in runs[core_start - width:core_start]]
-            if observed_prefix == prefix[-width:]:
-                # The closest learned predecessor belongs to the current layer;
-                # earlier bridge runs remain owned by the preceding layer.
-                boundary -= 1
-                break
-        minimum = refined[-1] + 1 if refined else 0
-        maximum = cuts[-1] - (len(core_ranges) - index)
-        refined.append(max(minimum, min(maximum, boundary)))
-    refined.append(cuts[-1])
-    return refined
-
-
-def _transition_stability(cuts, runs, chain):
-    by_transition = {}
-    for index in range(1, len(cuts) - 1):
-        left = runs[cuts[index] - 1]["stage"]
-        right = runs[cuts[index]]["stage"]
-        key = (chain[index - 1][1], chain[index][1])
-        by_transition.setdefault(key, []).append((left, right))
-    coverages = []
-    for values in by_transition.values():
-        counts = {}
-        for value in values:
-            counts[value] = counts.get(value, 0) + 1
-        coverages.append(float(max(counts.values())) / len(values))
-    return sum(coverages) / len(coverages) if coverages else 1.0
-
-
-def _refine_cuts_with_stable_transition_context(runs, cuts, chain):
-    """Resolve repeated within-layer transitions from the dominant Pattern."""
-    pattern_counts = {}
-    for _, pattern_id, _ in chain:
-        pattern_counts[pattern_id] = pattern_counts.get(pattern_id, 0) + 1
-    if not pattern_counts:
-        return cuts
-    dominant_pattern = min(
-        pattern_counts,
-        key=lambda pattern_id: (-pattern_counts[pattern_id], str(pattern_id)))
-
-    def context(position):
-        return [
-            run["stage"] for run in
-            runs[max(0, position - 2):min(len(runs), position + 6)]]
-
-    contexts = [
-        context(cuts[index])
-        for index in range(1, len(chain))
-        if chain[index][1] == dominant_pattern]
-    template = _sequence_medoid(contexts)
-    if not template:
-        return cuts
-    average = float(cuts[-1] - cuts[0]) / max(len(chain), 1)
-    radius = max(3, int(round(average * 0.6)))
-    refined = [cuts[0]]
-    for index in range(1, len(cuts) - 1):
-        low = max(refined[-1] + 1, cuts[index] - radius)
-        high = min(cuts[-1] - (len(cuts) - index - 1),
-                   cuts[index] + radius)
-        candidates = range(low, high + 1)
-        chosen = min(candidates, key=lambda position: (
-            -_sequence_ratio(template, context(position)),
-            abs(position - cuts[index]),
-            position,
-        ))
-        refined.append(chosen)
-    refined.append(cuts[-1])
-    return refined
-
-
-def _module_guided_segments(
-        step_rows, runs, patterns, core_templates, core_prefixes, layer_count):
-    row_to_run = {}
-    for run_index, run in enumerate(runs):
-        for row_index in range(run["start"], run["end"] + 1):
-            row_to_run[step_rows[row_index]["row_id"]] = run_index
-    groups = {}
+def _authoritative_instances(step_rows):
+    grouped = {}
     for row in step_rows:
         instance_id = row.get("layer_instance_id")
-        if (instance_id and
-                row.get("layer_evidence") == "python_module_span_external_id"):
-            groups.setdefault(instance_id, []).append(row)
-    candidates = []
-    for instance_id, group in groups.items():
-        match = re.search(r":pass-(\d+):layer-(\d+)$", instance_id)
-        if not match:
-            continue
-        pass_index, layer_id = int(match.group(1)), int(match.group(2))
-        pattern_id = (patterns.get(layer_id) or {}).get("pattern_id")
-        core = core_templates.get(pattern_id) or []
-        positions = [
-            row_to_run[row["row_id"]] for row in group
-            if row["row_id"] in row_to_run]
-        core_positions = [
-            row_to_run[row["row_id"]] for row in group
-            if core and row["row_id"] in row_to_run
-            and row["stage"] == core[0]]
-        if not positions:
-            continue
-        start = min(core_positions or positions)
-        prefix = core_prefixes.get(pattern_id) or []
-        if (prefix and start > 0
-                and runs[start - 1]["stage"] == prefix[-1]):
-            start -= 1
-        candidates.append({
-            "pass_index": pass_index,
-            "layer_id": layer_id,
-            "pattern_id": pattern_id,
-            "start": start,
+        evidence = str(row.get("layer_evidence") or "")
+        if (instance_id and (
+                evidence.startswith("python_module_span")
+                or evidence.startswith("explicit_layer_marker")
+                or evidence.startswith(
+                    "validated_graph_capture_layer_scope"))):
+            grouped.setdefault(instance_id, []).append(row)
+    instances = []
+    for instance_id, group in grouped.items():
+        group.sort(key=lambda row: row["device_seq_index"])
+        instances.append({
+            "instance_id": instance_id,
+            "layer_id": group[0].get("layer_id"),
+            "rows": group,
+            "first": group[0]["device_seq_index"],
+            "last": group[-1]["device_seq_index"],
         })
-    candidates.sort(key=lambda item: (item["pass_index"], item["layer_id"]))
-    if len(candidates) < layer_count:
-        return []
-    previous = -1
-    for index, candidate in enumerate(candidates):
-        minimum = previous + 1
-        maximum = len(runs) - (len(candidates) - index)
-        candidate["start"] = max(minimum, min(maximum, candidate["start"]))
-        previous = candidate["start"]
-    for index, candidate in enumerate(candidates):
-        candidate["end"] = (
-            candidates[index + 1]["start"]
-            if index + 1 < len(candidates) else len(runs))
-    return candidates
+    instances.sort(key=lambda item: item["first"])
+    return instances
 
 
-def _stage_sequence_partition(rows, pattern_doc):
-    """Partition module-less steps without operator/backend boundary names."""
+def _normalize_module_scope_cuts(
+        step_rows, instances, layer_count, patterns):
+    """Turn complete ordered module anchors into non-overlapping time cuts.
+
+    Independent streams can interleave launches from adjacent layers, so raw
+    External-id ownership is not necessarily contiguous in device timestamp
+    order.  A complete module pass still provides an ordered anchor cloud for
+    every layer.  Midpoints between those clouds define the only deterministic
+    cut used here; no stage or kernel identity participates.
+    """
+    if not instances or len(instances) % layer_count:
+        return False, []
+    if not all(all(str(row.get("layer_evidence") or "").startswith(
+                       "python_module_span") for row in item["rows"])
+               for item in instances):
+        return False, []
+    pass_count = len(instances) // layer_count
+    specifications = []
+    previous_end = None
+    for pass_index in range(pass_count):
+        chunk = instances[
+            pass_index * layer_count:(pass_index + 1) * layer_count]
+        if [item["layer_id"] for item in chunk] != list(range(layer_count)):
+            return False, []
+        centers = [statistics.median(
+            row["device_seq_index"] for row in item["rows"])
+            for item in chunk]
+        if any(left >= right for left, right in zip(centers, centers[1:])):
+            return False, []
+        starts = [min(
+            row["device_seq_index"] for row in chunk[0]["rows"])]
+        starts.extend(
+            int(math.floor((left + right) / 2.0)) + 1
+            for left, right in zip(centers, centers[1:]))
+        end = max(row["device_seq_index"] for row in chunk[-1]["rows"]) + 1
+        if (starts != sorted(starts) or len(set(starts)) != len(starts)
+                or end <= starts[-1]
+                or (previous_end is not None and starts[0] < previous_end)):
+            return False, []
+        specifications.append((pass_index, chunk, starts, end, centers))
+        previous_end = end
+
+    _clear_step_layer_assignments(
+        step_rows, "outside_python_module_span_ordered_cut")
+    audit = []
+    for pass_index, chunk, starts, end, centers in specifications:
+        for layer_id, start in enumerate(starts):
+            stop = starts[layer_id + 1] if layer_id + 1 < layer_count else end
+            instance_id = chunk[layer_id]["instance_id"]
+            selected = [
+                row for row in step_rows
+                if start <= row["device_seq_index"] < stop]
+            if not selected:
+                return False, []
+            for row in selected:
+                row["assignment"] = "layer_body"
+                row["layer_id"] = layer_id
+                row["layer_instance_id"] = instance_id
+                row["pattern_id"] = (patterns.get(layer_id) or {}).get(
+                    "pattern_id")
+                row["layer_evidence"] = "python_module_span_ordered_cut"
+                row["layer_region"] = "layer_body"
+            selected[0]["boundary_role"] = "body_start_kernel"
+            selected[-1]["boundary_role"] = "end_kernel"
+        audit.append({
+            "pass_index": pass_index,
+            "layer_anchor_centers": centers,
+            "layer_start_device_seq_indices": starts,
+            "body_end_device_seq_index_exclusive": end,
+        })
+    return True, audit
+
+
+def _authoritative_layer_partition(rows, pattern_doc):
+    """Publish only layer ownership backed by an independent scope.
+
+    Stage recurrence and sequence alignment are useful diagnostics, but a
+    periodic stage can represent one Pattern rather than one layer.  They must
+    therefore never assign layer IDs.  This function accepts only rows already
+    carrying complete module/marker/donor instance IDs.
+    """
     layer_count = int(pattern_doc.get("num_hidden_layers_main", 0) or 0)
-    patterns = _pattern_index(pattern_doc)
     if layer_count <= 0:
         return [], {}
-    (templates, core_templates, core_prefixes,
-     template_evidence) = _module_pattern_templates(rows)
-    alignment_cache = {}
+    template_evidence = {}
     by_step = {}
     for row in rows:
         if row.get("step_id"):
@@ -1247,231 +895,93 @@ def _stage_sequence_partition(rows, pattern_doc):
     diagnostics = []
     for step_id, step_rows in sorted(by_step.items()):
         step_rows.sort(key=lambda row: row["device_seq_index"])
-        module_instances = set(
-            row["layer_instance_id"] for row in step_rows
-            if row.get("layer_instance_id") and row.get("layer_evidence") and (
-                row["layer_evidence"].startswith("python_module_span")
-                or row["layer_evidence"] == "module_sequence_interpolation"))
+        instances = _authoritative_instances(step_rows)
+        actual_order = [item["layer_id"] for item in instances]
+        pass_count = len(instances) // layer_count if layer_count else 0
+        expected_order = list(range(layer_count)) * pass_count
+        contiguous = all(
+            [row["device_seq_index"] for row in item["rows"]]
+            == list(range(item["first"], item["last"] + 1))
+            for item in instances)
+        non_overlapping = all(
+            left["last"] < right["first"]
+            for left, right in zip(instances, instances[1:]))
+        complete = (
+            bool(instances) and len(instances) % layer_count == 0
+            and actual_order == expected_order
+            and contiguous and non_overlapping)
+        module_cut_audit = []
+        if (not complete and instances
+                and len(instances) % layer_count == 0
+                and actual_order == expected_order):
+            normalized, module_cut_audit = _normalize_module_scope_cuts(
+                step_rows, instances, layer_count,
+                _pattern_index(pattern_doc))
+            if normalized:
+                instances = _authoritative_instances(step_rows)
+                actual_order = [item["layer_id"] for item in instances]
+                pass_count = len(instances) // layer_count
+                expected_order = list(range(layer_count)) * pass_count
+                contiguous = all(
+                    [row["device_seq_index"] for row in item["rows"]]
+                    == list(range(item["first"], item["last"] + 1))
+                    for item in instances)
+                non_overlapping = all(
+                    left["last"] < right["first"]
+                    for left, right in zip(instances, instances[1:]))
+                complete = (
+                    actual_order == expected_order
+                    and contiguous and non_overlapping)
         runs = _stage_runs(step_rows)
-        if len(runs) < layer_count:
-            # This is physically impossible to split into non-empty layers
-            # without duplicating a device event, so preserve existing evidence.
+        recurring = _anchor_candidates(runs, layer_count)
+        phase = step_rows[0].get("phase") if step_rows else "unresolved"
+        if not complete:
+            _clear_step_layer_assignments(
+                step_rows, "boundary_unresolved_no_authoritative_scope")
             diagnostics.append({
                 "step_id": step_id,
-                "status": "insufficient_physical_events",
-                "partition_method": "forced_best_alignment",
+                "phase": phase,
+                "status": "boundary_unresolved",
+                "partition_method": "none",
                 "configured_layer_count": layer_count,
+                "module_instance_count": len(instances),
                 "observed_stage_run_count": len(runs),
+                "mapped_event_count": 0,
+                "diagnostic_only_recurring_stages": recurring,
+                "reason": (
+                    "No complete per-layer module, explicit-marker, or "
+                    "validated donor boundary. Recurring stages and sequence "
+                    "alignment are diagnostic only."),
+                "layer_boundaries": [],
             })
             continue
-        if len(module_instances) >= layer_count:
-            guided = _module_guided_segments(
-                step_rows, runs, patterns, core_templates, core_prefixes,
-                layer_count)
-            if guided:
-                for row in step_rows:
-                    row["assignment"] = "transition_global"
-                    row["layer_id"] = None
-                    row["layer_instance_id"] = None
-                    row["pattern_id"] = None
-                    row["layer_evidence"] = "sequence_outside_layer"
-                    row["layer_region"] = "transition_global"
-                    row["boundary_role"] = None
-                mapped_count = 0
-                cut_events = []
-                for item in guided:
-                    first_run, last_run = item["start"], item["end"] - 1
-                    first_row = runs[first_run]["start"]
-                    last_row = runs[last_run]["end"]
-                    segment = step_rows[first_row:last_row + 1]
-                    instance_id = (
-                        "%s:module-sequence:pass-%d:layer-%d" % (
-                            step_id, item["pass_index"], item["layer_id"]))
-                    pattern = patterns.get(item["layer_id"]) or {}
-                    for index, row in enumerate(segment):
-                        row["layer_id"] = item["layer_id"]
-                        row["layer_instance_id"] = instance_id
-                        row["pattern_id"] = pattern.get("pattern_id")
-                        row["assignment"] = "layer_body"
-                        row["layer_evidence"] = "module_span_sequence_medoid"
-                        row["layer_region"] = "layer_body"
-                        row["boundary_role"] = (
-                            "body_start_kernel" if index == 0
-                            else "end_kernel"
-                            if index == len(segment) - 1 else None)
-                    mapped_count += len(segment)
-                    cut_events.append({
-                        "pass_index": item["pass_index"],
-                        "layer_id": item["layer_id"],
-                        "body_start_event": segment[0]["row_id"],
-                        "body_end_event": segment[-1]["row_id"],
-                    })
-                diagnostics.append({
-                    "step_id": step_id,
-                    "status": "mapped",
-                    "partition_method": "module_span_sequence_medoid",
-                    "configured_layer_count": layer_count,
-                    "module_instance_count": len(module_instances),
-                    "mapped_pass_count": len(guided) // layer_count,
-                    "observed_stage_run_count": len(runs),
-                    "mapped_event_count": mapped_count,
-                    "template_evidence": template_evidence,
-                    "layer_boundaries": cut_events,
-                })
-                continue
-        anchored = (_anchor_runs(runs, layer_count, patterns)
-                    if len(module_instances) < layer_count else None)
-        if anchored and anchored["observed_layer_bodies"] != layer_count:
-            # The window does not hold `layer_count` layer bodies.  Map the ones
-            # that are physically there instead of forcing the configured count
-            # onto them, which is what produced degenerate 2-kernel "layers".
-            bounds = anchored["anchor_bounds"]
-            offset = anchored["layer_id_offset"]
-            class_agreement = anchored["pattern_class_agreement"]
-            for row in step_rows:
-                row["assignment"] = "transition_global"
-                row["layer_id"] = None
-                row["layer_instance_id"] = None
-                row["pattern_id"] = None
-                row["layer_evidence"] = "sequence_outside_layer"
-                row["layer_region"] = "transition_global"
-                row["boundary_role"] = None
-            mapped_count = 0
-            cut_events = []
-            for body_index, (first_run, last_run) in enumerate(bounds):
-                layer_id = offset + body_index
-                first_row = runs[first_run]["start"]
-                last_row = runs[last_run]["end"]
-                segment = step_rows[first_row:last_row + 1]
-                if not segment:
-                    continue
-                instance_id = "%s:anchor:layer-%d" % (step_id, layer_id)
-                pattern = patterns.get(layer_id) or {}
-                for index, row in enumerate(segment):
-                    row["layer_id"] = layer_id
-                    row["layer_instance_id"] = instance_id
-                    row["pattern_id"] = pattern.get("pattern_id")
-                    row["assignment"] = "layer_body"
-                    row["layer_evidence"] = "anchor_repeat_segmentation"
-                    row["layer_region"] = "layer_body"
-                    row["boundary_role"] = (
-                        "body_start_kernel" if index == 0
-                        else "end_kernel"
-                        if index == len(segment) - 1 else None)
-                mapped_count += len(segment)
-                cut_events.append({
-                    "layer_id": layer_id,
-                    "body_start_event": segment[0]["row_id"],
-                    "body_end_event": segment[-1]["row_id"],
-                })
-            diagnostics.append({
-                "step_id": step_id,
-                "status": "mapped",
-                "partition_method": "anchor_repeat_segmentation",
-                "configured_layer_count": layer_count,
-                "module_instance_count": len(module_instances),
-                "observed_stage_run_count": len(runs),
-                "mapped_event_count": mapped_count,
-                "window_truncated": (
-                    anchored["observed_layer_bodies"] < layer_count),
-                "observed_layer_bodies": anchored["observed_layer_bodies"],
-                "layer_id_offset": offset,
-                "anchor_stage": anchored["anchor_stage"],
-                "boundary_reference": "anchor_stage_rotation",
-                "boundary_reference_note": (
-                    "Layer bodies are cut at the recurring anchor stage, not at "
-                    "the module entry, so each body is a cyclic rotation of the "
-                    "true layer: the kernel set and the intra-layer order are "
-                    "faithful, but the first row is not necessarily the layer's "
-                    "first kernel."),
-                "anchor_gap_cv": anchored["gap_cv"],
-                "anchor_gap_mean": anchored["gap_mean"],
-                "pattern_class_agreement": class_agreement,
-                "segment_validity": anchored["segment_validity"],
-                "window_coverage": anchored["window_coverage"],
-                "layer_boundaries": cut_events,
-            })
-            continue
-        step_templates, bootstrap_evidence = _bootstrap_missing_templates(
-            runs, patterns, templates, layer_count)
-        cache_key = (
-            tuple(run["stage"] for run in runs),
-            tuple(
-                ((patterns.get(layer_id) or {}).get("pattern_id"),
-                 tuple(step_templates.get(
-                     (patterns.get(layer_id) or {}).get("pattern_id"), [])))
-                for layer_id in range(layer_count)),
-        )
-        if cache_key not in alignment_cache:
-            alignment_cache[cache_key] = _align_pattern_chain(
-                runs, patterns, step_templates, layer_count)
-        cuts, score, second_score, mean_ratio, chain = alignment_cache[cache_key]
-        cuts = _refine_cuts_with_core_medoids(
-            runs, cuts, chain, core_templates, core_prefixes,
-            allow_lookback=len(module_instances) >= layer_count)
-        if len(module_instances) < layer_count:
-            cuts = _refine_cuts_with_stable_transition_context(
-                runs, cuts, chain)
-        stability = _transition_stability(cuts, runs, chain)
-        method = (
-            "module_span_sequence_medoid"
-            if len(module_instances) >= layer_count
-            else "repeated_sequence_medoid"
-            if mean_ratio >= 0.45 and stability >= 0.5
-            else "forced_best_alignment")
-        for row in step_rows:
-            row["assignment"] = "transition_global"
-            row["layer_id"] = None
-            row["layer_instance_id"] = None
-            row["pattern_id"] = None
-            row["layer_evidence"] = "sequence_outside_layer"
-            row["layer_region"] = "transition_global"
-            row["boundary_role"] = None
-        mapped_count = 0
         cut_events = []
-        for layer_id in range(layer_count):
-            first_run, last_run = cuts[layer_id], cuts[layer_id + 1] - 1
-            first_row = runs[first_run]["start"]
-            last_row = runs[last_run]["end"]
-            segment = step_rows[first_row:last_row + 1]
-            instance_id = "%s:sequence:layer-%d" % (step_id, layer_id)
-            pattern = patterns.get(layer_id) or {}
-            for index, row in enumerate(segment):
-                row["layer_id"] = layer_id
-                row["layer_instance_id"] = instance_id
-                row["pattern_id"] = pattern.get("pattern_id")
-                row["assignment"] = "layer_body"
-                row["layer_evidence"] = method
+        for item in instances:
+            item["rows"][0]["boundary_role"] = "body_start_kernel"
+            item["rows"][-1]["boundary_role"] = "end_kernel"
+            for row in item["rows"]:
                 row["layer_region"] = "layer_body"
-                row["boundary_role"] = (
-                    "body_start_kernel" if index == 0
-                    else "end_kernel" if index == len(segment) - 1 else None)
-            mapped_count += len(segment)
             cut_events.append({
-                "layer_id": layer_id,
-                "body_start_event": segment[0]["row_id"],
-                "body_end_event": segment[-1]["row_id"],
+                "layer_id": item["layer_id"],
+                "body_start_event": item["rows"][0]["row_id"],
+                "body_end_event": item["rows"][-1]["row_id"],
             })
+        evidence = sorted({
+            row.get("layer_evidence") for item in instances
+            for row in item["rows"] if row.get("layer_evidence")})
         diagnostics.append({
             "step_id": step_id,
+            "phase": phase,
             "status": "mapped",
-            "partition_method": method,
+            "partition_method": "authoritative_scope_ownership",
+            "module_scope_ordered_cut": module_cut_audit,
+            "boundary_evidence": evidence,
             "configured_layer_count": layer_count,
-            "module_instance_count": len(module_instances),
+            "module_instance_count": len(instances),
+            "mapped_pass_count": pass_count,
             "observed_stage_run_count": len(runs),
-            "mapped_event_count": mapped_count,
-            "transition_stability": round(stability, 6),
-            "mean_pattern_similarity": round(mean_ratio, 6),
-            "best_score": None if score == float("-inf") else round(score, 6),
-            "second_best_score": (
-                round(second_score, 6) if second_score is not None else None),
-            "score_margin": (
-                round(score - second_score, 6)
-                if second_score is not None and score != float("-inf") else None),
-            "template_evidence": {
-                **template_evidence,
-                **bootstrap_evidence,
-            },
+            "mapped_event_count": sum(len(item["rows"]) for item in instances),
+            "diagnostic_only_recurring_stages": recurring,
             "layer_boundaries": cut_events,
         })
     return diagnostics, template_evidence
@@ -1515,7 +1025,12 @@ def _layer_instances(rows):
         evidence_sources = sorted(set(row["layer_evidence"] for row in group))
         boundary_complete = contiguous
         duration = sum(row["duration_us"] for row in group)
-        signature = [row["short_name"] for row in group]
+        signature = [
+            ((row.get("parent_operator") or {}).get("canonical_op")
+             if ((row.get("parent_operator") or {}).get("canonical_op")
+                 not in (None, "", "unresolved"))
+             else row.get("short_name"))
+            for row in group]
         instances.append({
             "phase": phase,
             "layer_id": layer_id,
@@ -1531,6 +1046,7 @@ def _layer_instances(rows):
             "duration_us": round(duration, 6),
             "sequence_signature": hashlib.sha256(
                 json.dumps(signature).encode()).hexdigest()[:16],
+            "normalized_sequence": signature,
             "boundary_complete": boundary_complete,
             "boundary_evidence": {
                 "sources": evidence_sources,
@@ -1544,211 +1060,112 @@ def _layer_instances(rows):
     return instances
 
 
-def _demote_non_dominant_prefixes(rows, partition_diagnostics):
-    """Move proven per-instance setup prefixes outside the layer body.
-
-    A prefix is demoted only when at least two different layers of the same
-    Pattern/phase share one dominant stage sequence and that full sequence
-    occurs exactly once as a suffix of the variant instance.  This preserves
-    every device event while avoiding kernel-name or model-specific rules.
-    """
-    groups = {}
-    for row in rows:
-        instance_id = row.get("layer_instance_id")
-        if row.get("assignment") == "layer_body" and instance_id:
-            groups.setdefault(instance_id, []).append(row)
-    by_pattern_phase = {}
-    for instance_id, group in groups.items():
-        group.sort(key=lambda item: item["device_seq_index"])
-        key = (group[0].get("phase"), group[0].get("pattern_id"))
-        sequence = tuple(item.get("stage") for item in group)
-        by_pattern_phase.setdefault(key, []).append(
-            (instance_id, group, sequence))
-
-    dominant = {}
-    for key, values in by_pattern_phase.items():
-        stats = {}
-        for _, group, sequence in values:
-            item = stats.setdefault(sequence, {
-                "count": 0,
-                "layer_ids": set(),
-            })
-            item["count"] += 1
-            item["layer_ids"].add(group[0].get("layer_id"))
-        ranked = sorted(
-            stats.items(),
-            key=lambda item: (
-                len(item[1]["layer_ids"]), item[1]["count"]),
-            reverse=True)
-        if not ranked or len(ranked[0][1]["layer_ids"]) < 2:
-            continue
-        best_score = (
-            len(ranked[0][1]["layer_ids"]), ranked[0][1]["count"])
-        if (len(ranked) > 1
-                and (len(ranked[1][1]["layer_ids"]),
-                     ranked[1][1]["count"]) == best_score):
-            continue
-        dominant[key] = ranked[0][0]
-
-    demotions = []
-    diagnostics_by_step = {
-        item.get("step_id"): item for item in partition_diagnostics}
-    for key, values in by_pattern_phase.items():
-        expected = dominant.get(key)
-        if not expected:
-            continue
-        for instance_id, group, observed in values:
-            if observed == expected or len(observed) <= len(expected):
-                continue
-            positions = [
-                index for index in range(len(observed) - len(expected) + 1)
-                if observed[index:index + len(expected)] == expected]
-            if len(positions) != 1:
-                continue
-            start = positions[0]
-            if start <= 0 or start + len(expected) != len(observed):
-                continue
-            prefix = group[:start]
-            remaining = group[start:]
-            layer_id = group[0].get("layer_id")
-            step_id = group[0].get("step_id")
-            for row in prefix:
-                row["boundary_reclassification"] = {
-                    "from": "layer_body",
-                    "to": "transition_global",
-                    "rule": (
-                        "prefix absent from the unique cross-layer dominant "
-                        "stage sequence for this Pattern/phase"),
-                    "original_layer_id": layer_id,
-                    "original_pattern_id": key[1],
-                }
-                row["assignment"] = "transition_global"
-                row["layer_id"] = None
-                row["layer_instance_id"] = None
-                row["pattern_id"] = None
-                row["layer_evidence"] = "pattern_variant_prefix_demoted"
-                row["layer_region"] = "transition_global"
-                row["boundary_role"] = None
-            remaining[0]["boundary_role"] = "body_start_kernel"
-            demotion = {
-                "step_id": step_id,
-                "phase": key[0],
-                "pattern_id": key[1],
-                "layer_id": layer_id,
-                "instance_id": instance_id,
-                "demoted_row_ids": [row["row_id"] for row in prefix],
-                "new_body_start_event": remaining[0]["row_id"],
-                "evidence": "unique_cross_layer_dominant_stage_suffix",
-            }
-            demotions.append(demotion)
-            diagnostic = diagnostics_by_step.get(step_id)
-            if diagnostic is not None:
-                diagnostic["mapped_event_count"] = max(
-                    0, int(diagnostic.get("mapped_event_count", 0))
-                    - len(prefix))
-                diagnostic.setdefault(
-                    "demoted_prefix_event_count", 0)
-                diagnostic["demoted_prefix_event_count"] += len(prefix)
-                diagnostic.setdefault("prefix_demotions", []).append(
-                    demotion)
-                for boundary in diagnostic.get("layer_boundaries", []):
-                    if boundary.get("layer_id") == layer_id:
-                        boundary["body_start_event"] = (
-                            remaining[0]["row_id"])
-                        break
-    return demotions
-
-
 def _boundary_rank(instance):
-    """Lower is a more trustworthy layer boundary. Prefer module-span-cut
-    instances over collective-anchor, then repeated-sequence, then forced
-    alignment, so the representative table is taken from the best-evidenced cut
-    (not merely the one whose duration is closest to the median)."""
+    """Lower is a more trustworthy independently-owned layer boundary."""
     sources = (instance.get("boundary_evidence") or {}).get("sources") or []
     best = 9
     for src in sources:
         text = str(src)
-        if "module_span" in text:
+        if text.startswith("python_module_span"):
             rank = 0
-        elif text in ("router_then_collective_end", "ordered_collective_anchor"):
+        elif text.startswith("validated_graph_capture_layer_scope"):
+            rank = 0
+        elif text.startswith("explicit_layer_marker"):
             rank = 1
-        elif text in ("repeated_sequence_medoid", "module_sequence_interpolation"):
+        elif text == "module_sequence_interpolation":
             rank = 2
-        elif text == "forced_best_alignment":
-            rank = 3
         else:
-            rank = 4
+            rank = 9
         best = min(best, rank)
     return best
 
 
-def _representatives(pattern_doc, instances):
+def _instance_context(pattern_doc, layer_id):
+    contexts = pattern_doc.get("layer_contexts") or {}
+    return contexts.get(str(layer_id), contexts.get(layer_id, {})) or {}
+
+
+def _context_penalty(pattern_doc, layer_id):
+    context = _instance_context(pattern_doc, layer_id)
+    return int(any(bool(context.get(key)) for key in (
+        "is_first_layer", "is_first_main_layer", "is_last_layer",
+        "is_last_main_layer", "model_entry", "model_exit",
+        "model_epilogue")))
+
+
+def _representatives(pattern_doc, instances, layer_hints=None):
+    """Choose one authoritative sequence medoid per (Pattern, phase)."""
+    layer_hints = layer_hints or {}
     by_pattern = {}
     for instance in instances:
-        if instance["boundary_complete"]:
+        if instance["boundary_complete"] and _boundary_rank(instance) < 9:
             by_pattern.setdefault(instance["pattern_id"], []).append(instance)
     selected = {}
     for pattern in pattern_doc.get("patterns", []):
         pid = pattern["pattern_id"]
         values = by_pattern.get(pid, [])
         phases = sorted({item["phase"] for item in values})
-        candidates = sorted(set(pattern.get("layer_ids", [])) &
-                            set(item["layer_id"] for item in values))
-        if phases:
-            candidates = [layer_id for layer_id in candidates
-                          if all(any(item["phase"] == phase and item["layer_id"] == layer_id
-                                     for item in values) for phase in phases)]
         medians = {}
-        layer_phase_medians = {}
+        selected_instances = {}
         for phase in phases:
             phase_values = [item for item in values if item["phase"] == phase]
-            for layer_id in candidates:
-                durations = [
-                    item["duration_us"] for item in phase_values
-                    if item["layer_id"] == layer_id]
-                if durations:
-                    layer_phase_medians[(phase, layer_id)] = statistics.median(durations)
+            allowed_ids = set(pattern.get(
+                "representative_candidates", pattern.get("layer_ids", [])))
+            preferred = [
+                item for item in phase_values
+                if item["layer_id"] in allowed_ids]
+            candidates = preferred or phase_values
+            hinted_ids = set(layer_hints.get(pid, []))
+            hinted = [
+                item for item in candidates
+                if item["layer_id"] in hinted_ids]
+            if hinted:
+                candidates = hinted
             medians[phase] = statistics.median(
-                list(layer_phase_medians[(phase, layer_id)]
-                     for layer_id in candidates
-                     if (phase, layer_id) in layer_phase_medians)) if candidates else 0
-        scored = []
-        for layer_id in candidates:
-            deviations = []
-            for phase in phases:
-                duration = layer_phase_medians.get((phase, layer_id))
-                median = medians[phase]
-                if duration is not None and median:
-                    deviations.append(abs(duration / median - 1.0))
-            if deviations:
-                scored.append((max(deviations), sum(deviations), layer_id))
-        selected_layer = min(scored)[2] if scored else None
-        selected_instances = {}
-        if selected_layer is not None:
-            for phase in phases:
-                phase_instances = [
-                    item for item in values
-                    if item["phase"] == phase
-                    and item["layer_id"] == selected_layer]
-                target = layer_phase_medians.get((phase, selected_layer), 0)
-                if phase_instances:
-                    chosen = min(phase_instances, key=lambda item: (
-                        _boundary_rank(item),
-                        abs(item["duration_us"] - target),
-                        item["first_device_seq_index"]))
-                    selected_instances[phase] = {
-                        "body_start_event": chosen["body_start_event"],
-                        "body_end_event": chosen["body_end_event"],
-                        "first_device_seq_index": chosen["first_device_seq_index"],
-                        "last_device_seq_index": chosen["last_device_seq_index"],
-                        "occurrence": chosen["occurrence"],
-                    }
+                item["duration_us"] for item in candidates) if candidates else 0
+            def score(item):
+                sequence = item.get("normalized_sequence") or []
+                distance = sum(
+                    1.0 - _sequence_ratio(
+                        sequence, other.get("normalized_sequence") or [])
+                    for other in candidates)
+                duration_deviation = (
+                    abs(item["duration_us"] / medians[phase] - 1.0)
+                    if medians[phase] else 0.0)
+                return (
+                    _boundary_rank(item),
+                    _context_penalty(pattern_doc, item["layer_id"]),
+                    round(distance, 12),
+                    round(duration_deviation, 12),
+                    item["layer_id"],
+                    item["first_device_seq_index"],
+                )
+            if candidates:
+                chosen = min(candidates, key=score)
+                selected_instances[phase] = {
+                    "layer_id": chosen["layer_id"],
+                    "body_start_event": chosen["body_start_event"],
+                    "body_end_event": chosen["body_end_event"],
+                    "first_device_seq_index": chosen["first_device_seq_index"],
+                    "last_device_seq_index": chosen["last_device_seq_index"],
+                    "occurrence": chosen["occurrence"],
+                    "boundary_rank": _boundary_rank(chosen),
+                    "contextual_edge": bool(
+                        _context_penalty(pattern_doc, chosen["layer_id"])),
+                    "sequence_signature": chosen["sequence_signature"],
+                    "boundary_evidence": chosen.get("boundary_evidence", {}),
+                }
+        selected_layers = sorted(set(
+            value["layer_id"] for value in selected_instances.values()))
         selected[pid] = {
-            "layer_id": selected_layer,
+            # Compatibility field. Tables use the phase-local layer_id below.
+            "layer_id": selected_layers[0] if len(selected_layers) == 1 else None,
             "phases": phases,
             "phase_median_duration_us": medians,
             "selected_instances": selected_instances,
-            "selection_confidence": "high" if phases and phases != ["unresolved"] else "low",
+            "selection_confidence": (
+                "high" if selected_instances and phases != ["unresolved"]
+                else "low"),
         }
     return selected
 
@@ -1764,7 +1181,8 @@ def _table(pattern_doc, rows, representatives, table_phases=None):
             continue
         rep = representatives.get(row["pattern_id"], {})
         selected = (rep.get("selected_instances") or {}).get(row["phase"])
-        if (row["assignment"] != "layer_body" or row["layer_id"] != rep.get("layer_id")
+        if (row["assignment"] != "layer_body"
+                or row["layer_id"] != (selected or {}).get("layer_id")
                 or not selected
                 or not (selected["first_device_seq_index"] <= row["device_seq_index"]
                         <= selected["last_device_seq_index"])):
@@ -1776,6 +1194,8 @@ def _table(pattern_doc, rows, representatives, table_phases=None):
             grouped.items(),
             key=lambda item: (
                 phase_order.get(item[0][0], 99), item[0][1])):
+        selected = ((representatives.get(pattern_id, {}).get(
+            "selected_instances") or {}).get(phase) or {})
         total = sum(row["duration_us"] for row in group)
         pattern_layer_ids = sorted(
             int(layer_id) for layer_id in
@@ -1794,7 +1214,7 @@ def _table(pattern_doc, rows, representatives, table_phases=None):
                 pattern_id, {}).get("pattern_display_name", pattern_id),
             "pattern_layer_ids": pattern_layer_ids,
             "pattern_layer_count": len(pattern_layer_ids),
-            "representative_layer_id": representatives[pattern_id]["layer_id"],
+            "representative_layer_id": selected["layer_id"],
             "selected_step_id": group[0].get("step_id"),
             "selected_bucket": {
                 "phase": phase,
@@ -1806,6 +1226,9 @@ def _table(pattern_doc, rows, representatives, table_phases=None):
                     "structural_context",
                     pattern_meta.get(pattern_id, {}).get(
                         "structural_signature", {})),
+            "representative_instance_context": _instance_context(
+                pattern_doc, selected["layer_id"]),
+            "boundary_evidence": selected.get("boundary_evidence", {}),
             "event_count": len(group),
             "layer_total_us": round(total, 6),
             "rows": output_rows,
@@ -1883,51 +1306,42 @@ def _representative_integrity(rows, tables, representatives):
     }
 
 
-def _representative_plausibility(pattern_doc, tables, rows):
-    """Reject representatives that cannot be the layer they claim to be.
+def _trace_pattern_consistency(instances):
+    """Validate runtime similarity without prescribing any semantic stage.
 
-    Structural self-consistency is not enough: a segmenter that mis-cuts a
-    window still produces internally consistent tables.  A representative must
-    also CONTAIN the stages its declared pattern requires -- a MoE layer with no
-    routing and no expert GEMM is a segmentation artefact, not a layer.
+    This is deliberately diagnostic. Data-dependent routing, generated kernel
+    specialisation, and different buckets may change an execution sequence even
+    when config/runtime define one structural body. A disagreement asks the
+    Agent to inspect a missed runtime branch; it does not invent a Pattern.
     """
-    patterns = _pattern_index(pattern_doc)
-    # Only demand stages the window actually demonstrates.  If the trace holds
-    # no expert kernels at all, a MoE representative without them reflects the
-    # capture, not a bad cut; if the trace does hold them, a MoE representative
-    # without them is a segmentation artefact.
-    stages_in_trace = set(
-        row["stage"] for row in rows if row.get("stage"))
+    grouped = {}
+    for instance in instances:
+        if not instance.get("boundary_complete") or _boundary_rank(instance) >= 9:
+            continue
+        grouped.setdefault(
+            (instance.get("phase"), instance.get("pattern_id")), []).append(
+                instance)
     audits = []
-    for table in tables:
-        layer_id = table.get("representative_layer_id")
-        pattern = patterns.get(layer_id) or {}
-        stages = set()
-        for row in table.get("rows", []):
-            if row.get("stage"):
-                stages.add(row["stage"])
-        declared = {"attn", "gemm"}
-        if _pattern_is_moe(pattern):
-            declared = declared | {"moe", "topk"}
-        required = declared & stages_in_trace
-        missing = sorted(required - stages)
+    for (phase, pattern_id), values in sorted(grouped.items()):
+        sequences = [value.get("normalized_sequence") or [] for value in values]
+        medoid = _sequence_medoid(sequences)
+        ratios = [_sequence_ratio(medoid, sequence) for sequence in sequences]
         audits.append({
-            "pattern_id": table.get("pattern_id"),
-            "phase": table.get("phase"),
-            "representative_layer_id": layer_id,
-            "row_count": len(table.get("rows", [])),
-            "declared_stages": sorted(declared),
-            "required_stages": sorted(required),
-            "unobserved_in_trace": sorted(declared - stages_in_trace),
-            "observed_stages": sorted(stages),
-            "missing_stages": missing,
-            "status": "pass" if not missing else "fail",
+            "phase": phase,
+            "pattern_id": pattern_id,
+            "instance_count": len(values),
+            "distinct_sequence_signatures": len(set(
+                value.get("sequence_signature") for value in values)),
+            "minimum_medoid_similarity": (
+                round(min(ratios), 6) if ratios else None),
+            "median_medoid_similarity": (
+                round(statistics.median(ratios), 6) if ratios else None),
+            "status": "pass" if ratios else "unavailable",
         })
     return {
-        "status": "pass" if tables and all(
-            item["status"] == "pass" for item in audits) else "fail",
-        "gating": True,
-        "scope": "exported_representatives",
+        "status": "pass" if audits else "unavailable",
+        "gating": False,
+        "scope": "authoritative_layer_instances",
         "tables": audits,
     }
 
@@ -1943,15 +1357,13 @@ def _quality(
                             if row["assignment"] in (
                                 "layer_body", "transition_global", "concurrent_unresolved"))
     pattern_missing = [pid for pid, rep in representatives.items()
-                       if rep["layer_id"] is None]
+                       if not rep.get("selected_instances")]
     incomplete = [item for item in instances if not item["boundary_complete"]]
     instances_by_step = {}
     for instance in instances:
         instances_by_step.setdefault(instance.get("step_id"), []).append(instance)
     step_audits = []
     for diagnostic in partition_diagnostics:
-        if diagnostic.get("status") != "mapped":
-            continue
         step_instances = sorted(
             instances_by_step.get(diagnostic["step_id"], []),
             key=lambda item: item["first_device_seq_index"])
@@ -1968,20 +1380,28 @@ def _quality(
             "actual_instance_count": len(step_instances),
             "layer_order_valid": actual_order == expected_order,
             "non_overlapping": non_overlapping,
+            "boundary_source_status": diagnostic.get("status"),
             "status": "pass" if (
-                actual_order == expected_order and non_overlapping) else "fail",
+                diagnostic.get("status") == "mapped"
+                and actual_order == expected_order
+                and non_overlapping) else "fail",
         })
     mechanical_pass = (not partition_diagnostics or bool(step_audits)) and all(
         item["status"] == "pass" for item in step_audits)
     phase_status = "pass" if spans else "partial"
     representative_integrity = _representative_integrity(
         rows, tables, representatives)
-    plausibility = _representative_plausibility(pattern_doc, tables, rows)
+    trace_consistency = _trace_pattern_consistency(instances)
+    conservation_pass = (
+        input_count == assigned_count and
+        math.isclose(input_duration, assigned_duration, rel_tol=0, abs_tol=1e-6))
     status = "fail" if (
-        pattern_missing or representative_integrity["status"] == "fail"
-        or plausibility["status"] == "fail") else (
-        "partial" if phase_status == "partial" or
-        pattern_doc.get("quality", {}).get("status") == "partial" else "pass")
+        not tables or representative_integrity["status"] == "fail"
+        or not conservation_pass) else (
+        "partial" if pattern_missing or not mechanical_pass
+        or phase_status == "partial"
+        or pattern_doc.get("quality", {}).get("status") == "partial"
+        else "pass")
     return {
         "schema_version": 1,
         "status": status,
@@ -1993,10 +1413,7 @@ def _quality(
                 "reason": "" if spans else "no measured phase annotations",
             },
             "analysis_window_conservation": {
-                "status": "pass" if (
-                    input_count == assigned_count and
-                    math.isclose(input_duration, assigned_duration, rel_tol=0, abs_tol=1e-6)
-                ) else "fail",
+                "status": "pass" if conservation_pass else "fail",
                 "input_event_count": input_count,
                 "assigned_event_count": assigned_count,
                 "input_duration_us": round(input_duration, 6),
@@ -2004,20 +1421,20 @@ def _quality(
                 "out_of_scope": out_of_scope,
             },
             "layer_boundaries": {
-                "status": "pass" if not incomplete and not pattern_missing else "fail",
-                "gating": False,
-                "scope": "all_layer_instances_diagnostic",
+                "status": "pass" if mechanical_pass and not incomplete else "fail",
+                "gating": True,
+                "scope": "all_required_steps",
                 "incomplete_instances": len(incomplete),
                 "patterns_without_representative": pattern_missing,
             },
             "step_layer_order": {
                 "status": "pass" if mechanical_pass else "fail",
-                "gating": False,
-                "scope": "all_layer_instances_diagnostic",
+                "gating": True,
+                "scope": "all_required_steps",
                 "steps": step_audits,
             },
             "representative_layer_integrity": representative_integrity,
-            "representative_pattern_plausibility": plausibility,
+            "trace_pattern_consistency": trace_consistency,
         },
     }
 
@@ -2100,6 +1517,19 @@ def _shape_capture_plan(tables, pattern_doc, trace_path,
     target_layers = sorted({
         int(table["representative_layer_id"]) for table in tables
         if table.get("representative_layer_id") is not None})
+    # Boundary capture needs one lightweight all-layer marker pass even when a
+    # graph-erased phase has no table yet.  Keep tensor logging representative-
+    # only by adding at most one deterministic, non-contextual candidate per
+    # otherwise-unrepresented Pattern.
+    represented_patterns = {table.get("pattern_id") for table in tables}
+    for pattern in pattern_doc.get("patterns", []):
+        if pattern.get("pattern_id") in represented_patterns:
+            continue
+        candidates = (pattern.get("representative_candidates")
+                      or pattern.get("layer_ids") or [])
+        if candidates:
+            target_layers.append(int(candidates[0]))
+    target_layers = sorted(set(target_layers))
     target_buckets = []
     for table in tables:
         bucket = dict(table.get("selected_bucket") or {})
@@ -2218,7 +1648,8 @@ def _markdown(tables, quality):
 
 
 def build(trace_path, pattern_path, out_dir, table_phases=None,
-          auto_sibling=True, require_phases=None):
+          auto_sibling=True, require_phases=None, boundary_map_paths=None,
+          representative_layer_hints=None):
     """Build the semantic layer/kernel tables.
 
     `trace_path` may be a single path or a list of phase traces.  When
@@ -2226,18 +1657,8 @@ def build(trace_path, pattern_path, out_dir, table_phases=None,
     and profiler session is pulled in automatically rather than silently
     ignored (B2).
     """
-    trace_paths = [trace_path] if isinstance(trace_path, str) else list(trace_path)
-    if not trace_paths:
-        raise ValueError("build() needs at least one trace")
-    adopted_siblings = []
-    if auto_sibling:
-        known = {os.path.abspath(path) for path in trace_paths}
-        for path in list(trace_paths):
-            for phase, sibling in sorted(_sibling_phase_traces(path).items()):
-                if os.path.abspath(sibling) not in known:
-                    known.add(os.path.abspath(sibling))
-                    trace_paths.append(sibling)
-                    adopted_siblings.append({"phase": phase, "path": sibling})
+    trace_paths, adopted_siblings = _resolve_trace_paths(
+        trace_path, auto_sibling=auto_sibling)
     primary_trace = trace_paths[0]
     with open(pattern_path) as fh:
         pattern_doc = json.load(fh)
@@ -2245,16 +1666,27 @@ def build(trace_path, pattern_path, out_dir, table_phases=None,
     patterns = _pattern_index(pattern_doc)
     rows, spans, out_of_scope, module_scopes, module_diagnostics = _event_rows(
         events, pattern_doc)
-    module_interpolated = _complete_module_ranges(rows, module_scopes, patterns)
-    partition_diagnostics, pattern_templates = _stage_sequence_partition(
+    boundary_map_diagnostics = []
+    applied_boundary_steps = set()
+    for boundary_map_path in boundary_map_paths or []:
+        boundary_map_diagnostics.extend(_apply_boundary_map(
+            rows, boundary_map_path, pattern_doc, trace_paths,
+            pattern_path, applied_boundary_steps))
+    module_interpolated = 0
+    partition_diagnostics, pattern_templates = _authoritative_layer_partition(
         rows, pattern_doc)
-    prefix_demotions = _demote_non_dominant_prefixes(
-        rows, partition_diagnostics)
+    # Historical code removed a first-layer prefix when its stage sequence was
+    # absent from a dominant suffix. That mutates a trusted module boundary
+    # using the same stage taxonomy we are trying to audit. Keep preparation
+    # kernels outside a layer only when ownership evidence says so; do not
+    # rewrite an authoritative boundary from sequence similarity.
+    prefix_demotions = []
     instances = _layer_instances(rows)
     representative_instances = [
         instance for instance in instances
         if not table_phases or instance["phase"] in table_phases]
-    representatives = _representatives(pattern_doc, representative_instances)
+    representatives = _representatives(
+        pattern_doc, representative_instances, representative_layer_hints)
     tables = _table(pattern_doc, rows, representatives, table_phases)
     quality = _quality(
         pattern_doc, rows, instances, representatives, spans, out_of_scope,
@@ -2264,7 +1696,11 @@ def build(trace_path, pattern_path, out_dir, table_phases=None,
         require_phases)
     quality["phase_coverage"] = coverage
     if coverage["missing_required_phases"]:
-        quality["status"] = "fail"
+        # A graph-replayed phase may legitimately need the Phase-1.2 donor
+        # capture before it has authoritative layer boundaries. Preserve any
+        # trustworthy phase tables and request completion; never publish the
+        # missing phase as if sequence inference had recovered it.
+        quality["status"] = "partial" if tables else "fail"
         quality.setdefault("failures", []).append(
             "phase coverage: required phase(s) %s absent from the tables; "
             "traces analysed: %s" % (
@@ -2303,6 +1739,7 @@ def build(trace_path, pattern_path, out_dir, table_phases=None,
             "module_scope_diagnostics": module_diagnostics,
             "module_scope_count": len(module_scopes),
             "module_interpolated_event_count": module_interpolated,
+            "boundary_maps": boundary_map_diagnostics,
             "boundary_partition_diagnostics": partition_diagnostics,
             "prefix_demotions": prefix_demotions,
             "pattern_stage_templates": pattern_templates,
@@ -2350,6 +1787,8 @@ def main():
     parser.add_argument("--no-auto-sibling", action="store_true",
                         help="do not adopt an unlisted EXTEND/DECODE sibling "
                              "trace of the same rank")
+    parser.add_argument("--layer-boundary-map", action="append", default=[],
+                        help="validated graph-construction boundary artifact")
     args = parser.parse_args()
     traces = [item.strip() for entry in args.trace
               for item in entry.split(",") if item.strip()]
@@ -2360,7 +1799,8 @@ def main():
                       if value.strip()]
     result = build(traces, args.patterns, args.out_dir, table_phases,
                    auto_sibling=not args.no_auto_sibling,
-                   require_phases=require_phases)
+                   require_phases=require_phases,
+                   boundary_map_paths=args.layer_boundary_map)
     if args.result_json:
         with open(args.result_json, "w") as fh:
             json.dump(result, fh, indent=2)

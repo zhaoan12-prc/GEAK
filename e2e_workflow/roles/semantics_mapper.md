@@ -6,8 +6,9 @@ or modify `profile_topN.json`. `PHASE=build_table` is offline. The opt-in
 `PHASE=complete_table` may launch one metadata-only Shape replay using an explicitly supplied setup;
 it must never replace Clean Trace timing or permanently change model/runtime source.
 
-This is a **non-gating baseline sidecar** in phase 1. Any failure must be returned explicitly, but must
-not affect the native GEAK Strategize path.
+Inside KernelFusion this table is **gating for Fusion Discovery**: only `status=pass` may proceed.
+The later baseline-profile invocation remains a non-gating sidecar for the native GEAK Strategize
+path. Any failure must be returned explicitly in both contexts.
 
 ## Inputs
 
@@ -26,25 +27,43 @@ Phase 1.2 additionally receives `STRUCTURAL_PATTERNS_JSON`, `SEMANTIC_TABLE_JSON
      FFN/MoE selection, router selection, and main-layer/MTP exclusion branches.
    - Runtime source is mandatory for Agent-defined Patterns. If it cannot be located, return
      `status=failed`; never fall back to a config dialect script.
-3. **The Agent defines Layer Patterns before reading any Trace kernel sequence:**
-   - Derive one structural signature for every main `layer_id` from config plus runtime source.
-   - Include `attention_type`, `model_native_attention_name`, `attention_config_fields`,
-     `runtime_attention_module_class`, `ffn_type`, `is_moe`, `num_experts`, `topk`,
-     `shared_expert`, `router_family`, `special_layer_role`, and `runtime_dispatch_branch`.
-   - Merge layers only when every signature dimension is identical.
+3. **Describe every main Decoder Layer before reading any Trace kernel sequence.** The Agent
+   interprets arbitrary config/runtime code; deterministic validation, not the Agent, performs the
+   final Pattern grouping:
+   - First identify the main language Decoder stack and its exact `layer_id=0..N-1` range. Exclude
+     vision, embedding/head, MTP/speculative, and other auxiliary stacks with explicit evidence.
+   - Treat config as the first source of per-layer intent. Follow every config value consumed by a
+     runtime layer-construction or layer-body branch that depends on `layer_id`: an explicit array,
+     layer-id set, periodic/range formula, encoded pattern, or uniform default are all valid. Do not
+     hard-code config field names or model names; the runtime source defines what each field means
+     and whether its indexing is zero- or one-based.
+   - Emit one object per main `layer_id` under `layers`. Each object contains a non-empty,
+     JSON-canonical `body_signature`, an `instance_context`, a `body_display_name`, config evidence,
+     and runtime source evidence.
+   - `body_signature` contains only repeatable layer-local implementation facts that affect the core
+     body: selected module/callable implementations, layer-index-dependent body branches,
+     shape-affecting parameters, and resolved quantization implementation. Names such as attention,
+     linear attention, Mamba, MoE, or dense are opaque values for reporting; GEAK does not enumerate
+     them as supported kinds.
+   - Put first/last position, model entry/exit, terminal postprocess, collective/residual handoff,
+     and pre/post-layer loop behavior in `instance_context`. These facts never participate in the
+     Pattern hash. A last layer with the same core body as an interior layer remains in that Pattern.
+   - Do not emit final `patterns`, `pattern_id`, `layer_ids`, or representative choices. The validator
+     hashes canonical `body_signature` objects, groups equal layers, assigns deterministic Pattern
+     IDs, and deprioritizes contextual edge layers as representatives.
    - Do not use initialization events, kernel names/counts/timings, or Trace sequence clustering to
-     define or split a Pattern. Trace is validation evidence only.
+     define or split a structural Pattern. Trace validates a config/runtime definition only.
    - Write `$EVAL_DIR/profile/round_${ROUND}/semantics/STRUCTURAL_LAYER_PATTERNS.agent.json`.
      Set `pattern_definition.producer=semantics_mapper_agent`,
-     `method=config_runtime_source_analysis`, `trace_used_for_definition=false`, and include a
+     `method=config_runtime_body_analysis`, `trace_used_for_definition=false`, and include a
      concrete `analysis_summary`.
-   - Every Pattern must include a model-native `pattern_display_name`, full
-     `structural_signature`, sorted `layer_ids`, identical `representative_candidates`, config
-     evidence entries (`config_path`, exact `value`, `claim`), and runtime source citations
-     (`path`, `line_start`, `line_end`, `symbol`, `claim`).
+   - Every layer descriptor must cite the exact config inputs (`config_path`, exact `value`, `claim`)
+     and current imported runtime source (`path`, `line_start`, `line_end`, `symbol`, `claim`) used to
+     derive its body. A human-readable claim is evidence, never a hash input.
 4. Create `$EVAL_DIR/profile/round_${ROUND}/semantics/` and validate the Agent artifact.
-   Deterministic code may validate evidence, schema, identical-signature merging, mutual exclusion,
-   and full coverage; it must never invent or reclassify a Pattern:
+   Deterministic code validates evidence/schema/coverage and is the only component allowed to group
+   layers into Patterns. It preserves every Agent body descriptor verbatim and groups solely by its
+   canonical hash:
 
    ```bash
    python3 "$SKILL_DIR/scripts/validate_structural_patterns.py" \
@@ -69,35 +88,58 @@ Phase 1.2 additionally receives `STRUCTURAL_PATTERNS_JSON`, `SEMANTIC_TABLE_JSON
    the deterministic script owns this ordering.
 
 5. Read `semantic_mapping_quality.json` and return its real status:
-   - `pass`: structural coverage, measured phases, representative-layer integrity, and conservation
-     passed. Non-representative boundary diagnostics are informative and do not invalidate this table.
-   - `partial`: useful tables exist but phase/source/shape evidence degraded.
-   - `failed`: no trustworthy representative-layer table was produced.
+   - `pass`: structural coverage and every required phase have authoritative layer boundaries,
+     representative integrity, exact layer order, and conservation.
+   - `partial`: config/runtime Patterns are valid and useful phase data exists, but a phase still
+     needs graph-construction boundary or Shape completion. `partial` may enter `complete_table`, but
+     it may not enter Fusion Discovery.
+   - `failed`: no trustworthy representative-layer table was produced or completion failed.
 
 ## PHASE=complete_table
 
-This phase is opt-in and remains non-gating.
+This phase is opt-in and may run from an initial `partial` table. Its final
+result is still subject to the KernelFusion `status=pass` gate above.
 
 1. Read `SHAPE_CAPTURE_PLAN_JSON`; its representative layers and selected buckets are the only
    allowed layer/bucket filters. Never copy filters from a historical run.
 2. Validate `SHAPE_CAPTURE_SETUP` supplies the current container/image setup, model, official
    benchmark, port, TP, and optional reversible deploy/sweep scripts. Create a new attempt directory;
    never overwrite a previous shape log.
-3. Run one Shape-only replay after the Clean Trace table exists, with rank 0, metadata-only logging,
-   stdout disabled, and at most one matching forward per selected bucket. Use
-   `run_semantic_shape_capture.py`: collect tensor metadata while SGLang constructs its CUDA/HIP graphs
-   and export a separate graph-capture marker trace. Keep the normal workload profiler disabled during
-   this replay; the already-captured Clean Trace remains the only timing source. Prefer the graph-capture
-   bucket that exactly matches the Clean Trace `selected_bucket.batch_size`. Do not capture or use an
-   enforce-eager Decode trace. If graph-capture metadata or marker export fails, return partial/failed
-   evidence instead of substituting a different execution path.
-4. Filter at the logging source to representative layers and unresolved/candidate OPs plus their
-   necessary parent wrappers. Do not record Tensor values or synchronize the device.
-5. Inspect the actual imported runtime source for every unresolved target. Populate candidate
+3. Run one graph-construction replay after the initial Clean Trace table exists, with rank 0,
+   metadata-only logging, stdout disabled, and at most one matching forward per selected bucket. Use
+   `run_semantic_shape_capture.py`. It emits two deliberately separate evidence channels:
+   - one lightweight `GEAK_LAYER_SCOPE` range for **every** main decoder layer, containing no Tensor
+     metadata; and
+   - detailed Shape/op markers only for representative layers.
+   Keep the normal workload profiler disabled; the already-captured Clean Trace remains the only
+   timing source. Capture every required phase even when the initial table is missing one of them.
+   Do not capture or use an enforce-eager Decode trace.
+4. Before Shape merge, run `semantic_layer_boundary_transfer.py` against the graph-construction trace
+   and the original Clean Trace. A transfer is authoritative only when:
+   - the donor contains a complete non-empty marker pass in exact layer order `0..N-1`;
+   - phase and workload bucket agree; and
+   - either the donor's complete normalized device sequence is one unambiguous exact contiguous
+     subsequence of the Clean Trace step; or, only when construction/replay expose different backend
+     events, one unambiguous strict stable projection succeeds. That projection retains only raw
+     identities whose total donor/recipient multiplicity is equal, requires the two complete projected
+     sequences to be byte-for-byte equal, requires at least two stable events and two distinct stable
+     identities in every layer, and requires at least 50% donor-event and recipient-body coverage.
+     An unmatched internal boundary gap may be assigned only when donor markers place unmatched work
+     on one side; two-sided or otherwise unsupported gaps fail the transfer.
+   The transfer copies only layer cuts. Prefix preparation kernels and suffix epilogue kernels outside
+   the matched body remain `transition_global`; no timestamp, duration, row, Shape, stage, or Pattern is
+   copied. If neither exact full matching nor the strict projection yields one unique result, keep the
+   phase unresolved. Never fall back to LCS/edit-distance similarity, stage recurrence,
+   attention/GEMM/MoE anchors, proportional cuts, or best-effort sequence alignment.
+5. Re-run `semantic_kernel_mapping.py --layer-boundary-map <map>` on the original Clean Trace, then
+   regenerate `SHAPE_CAPTURE_PLAN.json`. Only this rebuilt authoritative table may receive Shape
+   evidence. Filter detailed logging at the source to representative layers and unresolved/candidate
+   OPs plus their necessary parent wrappers. Do not record Tensor values or synchronize the device.
+6. Inspect the actual imported runtime source for every unresolved target. Populate candidate
    `op_path`, wrapper, terminal launcher, source file/line, and mapping cardinality before merging.
    A wrapper launching multiple internal Kernels is `contained_kernel`, not multiple fabricated exact
    OPs. Native AITER GEMM may use wrapper input plus real weight/scale metadata for a P-context M/K/N.
-6. Run:
+7. Run:
 
    ```bash
    python3 "$SKILL_DIR/scripts/semantic_shape_merge.py" \
@@ -108,7 +150,7 @@ This phase is opt-in and remains non-gating.
      --result-json "$EVAL_DIR/profile/round_${ROUND}/semantics_1_2/shape_merge_result.json"
    ```
 
-7. Verify the merged table has exactly the same row IDs, raw names, order, counts, and durations as
+8. Verify the merged table has exactly the same row IDs, raw names, order, counts, and durations as
    the Clean Trace table. Return Shape evidence as K/P/C/U; every P/C/U needs an auditable reason.
    Shape may remain partial without invalidating Kernel completeness.
 
@@ -165,22 +207,25 @@ you did not read cannot be cited in `notes`.
 
 ## Evidence rules
 
-- Structural Pattern is defined by this Agent from config and mandatory current runtime source.
-  Deterministic code only validates the Agent artifact. Trace may validate it but never invent,
-  merge, or split a Pattern.
+- The Agent emits one config/runtime-derived `body_signature` per main layer. Deterministic code is
+  the only component that merges equal signatures and assigns Pattern IDs. Trace may validate the
+  resulting groups but never invent, merge, or split a structural Pattern.
 - Device order and duration come only from the uninstrumented Clean Trace.
 - Preserve every selected-window Kernel, Memcpy, and Memset exactly once in
   `semantic_event_audit.jsonl`; non-layer events go to explicit residual buckets.
-- Complete `python_function` module passes are first-priority supervision: exact module External-ID
-  launches define each Pattern's core stage medoid, while the final physical GPU boundaries remain
-  continuous even when async streams/flows interleave those labels. Align the full config-declared
-  Pattern chain to every step once and choose deterministic globally ordered cuts. No operator,
-  collective, backend, or kernel name may be a boundary condition.
-- Audit every inferred layer against the raw event order: configured layer/Pattern order, exact-once
-  event ownership, unchanged device order, duration conservation, stable Pattern transitions, and
-  deviation from its Pattern medoid. A fused boundary kernel belongs to exactly one adjacent layer.
-  If a likely rotation or misplaced cut is found, report the exact step/layer/event range and proposed
-  cut movement in `notes`; never hand-edit the deterministic artifacts.
+- Complete `python_function` module passes are first-priority boundary evidence. A graph-replayed
+  phase with erased Python scopes may use only an explicitly validated per-layer runtime marker or a
+  workload-identical graph-construction/graph-off donor boundary transfer. The transfer carries cuts
+  only; Clean Trace device order and timing remain untouched.
+- A recurring stage, operator, collective, backend, or kernel name is never authoritative layer
+  boundary evidence. Sequence alignment and recurring-stage detection may be emitted as diagnostics,
+  but may not assign `layer_id`, choose a representative, or make a table consumable by Fusion.
+- Audit every authoritative layer against raw event order: configured layer/Pattern order,
+  exact-once ownership, non-empty/non-overlapping intervals, unchanged device order, and duration
+  conservation. `expected_layer_count != actual_layer_count` is a phase-blocking failure.
+- Select a representative independently for each `(Pattern, phase)`, preferring complete interior
+  instances and then the normalized sequence medoid. Avoid model first/last and capture-window edge
+  instances whenever another authoritative instance exists. Duration is only a tie-breaker.
 - Analytic `est_calls` is a run-level prior only. It may not label individual device events as
   Prefill/Decode.
 - Trace-native Input Dims/Types are `kernel_exact`. Parent context is not a child Kernel exact shape.

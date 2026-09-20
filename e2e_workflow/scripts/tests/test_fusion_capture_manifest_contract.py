@@ -81,6 +81,13 @@ class FusionCaptureManifestContractTest(unittest.TestCase):
             rank_block,
         )
 
+    def test_partial_semantics_cannot_enter_fusion_discovery(self):
+        source = self._workflow_source()
+        self.assertIn(
+            "if (semantics && semantics.status === 'pass' && semantics.semantic_table_json)",
+            source,
+        )
+
     def test_topk_execution_list_drives_exact_unitside_candidates(self):
         """Every unit-side call must be named by Top-K exec/candidate ids."""
         source = self._workflow_source()

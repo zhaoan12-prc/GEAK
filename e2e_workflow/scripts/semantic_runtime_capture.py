@@ -16,7 +16,10 @@ import sys
 import threading
 
 
-_LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+_LAYER_RE = re.compile(
+    r"(?:^|\.)(?:layers|h|blocks)\.(\d+)(?:\.|$)", re.IGNORECASE)
+_MAIN_LAYER_RE = re.compile(
+    r"(?:^|\.)(?:layers|h|blocks)\.(\d+)$", re.IGNORECASE)
 _TRUE = ("1", "true", "True", "TRUE", "yes", "on")
 _LOGGER = None
 _INSTALLED_CLASSES = set()
@@ -234,6 +237,7 @@ class SemanticRuntimeLogger(object):
         self.rank = int(os.environ.get("GEAK_SEMANTICS_RANK", "0"))
         self.layers = _csv_int("GEAK_SEMANTICS_LAYERS")
         self.phases = _csv_upper("GEAK_SEMANTICS_PHASES")
+        self.layer_scopes = _flag("GEAK_SEMANTICS_LAYER_SCOPES", "1")
         self.require_profiler = _flag(
             "GEAK_SEMANTICS_REQUIRE_PROFILER")
         self._profile_seen = False
@@ -303,6 +307,44 @@ class SemanticRuntimeLogger(object):
             self._context["phase"], self._context["batch_size"],
             self._context["input_tokens"])
         return self._bucket_forwards.get(key, 0) < self.max_forwards
+
+    def _layer_scope_allowed(self, layer_id):
+        """Whether a lightweight main-layer boundary marker should be emitted.
+
+        Unlike Shape logging this intentionally ignores ``self.layers``: the
+        boundary donor must cover the complete main stack.  It still observes
+        rank, phase and per-bucket forward limits, and it records no tensor
+        metadata for non-representative layers.
+        """
+        if not self.layer_scopes or not self.active() or layer_id < 0:
+            return False
+        if (self.phases
+                and _canonical_phase(self._context["phase"])
+                not in {_canonical_phase(item) for item in self.phases}):
+            return False
+        key = (
+            self._context["phase"], self._context["batch_size"],
+            self._context["input_tokens"])
+        return self._bucket_forwards.get(key, 0) < self.max_forwards
+
+    def layer_scope(self, layer_id, op_path):
+        """Return a record_function context for one complete main-layer body."""
+        if not self._layer_scope_allowed(layer_id):
+            return contextlib.nullcontext()
+        context = dict(self._context)
+        marker = (
+            "GEAK_LAYER_SCOPE|phase=%s|bs=%s|toks=%s|layer=%s|path=%s"
+            % (context["phase"], context["batch_size"],
+               context["input_tokens"], layer_id, op_path))
+        try:
+            import torch
+            factory = getattr(
+                getattr(torch, "profiler", None), "record_function", None)
+            if factory is None:
+                factory = torch.autograd.profiler.record_function
+            return factory(marker)
+        except Exception:
+            return contextlib.nullcontext()
 
     def _stack(self):
         if not hasattr(self._stacks, "value"):
@@ -520,11 +562,27 @@ def _register_hooks(model):
     if not logger.active():
         return
     count = 0
+    layer_scope_count = 0
     for raw_path, module in model.named_modules():
         if not raw_path:
             continue
         path = _op_path(raw_path)
         layer = _layer_id(path)
+        main_layer_match = _MAIN_LAYER_RE.search(path)
+        if main_layer_match and not getattr(
+                module, "_geak_semantics_layer_scope_wrapped", False):
+            original_forward = module.forward
+
+            @functools.wraps(original_forward)
+            def layer_scoped_forward(
+                    *args, __forward=original_forward,
+                    __layer=layer, __path=path, **kwargs):
+                with logger.layer_scope(__layer, __path):
+                    return __forward(*args, **kwargs)
+
+            module.forward = layer_scoped_forward
+            module._geak_semantics_layer_scope_wrapped = True
+            layer_scope_count += 1
         if logger.layers and layer not in logger.layers:
             continue
         children = list(module.children())
@@ -560,7 +618,8 @@ def _register_hooks(model):
             raise RuntimeError(
                 "runtime torch lacks kwargs-capable forward hooks")
     sys.stderr.write(
-        "[GEAK_SEMANTICS] registered %d marker+metadata hooks\n" % count)
+        "[GEAK_SEMANTICS] registered %d all-layer scopes and %d "
+        "marker+metadata hooks\n" % (layer_scope_count, count))
 
 
 def install_on_model(model):

@@ -85,6 +85,14 @@ class SemanticReportTest(unittest.TestCase):
         _, md = self._build(table)
         self.assertNotIn("🔴", md)
 
+    def test_prefill_is_rendered_before_decode(self):
+        rows = [_row("a", "norm", 10.0, dims=[[8, 16]])]
+        table = _table(phase="decode", rows=rows)
+        table["tables"].append(dict(table["tables"][0], phase="prefill"))
+        _, md = self._build(table)
+        self.assertLess(md.index("| prefill |"), md.index("| decode |"))
+        self.assertLess(md.index("### prefill /"), md.index("### decode /"))
+
     def test_an_absent_phase_is_named_as_absent(self):
         # The DSR1 failure: a prefill-only table with no declared record, which read
         # as a complete run because nothing mentioned decode at all.

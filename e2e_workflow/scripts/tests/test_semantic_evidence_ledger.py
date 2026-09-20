@@ -48,6 +48,38 @@ class SemanticEvidenceLedgerTest(unittest.TestCase):
             "parent_operator": {"canonical_op": "unresolved"},
         }
 
+    def test_preserves_graph_trace_shape_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            clean_row = self._row("event-0")
+            probe_row = self._row("event-0")
+            probe_row["semantic_evidence"] = {
+                "level": "P",
+                "probe_scope": "kernel",
+                "source": "graph_capture_trace_external_id",
+                "bucket_match": "exact",
+                "schema": {"tensors": [{
+                    "io": "operand", "shape": [4, 8]}]},
+            }
+            probe_row["shape"] = {
+                "source": "runtime_trace_kernel",
+                "input_dims": [[4, 8]],
+                "input_types": ["bfloat16"],
+                "logger_schema": probe_row["semantic_evidence"]["schema"],
+            }
+            result = ledger.merge(
+                self._write(
+                    tmp, "clean.json", self._document([clean_row])),
+                [self._write(
+                    tmp, "probe.json", self._document([probe_row]))],
+                os.path.join(tmp, "out"))
+            with open(result["semantic_table_json"]) as fh:
+                row = json.load(fh)["tables"][0]["rows"][0]
+            self.assertEqual(
+                row["semantic_evidence"]["evidence_origin"],
+                "graph_capture_trace")
+            self.assertEqual(
+                row["shape"]["source"], "runtime_trace_kernel")
+
     def test_accumulates_probe_runs_without_downgrading_k(self):
         with tempfile.TemporaryDirectory() as tmp:
             clean_rows = [

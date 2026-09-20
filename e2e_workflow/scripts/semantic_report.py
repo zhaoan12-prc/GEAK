@@ -47,6 +47,13 @@ from fusion_candidate_harness import DONOR_STAGES, _fusible_regions
 # declared record saying so -- so the report showed one tidy prefill row and read as
 # complete. Both halves are always named; the one with no tables is named as absent.
 EXPECTED_PHASES = ("prefill", "decode")
+PHASE_ORDER = {phase: index for index, phase in enumerate(EXPECTED_PHASES)}
+
+
+def _pattern_order(pattern):
+    phase = str(pattern.get("phase") or "")
+    return (PHASE_ORDER.get(phase, len(PHASE_ORDER)), phase,
+            str(pattern.get("pattern_id")))
 
 
 def _load(path):
@@ -168,6 +175,13 @@ def build(table_path, helper_floor=5.0, top_rows=8):
             "display_name": item.get("pattern_display_name"),
             "layer_count": item.get("pattern_layer_count"),
             "representative_layer_id": item.get("representative_layer_id"),
+            "body_signature": (
+                (item.get("structural_context") or {}).get(
+                    "body_signature")
+                or item.get("structural_context") or {}),
+            "representative_instance_context": item.get(
+                "representative_instance_context") or {},
+            "boundary_evidence": item.get("boundary_evidence") or {},
             "rows": len(rows),
             "layer_total_us": round(total, 3),
             "donor_us": round(donor_us, 3),
@@ -313,7 +327,7 @@ def render_markdown(rep):
     lines.append("")
     lines.append("| 阶段 | pattern | 名称 | 层数 | 单层 µs | 其中非-donor | 非-donor 占比 | 该 pattern forward |")
     lines.append("|:--:|---|---|---:|---:|---:|---:|---:|")
-    for p in sorted(rep["patterns"], key=lambda p: (p["phase"], str(p["pattern_id"]))):
+    for p in sorted(rep["patterns"], key=_pattern_order):
         lines.append("| %s | `%s` | %s | %s | %.1f | %.1f | %.1f%% | %.0f µs |" % (
             _esc(p["phase"]), _esc(p["pattern_id"]), _esc(p["display_name"]),
             _esc(p["layer_count"]), p["layer_total_us"], p["non_donor_us"],
@@ -325,8 +339,18 @@ def render_markdown(rep):
         % "、".join(sorted(DONOR_STAGES)))
     lines.append("")
 
-    for p in sorted(rep["patterns"], key=lambda p: (p["phase"], str(p["pattern_id"]))):
+    for p in sorted(rep["patterns"], key=_pattern_order):
         lines.append("### %s / `%s` — stage 分布" % (p["phase"], p["pattern_id"]))
+        lines.append("")
+        lines.append("- body signature：`%s`" % _esc(json.dumps(
+            p.get("body_signature") or {}, sort_keys=True,
+            ensure_ascii=False)))
+        lines.append("- representative instance context：`%s`" % _esc(
+            json.dumps(p.get("representative_instance_context") or {},
+                       sort_keys=True, ensure_ascii=False)))
+        lines.append("- layer boundary evidence：`%s`" % _esc(json.dumps(
+            p.get("boundary_evidence") or {}, sort_keys=True,
+            ensure_ascii=False)))
         lines.append("")
         lines.append("| stage | 次数 | µs/层 | 占单层 |")
         lines.append("|---|---:|---:|---:|")
