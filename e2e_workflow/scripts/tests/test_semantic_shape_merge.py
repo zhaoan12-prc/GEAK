@@ -75,6 +75,36 @@ class SemanticShapeMergeTest(unittest.TestCase):
                             [4, 4096], [128, 128], [4, 32], []],
                         "input_types": [
                             "float8_e4m3fnuz", "bfloat16", "float32", ""],
+                        "raw_operands": [
+                            {"arg_index": 0, "shape": [4, 4096],
+                             "dtype": "float8_e4m3fnuz", "stride": None},
+                            {"arg_index": 1, "shape": [128, 128],
+                             "dtype": "bfloat16", "stride": None},
+                            {"arg_index": 2, "shape": [4, 32],
+                             "dtype": "float32", "stride": None},
+                            {"arg_index": 3, "shape": [],
+                             "dtype": "", "stride": None},
+                        ],
+                        "operator_schema_resolution": {
+                            "status": "matched_unique"},
+                        "operator_schema": {
+                            "name": "aiter::dynamic_per_token_scaled_quant",
+                            "schema": "aiter::dynamic_per_token_scaled_quant(Tensor(a0!) out, Tensor(a1!) input, Tensor(a2!) scales, Tensor? scale_ub=None) -> ()",
+                            "arguments": [
+                                {"index": 0, "name": "out",
+                                 "type": "Tensor",
+                                 "alias_info": {"is_write": True}},
+                                {"index": 1, "name": "input",
+                                 "type": "Tensor",
+                                 "alias_info": {"is_write": True}},
+                                {"index": 2, "name": "scales",
+                                 "type": "Tensor",
+                                 "alias_info": {"is_write": True}},
+                                {"index": 3, "name": "scale_ub",
+                                 "type": "Optional[Tensor]",
+                                 "alias_info": None},
+                            ],
+                        },
                     },
                 }],
             }
@@ -118,6 +148,18 @@ class SemanticShapeMergeTest(unittest.TestCase):
             self.assertEqual(
                 row["parent_operator"]["canonical_op"],
                 "aiter::dynamic_per_token_scaled_quant")
+            kernel_shape = row["shape"]["kernel_shape"]
+            self.assertEqual(
+                [operand["schema_name"] for operand in
+                 kernel_shape["operands"]],
+                ["out", "input", "scales", "scale_ub"])
+            self.assertEqual(
+                kernel_shape["operands"][1]["semantic_role"], "input")
+            self.assertEqual(
+                kernel_shape["operands"][0]["direction"], "output")
+            self.assertEqual(
+                kernel_shape["operands"][2]["direction"],
+                "mutable_unresolved")
 
     def test_layer_wrapper_shape_does_not_claim_kernel_operand_roles(self):
         row = {
@@ -175,7 +217,8 @@ class SemanticShapeMergeTest(unittest.TestCase):
                             "raw_name": "exact", "short_name": "exact",
                             "duration_us": 1.0,
                             "shape": {"source": "kernel_exact",
-                                      "input_dims": [[4, 8]]},
+                                      "input_dims": [[4, 8], [8, 16]],
+                                      "input_types": ["bf16", "bf16"]},
                             "parent_operator": {"canonical_op": "aten::mm"},
                         },
                         {
@@ -203,6 +246,19 @@ class SemanticShapeMergeTest(unittest.TestCase):
                     "parent_operator": "unresolved",
                 }],
             }
+            plan["operator_schema_manifest"] = self._write(
+                tmp, "schemas.json", {"schemas": [{
+                    "name": "aten::mm", "overload_name": "",
+                    "qualified_name": "aten::mm",
+                    "schema": "aten::mm(Tensor self, Tensor mat2) -> Tensor",
+                    "arguments": [
+                        {"index": 0, "name": "self", "type": "Tensor",
+                         "has_default": False, "alias_info": None},
+                        {"index": 1, "name": "mat2", "type": "Tensor",
+                         "has_default": False, "alias_info": None},
+                    ],
+                    "returns": [],
+                }]})
             records = [
                 {
                     "phase": "decode", "rank": 0, "layer_id": 2,
@@ -247,7 +303,11 @@ class SemanticShapeMergeTest(unittest.TestCase):
             with open(result["semantic_table_json"]) as fh:
                 rows = json.load(fh)["tables"][0]["rows"]
             self.assertEqual(rows[0]["semantic_evidence"]["level"], "K")
-            self.assertEqual(rows[0]["shape"]["input_dims"], [[4, 8]])
+            self.assertEqual(
+                rows[0]["shape"]["input_dims"], [[4, 8], [8, 16]])
+            self.assertEqual(
+                rows[0]["shape"]["kernel_shape"]["operands"][0]
+                ["schema_name"], "self")
             self.assertEqual(rows[1]["semantic_evidence"]["level"], "P")
             self.assertEqual(
                 rows[1]["semantic_evidence"]["clean_row_binding"],

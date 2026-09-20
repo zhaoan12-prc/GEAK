@@ -11,6 +11,54 @@ import semantic_runtime_marker_mapping as mapping
 
 
 class RuntimeMarkerMappingTest(unittest.TestCase):
+    def test_operator_schema_is_resolved_from_observed_argument_structure(self):
+        manifest = {
+            "schemas": [
+                {
+                    "name": "aten::mul", "overload_name": "Tensor",
+                    "qualified_name": "aten::mul.Tensor",
+                    "schema": "aten::mul.Tensor(Tensor self, Tensor other) -> Tensor",
+                    "arguments": [
+                        {"index": 0, "name": "self", "type": "Tensor",
+                         "has_default": False, "alias_info": None},
+                        {"index": 1, "name": "other", "type": "Tensor",
+                         "has_default": False, "alias_info": None},
+                    ],
+                },
+                {
+                    "name": "aten::mul", "overload_name": "Scalar",
+                    "qualified_name": "aten::mul.Scalar",
+                    "schema": "aten::mul.Scalar(Tensor self, Scalar other) -> Tensor",
+                    "arguments": [
+                        {"index": 0, "name": "self", "type": "Tensor",
+                         "has_default": False, "alias_info": None},
+                        {"index": 1, "name": "other", "type": "Scalar",
+                         "has_default": False, "alias_info": None},
+                    ],
+                },
+            ]}
+        resolution = mapping._resolve_operator_schema(
+            "aten::mul", [[4, 8], [4, 8]],
+            ["bfloat16", "bfloat16"], mapping._schema_index(manifest))
+        self.assertEqual(resolution["status"], "matched_unique")
+        self.assertEqual(resolution["schema"]["overload_name"], "Tensor")
+
+    def test_ambiguous_operator_schema_keeps_argument_roles_unresolved(self):
+        schema = {
+            "name": "custom::opaque", "overload_name": "",
+            "qualified_name": "custom::opaque",
+            "schema": "custom::opaque(Tensor x) -> Tensor",
+            "arguments": [{
+                "index": 0, "name": "x", "type": "Tensor",
+                "has_default": False, "alias_info": None}],
+        }
+        manifest = {"schemas": [schema, dict(schema)]}
+        resolution = mapping._resolve_operator_schema(
+            "custom::opaque", [[4, 8]], ["bfloat16"],
+            mapping._schema_index(manifest))
+        self.assertEqual(resolution["status"], "ambiguous")
+        self.assertIsNone(resolution["schema"])
+
     def test_graph_trace_external_id_shape_beats_broad_wrapper(self):
         with tempfile.TemporaryDirectory() as tmp:
             plan_path = os.path.join(tmp, "plan.json")

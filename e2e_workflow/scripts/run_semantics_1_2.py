@@ -217,7 +217,9 @@ def run(config_path, trace_path, shape_log_path, out_dir,
             capture_result.get(
                 "source_wrapper_map", source_wrapper_map),
             clean_table_path=phase_1_1_json,
-            required_phases=capture_result.get("capture_phases"))
+            required_phases=capture_result.get("capture_phases"),
+            operator_schema_manifest_path=capture_result.get(
+                "operator_schema_manifest", ""))
         capture_result["runtime_marker_mapping"] = marker_mapping
         merged_probe = semantic_shape_merge.merge(
             phase_1_1_json, merge_plan_path,

@@ -298,6 +298,68 @@ def _observed_phases(shape_log):
     return seen
 
 
+def _load_probe_plan(value, setup_path):
+    if not value:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    path = str(value)
+    if not os.path.isabs(path):
+        path = os.path.join(os.path.dirname(os.path.abspath(setup_path)), path)
+    with open(path) as fh:
+        return json.load(fh)
+
+
+def _target_name(value, field):
+    if isinstance(value, dict):
+        return str(value.get(field) or value.get("target") or "").strip()
+    return str(value or "").strip()
+
+
+def _normalized_probe_plan(setup, plan, setup_path):
+    """Combine Agent/source/setup priors without treating them as mappings."""
+    documents = [
+        plan.get("operator_probe_plan") or {},
+        _load_probe_plan(setup.get("operator_probe_plan"), setup_path),
+    ]
+    operator_details = []
+    callable_details = []
+    for document in documents:
+        operator_details.extend(document.get("operator_targets", []))
+        callable_details.extend(document.get("callable_targets", []))
+    operator_details.extend(setup.get("operator_targets", []))
+    callable_details.extend(setup.get("callable_targets", []))
+
+    def unique(items, field):
+        result = []
+        seen = set()
+        for item in items:
+            name = _target_name(item, field)
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            if isinstance(item, dict):
+                value = dict(item)
+                value[field] = name
+            else:
+                value = {field: name, "evidence": "caller_supplied"}
+            result.append(value)
+        return result
+
+    operators = unique(operator_details, "operator")
+    callables = unique(callable_details, "callable")
+    return {
+        "schema_version": 1,
+        "status": "observational_prior_only",
+        "mapping_claim": "none",
+        "note": (
+            "Targets guide capture-time observation only. Kernel-to-operator "
+            "ownership is decided after capture from runtime evidence."),
+        "operator_targets": operators,
+        "callable_targets": callables,
+    }
+
+
 def capture(setup_path, capture_plan_path, out_dir, phases=None,
             forwards_per_bucket=1):
     with open(setup_path) as fh:
@@ -343,11 +405,15 @@ def capture(setup_path, capture_plan_path, out_dir, phases=None,
 
     os.makedirs(out_dir, exist_ok=True)
     shape_log = os.path.join(out_dir, "shape.jsonl")
+    operator_schema_manifest = os.path.join(
+        out_dir, "operator_schema_manifest.json")
+    operator_probe_plan_path = os.path.join(
+        out_dir, "OPERATOR_PROBE_PLAN.json")
     graph_capture_trace = os.path.join(
         out_dir, "graph_capture-TP-{rank}.trace.json")
     benchmark_log = os.path.join(out_dir, "benchmark.log")
     pgid_path = os.path.join(out_dir, "server.pgid")
-    for path in (shape_log,):
+    for path in (shape_log, operator_schema_manifest):
         if os.path.exists(path):
             os.remove(path)
 
@@ -374,12 +440,23 @@ def capture(setup_path, capture_plan_path, out_dir, phases=None,
         extra_server_args = (
             extra_server_args + " --enable-profile-cuda-graph").strip()
     extra_env = str(setup.get("extra_env", "")).strip()
-    callable_targets = list(setup.get("callable_targets", []))
+    probe_plan = _normalized_probe_plan(setup, plan, setup_path)
+    callable_targets = [
+        item["callable"] for item in probe_plan["callable_targets"]]
+    operator_targets = [
+        item["operator"] for item in probe_plan["operator_targets"]]
     # V-absorb uses a functional BMM, so nn.Module hooks only expose the broad
     # self-attention wrapper. Probe torch.bmm during graph construction; logging
     # remains restricted to selected layers and capture buckets.
     if decode_requested and "torch:bmm" not in callable_targets:
         callable_targets.append("torch:bmm")
+        probe_plan["callable_targets"].append({
+            "callable": "torch:bmm",
+            "evidence": "generic_decode_functional_bmm_probe",
+            "mapping_claim": "none",
+        })
+    with open(operator_probe_plan_path, "w") as fh:
+        json.dump(probe_plan, fh, indent=2, sort_keys=True)
     command = """
 set -e
 export GEAK_SEMANTICS_CAPTURE=1
@@ -390,6 +467,8 @@ export GEAK_SEMANTICS_PHASES=%s
 export GEAK_SEMANTICS_LAYER_SCOPES=1
 export GEAK_SEMANTICS_FORWARDS_PER_BUCKET=%s
 export GEAK_SEMANTICS_CALLABLE_TARGETS=%s
+export GEAK_SEMANTICS_OPERATOR_TARGETS=%s
+export GEAK_SEMANTICS_OPERATOR_SCHEMA_MANIFEST=%s
 export GEAK_SEMANTICS_REQUIRE_PROFILER=0
 export GEAK_SEMANTICS_GRAPH_CAPTURE_TRACE=%s
 export EXTRA_SERVER_ARGS=%s
@@ -428,6 +507,8 @@ wait "$geak_wrapper"
         shape_log, ",".join(str(layer) for layer in layers),
         ",".join(phases or []), forwards_per_bucket,
         ",".join(callable_targets),
+        ",".join(operator_targets),
+        operator_schema_manifest,
         graph_capture_trace,
         shlex.quote(extra_server_args), shlex.quote(extra_env),
         int(setup.get("repeats", 1)),
@@ -483,6 +564,11 @@ wait "$geak_wrapper"
         raise RuntimeError(
             "GEAK runtime capture trace is missing: %s (see %s)" %
             (trace, benchmark_log))
+    if (not os.path.exists(operator_schema_manifest)
+            or os.path.getsize(operator_schema_manifest) == 0):
+        raise RuntimeError(
+            "GEAK runtime capture produced no operator schema manifest: %s "
+            "(see %s)" % (operator_schema_manifest, benchmark_log))
     result = {
         "schema_version": 1,
         "status": "pass",
@@ -497,6 +583,9 @@ wait "$geak_wrapper"
         "all_main_layer_scopes": True,
         "workload": workload,
         "callable_targets": callable_targets,
+        "operator_targets": operator_targets,
+        "operator_probe_plan": operator_probe_plan_path,
+        "operator_schema_manifest": operator_schema_manifest,
         "callable_kernel_map": list(
             setup.get("callable_kernel_map", [])),
         "source_wrapper_map": list(

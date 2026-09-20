@@ -45,6 +45,123 @@ def _integer(value, default=-1):
         return default
 
 
+def _load_schema_manifest(path):
+    if not path or not os.path.exists(path):
+        return None
+    with open(path) as fh:
+        return json.load(fh)
+
+
+def _schema_index(manifest):
+    result = collections.defaultdict(list)
+    for schema in (manifest or {}).get("schemas", []):
+        name = str(schema.get("name") or "")
+        qualified = str(schema.get("qualified_name") or "")
+        if name:
+            result[name].append(schema)
+        if qualified and qualified != name:
+            result[qualified].append(schema)
+    return result
+
+
+def _schema_type_is_tensor(value):
+    return "tensor" in str(value or "").lower()
+
+
+def _schema_score(schema, dims, types):
+    arguments = schema.get("arguments") or []
+    observed_count = max(len(dims), len(types))
+    required_count = sum(
+        not bool(argument.get("has_default"))
+        for argument in arguments)
+    if observed_count < required_count or observed_count > len(arguments):
+        return None
+    score = 0
+    if observed_count == len(arguments):
+        score += 20
+    score -= len(arguments) - observed_count
+    scalar_names = {
+        "bool", "int", "int64", "int64_t", "long", "long int",
+        "float", "double", "str", "string", "device", "layout",
+        "scalar", "symint", "none",
+    }
+    for index in range(observed_count):
+        dim = dims[index] if index < len(dims) else []
+        observed_type = str(
+            types[index] if index < len(types) else "").strip().lower()
+        tensor_argument = _schema_type_is_tensor(
+            arguments[index].get("type"))
+        if isinstance(dim, list) and dim:
+            if not tensor_argument:
+                return None
+            score += 4
+        elif observed_type:
+            scalar_type = observed_type in scalar_names
+            if tensor_argument and not scalar_type:
+                score += 2
+            elif not tensor_argument and scalar_type:
+                score += 2
+    return score
+
+
+def _resolve_operator_schema(op_name, dims, types, schema_by_name):
+    candidates = list(schema_by_name.get(str(op_name or ""), []))
+    if not candidates:
+        return {
+            "status": "not_registered",
+            "operator": op_name,
+            "candidate_count": 0,
+            "schema": None,
+        }
+    scored = []
+    for schema in candidates:
+        score = _schema_score(schema, dims, types)
+        if score is not None:
+            scored.append((score, schema))
+    if not scored:
+        return {
+            "status": "no_compatible_schema",
+            "operator": op_name,
+            "candidate_count": len(candidates),
+            "schema": None,
+        }
+    best_score = max(score for score, _ in scored)
+    best = [schema for score, schema in scored if score == best_score]
+    if len(best) != 1:
+        return {
+            "status": "ambiguous",
+            "operator": op_name,
+            "candidate_count": len(best),
+            "compatible_schema_count": len(scored),
+            "schema": None,
+            "candidate_schemas": [
+                schema.get("schema") for schema in best[:8]],
+        }
+    return {
+        "status": "matched_unique",
+        "operator": op_name,
+        "candidate_count": 1,
+        "compatible_schema_count": len(scored),
+        "match_rule": (
+            "unique registered schema compatible with observed argument "
+            "count and tensor/scalar positions"),
+        "schema": best[0],
+    }
+
+
+def _raw_operands(dims, types, strides=None):
+    strides = strides or []
+    count = max(len(dims), len(types), len(strides))
+    return [
+        {
+            "arg_index": index,
+            "shape": dims[index] if index < len(dims) else None,
+            "dtype": types[index] if index < len(types) else None,
+            "stride": strides[index] if index < len(strides) else None,
+        }
+        for index in range(count)]
+
+
 def _kernel_key(name):
     value = str(name or "")
     value = re.sub(r"GRID_MN_\d+", "GRID_MN_*", value)
@@ -52,8 +169,9 @@ def _kernel_key(name):
     return value
 
 
-def _runtime_entries(events):
+def _runtime_entries(events, schema_manifest=None):
     markers = []
+    schema_by_name = _schema_index(schema_manifest)
     device_by_correlation = {}
     cpu_shapes_by_external_id = collections.defaultdict(list)
     runtime_launch_count_by_external_id = collections.Counter()
@@ -86,12 +204,23 @@ def _runtime_entries(events):
             input_dims = args.get("Input Dims") or []
             if external_id is not None and any(
                     isinstance(dim, list) and dim for dim in input_dims):
+                input_types = args.get("Input type") or []
+                input_strides = args.get("Input Strides") or []
+                schema_resolution = _resolve_operator_schema(
+                    name, input_dims, input_types, schema_by_name)
                 cpu_shapes_by_external_id[external_id].append({
                     "op_name": name,
                     "external_id": external_id,
                     "cpu_event_index": index,
                     "input_dims": input_dims,
-                    "input_types": args.get("Input type") or [],
+                    "input_types": input_types,
+                    "input_strides": input_strides,
+                    "raw_operands": _raw_operands(
+                        input_dims, input_types, input_strides),
+                    "operator_schema_resolution": {
+                        key: value for key, value in schema_resolution.items()
+                        if key != "schema"},
+                    "operator_schema": schema_resolution.get("schema"),
                 })
         if event.get("cat") in RUNTIME_CATEGORIES:
             external_id = args.get("External id")
@@ -828,12 +957,14 @@ def _apply_shape_log_region_fallback(targets, shape_log_path):
 def map_plan(
         plan_path, capture_trace_path, out_path, shape_log_path="",
         callable_kernel_map=None, source_wrapper_map=None,
-        clean_table_path="", required_phases=None):
+        clean_table_path="", required_phases=None,
+        operator_schema_manifest_path=""):
     with open(plan_path) as fh:
         plan = json.load(fh)
     _annotate_decode_semantic_regions(plan.get("capture_targets", []))
     events = _load(capture_trace_path)
-    markers, entries = _runtime_entries(events)
+    schema_manifest = _load_schema_manifest(operator_schema_manifest_path)
+    markers, entries = _runtime_entries(events, schema_manifest)
     marker_launch_counts = collections.Counter(
         entry["marker"]["op_instance_id"] for entry in entries)
 
@@ -996,6 +1127,11 @@ def map_plan(
     kernel_trace_shape_matched = sum(
         bool(target.get("kernel_trace_shape"))
         for target in plan.get("capture_targets", []))
+    operator_schema_statuses = collections.Counter(
+        (target.get("kernel_trace_shape") or {}).get(
+            "operator_schema_resolution", {}).get("status", "unavailable")
+        for target in plan.get("capture_targets", [])
+        if target.get("kernel_trace_shape"))
     matched = statuses.count("matched")
     ambiguous = statuses.count("ambiguous_count")
     unmatched = statuses.count("not_found")
@@ -1047,6 +1183,11 @@ def map_plan(
         "matched_target_count": matched,
         "kernel_trace_shape_matched_target_count": (
             kernel_trace_shape_matched),
+        "operator_schema_manifest": (
+            os.path.abspath(operator_schema_manifest_path)
+            if operator_schema_manifest_path else None),
+        "operator_schema_resolution_counts": dict(sorted(
+            operator_schema_statuses.items())),
         "source_callable_matched_target_count": source_callable_matched,
         "vabsorb_probe_matched_target_count": vabsorb_probe_matched,
         "shape_log_region_fallback_matched_target_count": (
@@ -1077,6 +1218,9 @@ def map_plan(
             for bucket, marker_ids in bucket_marker_ids.items()
         },
     }
+    if operator_schema_manifest_path:
+        plan["operator_schema_manifest"] = os.path.abspath(
+            operator_schema_manifest_path)
     with open(out_path, "w") as fh:
         json.dump(plan, fh, indent=2)
     return plan["runtime_marker_mapping"]
@@ -1096,13 +1240,15 @@ def main():
     parser.add_argument(
         "--phase", action="append", default=[],
         help="phase required from this capture; repeat for multiple phases")
+    parser.add_argument("--operator-schema-manifest", default="")
     parser.add_argument("--result-json", default="")
     args = parser.parse_args()
     result = map_plan(
         args.capture_plan, args.capture_trace, args.out,
         shape_log_path=args.shape_log,
         clean_table_path=args.clean_table,
-        required_phases=args.phase)
+        required_phases=args.phase,
+        operator_schema_manifest_path=args.operator_schema_manifest)
     if args.result_json:
         with open(args.result_json, "w") as fh:
             json.dump(result, fh, indent=2)

@@ -14,8 +14,9 @@ class _Logger(object):
     def __init__(self):
         self.calls = []
 
-    def begin_callable(self, target):
-        self.calls.append(("begin", target))
+    def begin_callable(self, target, args, kwargs, callable_obj):
+        self.calls.append((
+            "begin", target, tuple(args), dict(kwargs), callable_obj))
         return target
 
     def end_callable(self, entry, args, kwargs, output):
@@ -90,8 +91,53 @@ class SemanticRuntimeCaptureTest(unittest.TestCase):
                 mock.patch.object(capture, "get_logger", return_value=logger):
             capture._install_callable_probes()
             self.assertEqual(module.launcher(4), 5)
-        self.assertEqual(logger.calls[0], ("begin", "pkg.mod:launcher"))
+        self.assertEqual(logger.calls[0][0:3], (
+            "begin", "pkg.mod:launcher", (4,)))
         self.assertEqual(logger.calls[1][-1], 5)
+
+    def test_dispatcher_schema_record_preserves_argument_names_and_mutation(self):
+        class Alias(object):
+            is_write = True
+            before_set = {"a"}
+            after_set = {"a"}
+
+            def __str__(self):
+                return "Tensor(a!)"
+
+        class Argument(object):
+            def __init__(self, name, value_type, default=False, alias=None):
+                self.name = name
+                self.type = value_type
+                self.kwarg_only = False
+                self.default_value = None
+                self.alias_info = alias
+                self._default = default
+
+            def has_default_value(self):
+                return self._default
+
+        class Schema(object):
+            name = "custom::quant"
+            overload_name = ""
+            arguments = [
+                Argument("out", "Tensor", alias=Alias()),
+                Argument("input", "Tensor"),
+                Argument("scale", "Tensor"),
+                Argument("shuffle", "bool", default=True),
+            ]
+            returns = []
+
+            def __str__(self):
+                return "custom::quant(Tensor(a!) out, Tensor input, Tensor scale, bool shuffle=False) -> ()"
+
+        record = capture._schema_record(Schema())
+        self.assertEqual(record["name"], "custom::quant")
+        self.assertEqual(
+            [argument["name"] for argument in record["arguments"]],
+            ["out", "input", "scale", "shuffle"])
+        self.assertTrue(
+            record["arguments"][0]["alias_info"]["is_write"])
+        self.assertTrue(record["arguments"][3]["has_default"])
 
 
 if __name__ == "__main__":

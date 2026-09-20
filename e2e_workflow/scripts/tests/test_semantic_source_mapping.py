@@ -57,6 +57,28 @@ class SemanticSourceMappingTest(unittest.TestCase):
                 target = json.load(fh)["capture_targets"][0]
             self.assertEqual(target["source_mapping_status"], "not_found")
 
+    def test_explicit_dispatcher_calls_become_observation_targets_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "runtime.py")
+            with open(source, "w") as fh:
+                fh.write(
+                    "def launch(out, x):\n"
+                    "    return torch.ops.aiter.quant(out, x)\n"
+                    "CUSTOM = 'sglang::store_cache'\n")
+            plan = os.path.join(tmp, "plan.json")
+            with open(plan, "w") as fh:
+                json.dump({"capture_targets": []}, fh)
+            out = os.path.join(tmp, "mapped.json")
+            summary = source_mapping.map_plan(plan, [source], out)
+            self.assertEqual(summary["operator_probe_target_count"], 2)
+            with open(out) as fh:
+                probe = json.load(fh)["operator_probe_plan"]
+            self.assertEqual(probe["status"], "observational_prior_only")
+            self.assertEqual(probe["mapping_claim"], "none")
+            self.assertEqual(
+                [item["operator"] for item in probe["operator_targets"]],
+                ["aiter::quant", "sglang::store_cache"])
+
 
 if __name__ == "__main__":
     unittest.main()

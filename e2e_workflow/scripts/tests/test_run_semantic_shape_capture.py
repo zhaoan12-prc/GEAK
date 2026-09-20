@@ -145,6 +145,9 @@ class DecodeProbeTest(unittest.TestCase):
                 with open(os.path.join(
                         out_dir, "graph_capture-TP-0.trace.json"), "w") as fh:
                     json.dump({"traceEvents": []}, fh)
+                with open(os.path.join(
+                        out_dir, "operator_schema_manifest.json"), "w") as fh:
+                    json.dump({"schemas": []}, fh)
             with mock.patch.object(capture, "_assert_port_free"), \
                     mock.patch.object(capture, "_deploy"), \
                     mock.patch.object(capture, "_restore") as restore, \
@@ -159,6 +162,8 @@ class DecodeProbeTest(unittest.TestCase):
             self.assertNotIn("--disable-cuda-graph", command)
             self.assertIn("GEAK_SEMANTICS_REQUIRE_PROFILER=0", command)
             self.assertIn("GEAK_SEMANTICS_LAYER_SCOPES=1", command)
+            self.assertIn(
+                "GEAK_SEMANTICS_OPERATOR_SCHEMA_MANIFEST=", command)
             self.assertIn("export PROFILE=0", command)
             self.assertIn("export GPU=0,1,2,3,4,5,6,7", command)
             self.assertIn(
@@ -171,6 +176,10 @@ class DecodeProbeTest(unittest.TestCase):
             self.assertEqual(
                 result["capture_trace"],
                 os.path.join(out_dir, "graph_capture-TP-0.trace.json"))
+            self.assertEqual(
+                result["operator_schema_manifest"],
+                os.path.join(out_dir, "operator_schema_manifest.json"))
+            self.assertTrue(os.path.exists(result["operator_probe_plan"]))
             self.assertNotIn("clean_traces_by_phase", result)
             self.assertNotIn("capture_traces_by_phase", result)
             restore.assert_called_once_with(
@@ -223,6 +232,9 @@ class DecodeProbeTest(unittest.TestCase):
                     fh.write(json.dumps({"phase": "decode"}) + "\n")
                 with open(os.path.join(out_dir, "graph_capture-TP-0.trace.json"), "w") as fh:
                     json.dump({"traceEvents": []}, fh)
+                with open(os.path.join(
+                        out_dir, "operator_schema_manifest.json"), "w") as fh:
+                    json.dump({"schemas": []}, fh)
                 return mock.Mock(returncode=0)
 
             with mock.patch.object(capture, "_free_local_port", return_value=32123), \

@@ -105,7 +105,15 @@ result is still subject to the KernelFusion `status=pass` gate above.
 2. Validate `SHAPE_CAPTURE_SETUP` supplies the current container/image setup, model, official
    benchmark, port, TP, and optional reversible deploy/sweep scripts. Create a new attempt directory;
    never overwrite a previous shape log.
-3. Run one graph-construction replay after the initial Clean Trace table exists, with rank 0,
+3. **Before the replay**, inspect the actual imported runtime source and the unresolved Shape
+   capture targets. Emit `OPERATOR_PROBE_PLAN.agent.json` and reference it from
+   `SHAPE_CAPTURE_SETUP.operator_probe_plan`. List every explicit dispatcher operator or Python
+   callable that is plausibly on those source paths, with source file/line/symbol evidence. This is
+   an observation prior, not a Kernel mapping: set `status=observational_prior_only` and
+   `mapping_claim=none`. Never turn a Kernel-name resemblance, stage label, model name, or expected
+   architecture into a claimed operator. Missing a target here must not prevent post-capture
+   discovery from the actual trace and registered dispatcher schemas.
+4. Run one graph-construction replay after the initial Clean Trace table exists, with rank 0,
    metadata-only logging, stdout disabled, and at most one matching forward per selected bucket. Use
    `run_semantic_shape_capture.py`. It emits two deliberately separate evidence channels:
    - one lightweight `GEAK_LAYER_SCOPE` range for **every** main decoder layer, containing no Tensor
@@ -113,8 +121,11 @@ result is still subject to the KernelFusion `status=pass` gate above.
    - detailed Shape/op markers only for representative layers.
    Keep the normal workload profiler disabled; the already-captured Clean Trace remains the only
    timing source. Capture every required phase even when the initial table is missing one of them.
-   Do not capture or use an enforce-eager Decode trace.
-4. Before Shape merge, run `semantic_layer_boundary_transfer.py` against the graph-construction trace
+   Do not capture or use an enforce-eager Decode trace. The replay must also emit
+   `operator_schema_manifest.json` after model/runtime registration. This complete dispatcher
+   inventory is post-capture evidence; it may resolve an actually observed CPU operator even when
+   the pre-capture prior omitted it.
+5. Before Shape merge, run `semantic_layer_boundary_transfer.py` against the graph-construction trace
    and the original Clean Trace. A transfer is authoritative only when:
    - the donor contains a complete non-empty marker pass in exact layer order `0..N-1`;
    - phase and workload bucket agree; and
@@ -131,15 +142,15 @@ result is still subject to the KernelFusion `status=pass` gate above.
    copied. If neither exact full matching nor the strict projection yields one unique result, keep the
    phase unresolved. Never fall back to LCS/edit-distance similarity, stage recurrence,
    attention/GEMM/MoE anchors, proportional cuts, or best-effort sequence alignment.
-5. Re-run `semantic_kernel_mapping.py --layer-boundary-map <map>` on the original Clean Trace, then
+6. Re-run `semantic_kernel_mapping.py --layer-boundary-map <map>` on the original Clean Trace, then
    regenerate `SHAPE_CAPTURE_PLAN.json`. Only this rebuilt authoritative table may receive Shape
    evidence. Filter detailed logging at the source to representative layers and unresolved/candidate
    OPs plus their necessary parent wrappers. Do not record Tensor values or synchronize the device.
-6. Inspect the actual imported runtime source for every unresolved target. Populate candidate
+7. Re-check the actual imported runtime source for every still-unresolved target. Populate candidate
    `op_path`, wrapper, terminal launcher, source file/line, and mapping cardinality before merging.
    A wrapper launching multiple internal Kernels is `contained_kernel`, not multiple fabricated exact
    OPs. Native AITER GEMM may use wrapper input plus real weight/scale metadata for a P-context M/K/N.
-7. Run:
+8. Run:
 
    ```bash
    python3 "$SKILL_DIR/scripts/semantic_shape_merge.py" \
@@ -150,7 +161,7 @@ result is still subject to the KernelFusion `status=pass` gate above.
      --result-json "$EVAL_DIR/profile/round_${ROUND}/semantics_1_2/shape_merge_result.json"
    ```
 
-8. Verify the merged table has exactly the same row IDs, raw names, order, counts, and durations as
+9. Verify the merged table has exactly the same row IDs, raw names, order, counts, and durations as
    the Clean Trace table. Return Shape evidence as K/P/C/U; every P/C/U needs an auditable reason.
    Shape may remain partial without invalidating Kernel completeness.
 
@@ -162,6 +173,15 @@ result is still subject to the KernelFusion `status=pass` gate above.
    Cross-trace graph-capture evidence remains `P`, even when the marker-to-kernel containment is exact.
    Reject the transfer when the capture and Clean Trace layer Kernel sequences cannot be reconciled;
    never repair a mismatch by kernel-name guessing.
+
+   For every one-to-one graph-capture CPU-op → GPU-launch match, preserve raw profiler operands and
+   resolve the observed operator against `operator_schema_manifest.json`. Publish the unique schema,
+   exact argument names, Tensor shape/dtype/stride, alias/mutability metadata, semantic role, and role
+   evidence in structured JSON. Retain compatibility `input_dims`/`input_types`. If overload
+   resolution is absent or ambiguous, keep `arg_N` and record the reason; never assign
+   input/weight/output roles from the row's stage. Targeted Python callables must snapshot named input
+   metadata before invocation and output metadata after invocation so in-place calls cannot rewrite
+   the recorded input state.
 
    The Role owns semantic judgment: decide which axis is the batch/token axis and record the evidence
    rule. The merge script owns every numeric substitution and its audit trail. It must preserve

@@ -10,6 +10,7 @@ import json
 import functools
 import importlib
 import contextlib
+import inspect
 import os
 import re
 import sys
@@ -25,6 +26,7 @@ _LOGGER = None
 _INSTALLED_CLASSES = set()
 _PATCHED_CALLABLES = set()
 _GRAPH_CAPTURE_PROFILER_INSTALLED = False
+_OPERATOR_SCHEMA_MANIFEST_DUMPED = False
 
 
 def _flag(name, default="0"):
@@ -80,6 +82,130 @@ def _graph_capture_trace_path(rank):
         return path.format(rank=rank)
     except (KeyError, ValueError):
         return path
+
+
+def _operator_targets():
+    return [
+        item.strip()
+        for item in os.environ.get(
+            "GEAK_SEMANTICS_OPERATOR_TARGETS", "").split(",")
+        if item.strip()]
+
+
+def _value_or_call(value, default=None):
+    if value is None:
+        return default
+    try:
+        return value() if callable(value) else value
+    except Exception:
+        return default
+
+
+def _alias_info(alias):
+    if alias is None:
+        return None
+    return {
+        "text": str(alias),
+        "is_write": bool(_value_or_call(
+            getattr(alias, "is_write", None), False)),
+        "before_set": sorted(str(item) for item in (
+            _value_or_call(getattr(alias, "before_set", None), []) or [])),
+        "after_set": sorted(str(item) for item in (
+            _value_or_call(getattr(alias, "after_set", None), []) or [])),
+    }
+
+
+def _schema_argument(argument, index):
+    has_default = bool(_value_or_call(
+        getattr(argument, "has_default_value", None), False))
+    default = getattr(argument, "default_value", None)
+    return {
+        "index": index,
+        "name": str(getattr(argument, "name", "arg_%d" % index)),
+        "type": str(getattr(argument, "type", "unknown")),
+        "kwarg_only": bool(getattr(argument, "kwarg_only", False)),
+        "has_default": has_default,
+        "default": str(default) if has_default else None,
+        "alias_info": _alias_info(getattr(argument, "alias_info", None)),
+    }
+
+
+def _schema_record(schema):
+    name = str(getattr(schema, "name", ""))
+    overload = str(getattr(schema, "overload_name", "") or "")
+    return {
+        "name": name,
+        "overload_name": overload,
+        "qualified_name": name + ("." + overload if overload else ""),
+        "schema": str(schema),
+        "arguments": [
+            _schema_argument(argument, index)
+            for index, argument in enumerate(
+                list(getattr(schema, "arguments", []) or []))],
+        "returns": [
+            _schema_argument(argument, index)
+            for index, argument in enumerate(
+                list(getattr(schema, "returns", []) or []))],
+    }
+
+
+def dump_operator_schema_manifest():
+    """Dump registered dispatcher schemas after runtime/model initialization.
+
+    The pre-capture operator target list is an observational prior only.  The
+    complete registered schema inventory is exported so operators actually
+    observed in the graph-construction trace can still be named even when the
+    prior missed them.
+    """
+    global _OPERATOR_SCHEMA_MANIFEST_DUMPED
+    if _OPERATOR_SCHEMA_MANIFEST_DUMPED:
+        return
+    path = os.environ.get(
+        "GEAK_SEMANTICS_OPERATOR_SCHEMA_MANIFEST", "")
+    if not path:
+        return
+    rank = _distributed_rank()
+    expected_rank = int(os.environ.get("GEAK_SEMANTICS_RANK", "0"))
+    if rank != expected_rank:
+        return
+    import torch
+    getter = getattr(torch._C, "_jit_get_all_schemas", None)
+    if getter is None:
+        raise RuntimeError(
+            "runtime torch does not expose _jit_get_all_schemas")
+    schemas = sorted(
+        (_schema_record(schema) for schema in getter()),
+        key=lambda item: (
+            item["name"], item["overload_name"], item["schema"]))
+    requested = sorted(set(_operator_targets()))
+    available = {item["name"] for item in schemas}
+    document = {
+        "schema_version": 1,
+        "producer": "geak.semantic_runtime_capture",
+        "rank": rank,
+        "capture_timing": "after_model_and_runtime_operator_registration",
+        "operator_targets_are_observational_prior_only": True,
+        "requested_operators": requested,
+        "requested_operator_resolution": [
+            {
+                "operator": name,
+                "registered": name in available,
+                "schema_count": sum(
+                    item["name"] == name for item in schemas),
+            }
+            for name in requested],
+        "schema_count": len(schemas),
+        "schemas": schemas,
+    }
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    temporary = "%s.tmp.%d" % (path, os.getpid())
+    with open(temporary, "w") as fh:
+        json.dump(document, fh, indent=2, sort_keys=True)
+    os.replace(temporary, path)
+    _OPERATOR_SCHEMA_MANIFEST_DUMPED = True
+    sys.stderr.write(
+        "[GEAK_SEMANTICS] exported %d operator schemas to %s\n" %
+        (len(schemas), path))
 
 
 def install_graph_capture_profiler():
@@ -438,7 +564,7 @@ class SemanticRuntimeLogger(object):
                 payload, sort_keys=True, separators=(",", ":")) + "\n")
         return output
 
-    def begin_callable(self, target):
+    def begin_callable(self, target, args, kwargs, callable_obj):
         active = self._active_modules()
         if not active:
             return None
@@ -466,6 +592,20 @@ class SemanticRuntimeLogger(object):
             record.__enter__()
         except Exception:
             record = None
+        aliases = {}
+        signature_text = None
+        binding_status = "generic_args"
+        try:
+            signature = inspect.signature(callable_obj)
+            signature_text = str(signature)
+            bound = signature.bind_partial(*args, **kwargs)
+            named_inputs = dict(bound.arguments)
+            binding_status = "inspect_signature_bind_partial"
+        except (TypeError, ValueError):
+            named_inputs = {
+                "args": args,
+                "kwargs": kwargs,
+            }
         return {
             "op_id": op_id,
             "marker": marker,
@@ -474,6 +614,13 @@ class SemanticRuntimeLogger(object):
             "layer_id": layer_id,
             "op_path": op_path,
             "target": target,
+            # Snapshot input metadata before invoking the target.  Some
+            # launchers mutate output/cache arguments in-place; reading the
+            # arguments in finally used to blur pre-call and post-call state.
+            "aliases": aliases,
+            "inputs": _metadata(named_inputs, aliases),
+            "callable_signature": signature_text,
+            "argument_binding": binding_status,
         }
 
     def end_callable(self, entry, args, kwargs, output):
@@ -484,9 +631,9 @@ class SemanticRuntimeLogger(object):
                 entry["record"].__exit__(None, None, None)
             except Exception:
                 pass
-        aliases = {}
+        aliases = entry["aliases"]
         payload = {
-            "schema": "geak.semantics_runtime.v2",
+            "schema": "geak.semantics_runtime.v3",
             "op_instance_id": entry["op_id"],
             "marker": entry["marker"],
             "rank": self.rank,
@@ -499,8 +646,11 @@ class SemanticRuntimeLogger(object):
             "op_path": entry["op_path"],
             "mapping_cardinality": "probe_required",
             "evidence_level": "targeted_launcher_probe",
-            "inputs": _metadata(args, aliases),
-            "kwargs": _metadata(kwargs, aliases),
+            "callable_signature": entry["callable_signature"],
+            "argument_binding": entry["argument_binding"],
+            "input_snapshot_timing": "before_call",
+            "inputs": entry["inputs"],
+            "kwargs": _metadata({}, aliases),
             "parameters": _metadata({}, aliases),
             "output": _metadata(output, aliases),
         }
@@ -543,7 +693,8 @@ def _install_callable_probes():
 
         @functools.wraps(original)
         def wrapped(*args, __original=original, __target=target, **kwargs):
-            entry = logger.begin_callable(__target)
+            entry = logger.begin_callable(
+                __target, args, kwargs, __original)
             output = None
             try:
                 output = __original(*args, **kwargs)
@@ -624,6 +775,7 @@ def _register_hooks(model):
 
 def install_on_model(model):
     install_graph_capture_profiler()
+    dump_operator_schema_manifest()
     logger = get_logger()
     if not logger.active():
         return model

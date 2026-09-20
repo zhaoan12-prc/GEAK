@@ -88,7 +88,16 @@ class SemanticEvidenceLedgerTest(unittest.TestCase):
                 self._row("event-2"),
             ]
             graph_rows = [dict(row) for row in clean_rows]
-            graph_rows[0]["semantic_evidence"] = {"level": "K"}
+            graph_rows[0] = json.loads(json.dumps(graph_rows[0]))
+            graph_rows[0]["semantic_evidence"] = {
+                "level": "K",
+                "operator_schema_manifest": "/capture/schemas.json"}
+            graph_rows[0]["shape"]["kernel_shape"] = {
+                "operator": "aten::mm",
+                "operator_schema_resolution": {"status": "matched_unique"},
+                "operator_schema": {"schema": "aten::mm(...)"},
+                "operands": [{"schema_name": "self", "shape": [4, 8]}],
+            }
             graph_rows[1]["semantic_evidence"] = {
                 "level": "P", "probe_scope": "wrapper",
                 "bucket_match": "exact",
@@ -133,6 +142,12 @@ class SemanticEvidenceLedgerTest(unittest.TestCase):
                 document = json.load(fh)
                 rows = document["tables"][0]["rows"]
             self.assertEqual(rows[0]["semantic_evidence"]["level"], "K")
+            self.assertEqual(
+                rows[0]["shape"]["kernel_shape"]["operands"][0]
+                ["schema_name"], "self")
+            self.assertEqual(
+                rows[0]["evidence_history"][0]["purpose"],
+                "operator_schema_enrichment_only")
             self.assertEqual(
                 rows[1]["semantic_evidence"]["probe_scope"], "wrapper")
             self.assertEqual(

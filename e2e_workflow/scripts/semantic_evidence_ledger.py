@@ -140,12 +140,53 @@ def merge(clean_table_path, probe_table_paths, out_dir):
             history = []
             if row.get("shape", {}).get("source") == "kernel_exact":
                 selected = copy.deepcopy(row)
-                selected["semantic_evidence"] = {
+                schema_candidates = []
+                for path, rows_by_id in probe_rows:
+                    candidate = rows_by_id.get(row["row_id"])
+                    if not candidate:
+                        continue
+                    candidate_evidence = candidate.get(
+                        "semantic_evidence") or {}
+                    kernel_shape = (candidate.get("shape") or {}).get(
+                        "kernel_shape")
+                    if (candidate_evidence.get("level") == "K"
+                            and kernel_shape):
+                        resolution = kernel_shape.get(
+                            "operator_schema_resolution") or {}
+                        quality = (
+                            resolution.get("status") == "matched_unique",
+                            bool(kernel_shape.get("operator_schema")),
+                            len(kernel_shape.get("operands") or []),
+                        )
+                        schema_candidates.append((
+                            quality, path, candidate, kernel_shape))
+                selected_evidence = {
                     "level": "K",
                     "status": "preserved",
                     "source": "clean_trace_external_id",
                     "evidence_origin": "trace_input_dims",
                 }
+                if schema_candidates:
+                    _, path, candidate, kernel_shape = max(
+                        schema_candidates, key=lambda item: item[0])
+                    selected.setdefault("shape", {})["kernel_shape"] = (
+                        copy.deepcopy(kernel_shape))
+                    candidate_evidence = copy.deepcopy(
+                        candidate.get("semantic_evidence") or {})
+                    selected_evidence.update({
+                        "operator_schema_manifest": candidate_evidence.get(
+                            "operator_schema_manifest"),
+                        "schema": copy.deepcopy(kernel_shape),
+                    })
+                    history.append({
+                        "probe_table": os.path.abspath(path),
+                        "level": "K",
+                        "purpose": "operator_schema_enrichment_only",
+                        "shape_source": "clean_trace_external_id",
+                        "operator_schema_resolution": kernel_shape.get(
+                            "operator_schema_resolution"),
+                    })
+                selected["semantic_evidence"] = selected_evidence
             else:
                 candidates = []
                 unavailable_attempts = []

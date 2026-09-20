@@ -92,6 +92,43 @@ def _index(paths):
     return index
 
 
+def _operator_probe_targets(source_index):
+    """Collect explicit dispatcher names before capture.
+
+    This deliberately recognizes only source spellings that already contain a
+    dispatcher namespace.  A Python helper name is not rewritten into a
+    guessed operator namespace.
+    """
+    by_operator = {}
+    patterns = (
+        (re.compile(
+            r"torch\.ops\.([A-Za-z_]\w*)\.([A-Za-z_]\w*)"),
+         lambda match: "%s::%s" % (match.group(1), match.group(2)),
+         "torch_ops_attribute"),
+        (re.compile(r"['\"]([A-Za-z_]\w*::[A-Za-z_]\w*)['\"]"),
+         lambda match: match.group(1), "qualified_operator_literal"),
+    )
+    for path, source in source_index.items():
+        for number, line in enumerate(source["lines"], 1):
+            for pattern, formatter, method in patterns:
+                for match in pattern.finditer(line):
+                    operator = formatter(match)
+                    by_operator.setdefault(operator, []).append({
+                        "file": path,
+                        "line": number,
+                        "snippet": line.strip()[:240],
+                        "discovery_method": method,
+                    })
+    return [
+        {
+            "operator": operator,
+            "evidence": "explicit_runtime_source_spelling",
+            "source_evidence": evidence,
+            "mapping_claim": "none",
+        }
+        for operator, evidence in sorted(by_operator.items())]
+
+
 def map_plan(plan_path, runtime_sources, out_path):
     with open(plan_path) as fh:
         plan = json.load(fh)
@@ -135,6 +172,32 @@ def map_plan(plan_path, runtime_sources, out_path):
             target["source_mapping_status"] = "not_found"
     plan["runtime_source_roots"] = [
         os.path.abspath(path) for path in runtime_sources]
+    existing_probe_plan = plan.get("operator_probe_plan") or {}
+    operator_targets = list(existing_probe_plan.get(
+        "operator_targets", []))
+    operator_targets.extend(_operator_probe_targets(source_index))
+    unique_targets = []
+    seen_operators = set()
+    for target in operator_targets:
+        name = (
+            target.get("operator") if isinstance(target, dict)
+            else str(target))
+        if not name or name in seen_operators:
+            continue
+        seen_operators.add(name)
+        unique_targets.append(target)
+    plan["operator_probe_plan"] = {
+        "schema_version": 1,
+        "producer": "semantics_mapper_pre_capture_source_scan",
+        "status": "observational_prior_only",
+        "mapping_claim": "none",
+        "operator_targets": unique_targets,
+        "callable_targets": list(existing_probe_plan.get(
+            "callable_targets", [])),
+        "note": (
+            "Explicit runtime-source operator spellings are observation "
+            "targets only; they do not establish Kernel ownership."),
+    }
     plan["source_mapping_summary"] = {
         "target_count": len(plan.get("capture_targets", [])),
         "with_source_candidate": sum(
@@ -144,6 +207,7 @@ def map_plan(plan_path, runtime_sources, out_path):
             1 for target in plan.get("capture_targets", [])
             if target.get("source_mapping_status") ==
             "unique_wrapper_candidate"),
+        "operator_probe_target_count": len(unique_targets),
     }
     with open(out_path, "w") as fh:
         json.dump(plan, fh, indent=2)

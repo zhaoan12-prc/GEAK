@@ -147,6 +147,25 @@ def _fmt_types(types):
     return _esc(",".join(str(t).replace("c10::", "") or "·" for t in types))
 
 
+def _fmt_named_operands(operands):
+    """Render schema-backed tensor operands without replacing raw dimensions."""
+    values = []
+    for operand in operands or []:
+        shape = operand.get("shape")
+        if not isinstance(shape, list) or not shape:
+            continue
+        name = operand.get("schema_name") or (
+            "arg_%s" % operand.get("arg_index", "?"))
+        dtype = str(operand.get("dtype") or "Tensor").replace("c10::", "")
+        direction = str(operand.get("direction") or "unresolved")
+        suffix = "{%s}" % direction if direction not in (
+            "input", "output") else ""
+        values.append("%s%s=%s[%s]" % (
+            name, suffix, dtype,
+            "×".join(str(value) for value in shape)))
+    return _esc("; ".join(values)) if values else "—"
+
+
 def build(table_path, helper_floor=5.0, top_rows=8):
     table = _load(table_path)
     measured = _measure_phases(table)
@@ -213,7 +232,9 @@ def build(table_path, helper_floor=5.0, top_rows=8):
                  "provider": r.get("provider"),
                  "shape_source": (r.get("shape") or {}).get("source"),
                  "input_dims": (r.get("shape") or {}).get("input_dims"),
-                 "input_types": (r.get("shape") or {}).get("input_types")}
+                 "input_types": (r.get("shape") or {}).get("input_types"),
+                 "named_operands": (((r.get("shape") or {}).get(
+                     "kernel_shape") or {}).get("operands") or [])}
                 for r in sorted(rows, key=_row_order)],
         })
 
@@ -366,21 +387,23 @@ def render_markdown(rep):
             lines.append(
                 "这一层的**全部 %d 行**，按 trace 顺序（`pos`），donor 行也在内。"
                 "`input_dims` / `dtypes` 是 trace 里量到的原文，"
+                "`具名 operands` 只在 operator schema 唯一匹配时显示参数名；"
                 "**下游构造融合参考侧和单侧 microbench 时必须从这里抄，不要从配置字段拼**。%s"
                 % (len(detail),
                    ("其中 **%d 行没有解出 shape**（`—`）——它们对下游是盲区。"
                     % len(unresolved)) if unresolved else "全部 %d 行都解出了 shape。" % len(detail)))
             lines.append("")
-            lines.append("| pos | row | stage | kernel | 算子 | µs/层 | input_dims | dtypes |")
-            lines.append("|---:|---|---|---|---|---:|---|---|")
+            lines.append("| pos | row | stage | kernel | 算子 | µs/层 | input_dims | dtypes | 具名 operands |")
+            lines.append("|---:|---|---|---|---|---:|---|---|---|")
             for r in detail:
                 mark = " *(donor)*" if r.get("donor") else ""
-                lines.append("| %s | `%s` | %s%s | `%s` | `%s` | %.2f | %s | %s |" % (
+                lines.append("| %s | `%s` | %s%s | `%s` | `%s` | %.2f | %s | %s | %s |" % (
                     _esc(r.get("pos")), _esc(r.get("row_id")),
                     _esc(r.get("stage")), mark,
                     _esc(r.get("short_name")), _esc(_op_name(r.get("parent_operator"))),
                     r.get("duration_us") or 0.0,
-                    _fmt_dims(r.get("input_dims")), _fmt_types(r.get("input_types"))))
+                    _fmt_dims(r.get("input_dims")), _fmt_types(r.get("input_types")),
+                    _fmt_named_operands(r.get("named_operands"))))
             lines.append("")
 
     lines.append("## 4. 可融合面：fusible regions")

@@ -185,6 +185,22 @@ class SemanticReportTest(unittest.TestCase):
         self.assertEqual(rep["trace_paths"], ["/t/trace.json"])
         self.assertIn("abc123", md)
 
+    def test_unique_operator_schema_names_are_visible_beside_raw_dims(self):
+        row = _row("q", "quant", 6.0, dims=[[4, 8], [4, 1]])
+        row["shape"]["input_types"] = ["c10::Float8_e4m3fnuz", "float"]
+        row["shape"]["kernel_shape"] = {"operands": [
+            {"arg_index": 0, "schema_name": "out", "direction": "output",
+             "shape": [4, 8], "dtype": "c10::Float8_e4m3fnuz"},
+            {"arg_index": 1, "schema_name": "scales",
+             "direction": "mutable_unresolved", "shape": [4, 1],
+             "dtype": "float"},
+        ]}
+        rep, md = self._build(_table(rows=[row]))
+        detail = rep["patterns"][0]["row_detail"][0]
+        self.assertEqual(detail["named_operands"][0]["schema_name"], "out")
+        self.assertIn("out=Float8_e4m3fnuz[4×8]", md)
+        self.assertIn("scales{mutable_unresolved}=float[4×1]", md)
+
     def test_two_traces_both_appear(self):
         # The split prefill/decode capture is exactly the case that went unnoticed.
         rows = [_row("a", "norm", 10.0, dims=[[8, 16]])]

@@ -5,6 +5,8 @@ import json
 import os
 import re
 
+import semantic_runtime_marker_mapping as runtime_marker_mapping
+
 
 LEGACY_LOG_RE = re.compile(
     r"phase=(?P<phase>\S+).*?rank=(?P<rank>\d+).*?bs=(?P<bs>-?\d+)"
@@ -357,15 +359,95 @@ def _kernel_trace_schema(trace_shape):
     """
     dims = trace_shape.get("input_dims") or []
     types = trace_shape.get("input_types") or []
+    raw_operands = trace_shape.get("raw_operands") or [
+        {
+            "arg_index": index,
+            "shape": dims[index] if index < len(dims) else None,
+            "dtype": types[index] if index < len(types) else None,
+            "stride": None,
+        }
+        for index in range(max(len(dims), len(types)))]
+    operator_schema = trace_shape.get("operator_schema") or None
+    schema_arguments = {
+        int(argument.get("index", index)): argument
+        for index, argument in enumerate(
+            (operator_schema or {}).get("arguments", []))}
+
+    def semantic_role(name):
+        lowered = str(name or "").lower()
+        if lowered in ("out", "output", "result") or lowered.startswith(
+                ("out_", "output_")):
+            return "output"
+        if "weight" in lowered or re.match(r"^w(?:\d+)?$", lowered):
+            return "weight"
+        if "bias" in lowered:
+            return "bias"
+        if "cache" in lowered:
+            return "cache"
+        if any(token in lowered for token in (
+                "index", "indices", "offset", "position", "slot")):
+            return "index"
+        if "scale" in lowered:
+            return "scale"
+        if lowered in ("q", "query"):
+            return "query"
+        if lowered in ("k", "key"):
+            return "key"
+        if lowered in ("v", "value"):
+            return "value"
+        if lowered in ("input", "self", "x", "src", "other"):
+            return "input"
+        return "argument"
+
+    def direction(name, role, mutable):
+        lowered = str(name or "").lower()
+        if role == "output":
+            return "output"
+        if role == "cache" and mutable:
+            return "inout"
+        if lowered in ("dst", "destination") and mutable:
+            return "inout"
+        if role in (
+                "input", "weight", "bias", "index", "query", "key",
+                "value"):
+            return "input"
+        return "mutable_unresolved" if mutable else "input"
+
+    operands = []
     tensors = []
-    for index, shape in enumerate(dims):
+    for raw in raw_operands:
+        index = int(raw.get("arg_index", len(operands)))
+        shape = raw.get("shape")
+        schema_argument = schema_arguments.get(index) or {}
+        schema_name = schema_argument.get("name") or "arg_%d" % index
+        alias_info = schema_argument.get("alias_info") or {}
+        mutable = bool(alias_info.get("is_write"))
+        role = semantic_role(schema_name) if schema_argument else "unresolved"
+        operand = {
+            **raw,
+            "arg_index": index,
+            "schema_name": schema_name,
+            "schema_type": schema_argument.get("type"),
+            "schema_mutable": mutable if schema_argument else None,
+            "schema_alias_info": (
+                alias_info if schema_argument else None),
+            "semantic_role": role,
+            "direction": direction(schema_name, role, mutable)
+            if schema_argument else "unresolved",
+            "role_evidence": (
+                "operator_schema_argument_name"
+                if schema_argument else "unresolved_no_unique_schema"),
+        }
+        operands.append(operand)
         if not isinstance(shape, list) or not shape:
             continue
-        dtype = types[index] if index < len(types) else "Tensor"
+        dtype = raw.get("dtype") or (
+            types[index] if index < len(types) else "Tensor")
         tensors.append({
-            "io": "operand",
-            "tensor_path": "trace_args[%d]" % index,
-            "arg_name": "arg_%d" % index,
+            **operand,
+            "io": operand["direction"],
+            "tensor_path": "operator_args.%s" % schema_name,
+            "arg_name": schema_name,
             "trace_arg_index": index,
             "shape": list(shape),
             "logger_shape": list(shape),
@@ -376,11 +458,18 @@ def _kernel_trace_schema(trace_shape):
                 for value in shape],
         })
     return {
-        "source": "graph_capture_trace_external_id",
+        "source": trace_shape.get(
+            "source", "graph_capture_trace_external_id"),
         "operator": trace_shape.get("op_name"),
         "external_id": trace_shape.get("external_id"),
         "cpu_event_index": trace_shape.get("cpu_event_index"),
         "runtime_launch_count": trace_shape.get("runtime_launch_count"),
+        "mapping_cardinality": trace_shape.get("mapping_cardinality"),
+        "raw_operands": raw_operands,
+        "operator_schema_resolution": trace_shape.get(
+            "operator_schema_resolution"),
+        "operator_schema": operator_schema,
+        "operands": operands,
         "tensors": tensors,
         "linear_interface": None,
     }
@@ -554,7 +643,8 @@ def _layer_wrapper_role(tensor, index, output_index):
 
 def _is_output_role(role):
     return (
-        role == "y" or role.startswith("y_") or role == "dst"
+        role in ("y", "out", "output", "result")
+        or role.startswith(("y_", "out_", "output_")) or role == "dst"
         or role.startswith("wrapper_output_")
         or role.endswith("_out") or role in (
             "topk_weights", "topk_ids", "scale"))
@@ -579,6 +669,16 @@ def _shape_text(row):
     evidence = row.get("semantic_evidence", {})
     level = evidence.get("level", "U")
     if level == "K":
+        named = ((shape.get("kernel_shape") or {}).get("tensors") or [])
+        if named:
+            tensors = []
+            for tensor in named:
+                dim = tensor.get("shape") or []
+                role = tensor.get("schema_name") or tensor.get("arg_name")
+                tensors.append((role, "%s=%s[%s]" % (
+                    role, _dtype_label(tensor.get("dtype")),
+                    "×".join(str(value) for value in dim))))
+            return _semantic_shape_text("K", tensors)
         dims = shape.get("input_dims") or []
         types = shape.get("input_types") or []
         tensors = []
@@ -600,10 +700,13 @@ def _shape_text(row):
             evidence.get("wrapper_scope") == "phase_layer_wrapper")
         for index, tensor in enumerate(tensors[:12]):
             dims = tensor.get("effective_shape") or tensor.get("shape") or []
-            role = (
-                _layer_wrapper_role(tensor, index, output_index)
-                if layer_wrapper else
-                _probe_role(row, tensor, index, output_index))
+            if tensor.get("role_evidence") == "operator_schema_argument_name":
+                role = tensor.get("schema_name") or tensor.get("arg_name")
+            else:
+                role = (
+                    _layer_wrapper_role(tensor, index, output_index)
+                    if layer_wrapper else
+                    _probe_role(row, tensor, index, output_index))
             if str(tensor.get("io") or "").lower() == "output":
                 output_index += 1
             values.append((role, "%s=%s[%s]" % (
@@ -800,6 +903,12 @@ def _phase_resolution(audits, groups):
 def merge(table_path, capture_plan_path, shape_log_path, out_dir):
     table_doc = _load(table_path)
     capture_plan = _load(capture_plan_path)
+    operator_schema_manifest_path = capture_plan.get(
+        "operator_schema_manifest", "")
+    operator_schema_manifest = runtime_marker_mapping._load_schema_manifest(
+        operator_schema_manifest_path)
+    operator_schemas = runtime_marker_mapping._schema_index(
+        operator_schema_manifest)
     groups = _groups(_shape_records(shape_log_path))
     target_by_row = {
         target["row_id"]: target
@@ -874,9 +983,46 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir):
         for row in table.get("rows", []):
             original = json.loads(json.dumps(row))
             if row.get("shape", {}).get("source") == "kernel_exact":
+                raw_shape = row.get("shape") or {}
+                op_name = row.get("parent_operator")
+                if isinstance(op_name, dict):
+                    op_name = op_name.get("canonical_op")
+                dims = raw_shape.get("input_dims") or []
+                types = raw_shape.get("input_types") or []
+                strides = raw_shape.get("input_strides") or []
+                schema_resolution = (
+                    runtime_marker_mapping._resolve_operator_schema(
+                        op_name, dims, types, operator_schemas))
+                trace_shape = {
+                    "source": "clean_trace_external_id",
+                    "mapping_cardinality": "1:1",
+                    "op_name": op_name,
+                    "external_id": raw_shape.get("external_id"),
+                    "cpu_event_index": row.get("parent_operator", {}).get(
+                        "evidence_event_index")
+                    if isinstance(row.get("parent_operator"), dict) else None,
+                    "input_dims": dims,
+                    "input_types": types,
+                    "input_strides": strides,
+                    "raw_operands": runtime_marker_mapping._raw_operands(
+                        dims, types, strides),
+                    "operator_schema_resolution": {
+                        key: value for key, value in schema_resolution.items()
+                        if key != "schema"},
+                    "operator_schema": schema_resolution.get("schema"),
+                }
+                kernel_schema = _kernel_trace_schema(trace_shape)
+                row["shape"] = {
+                    **raw_shape,
+                    "kernel_shape": kernel_schema,
+                }
                 evidence = {
                     "level": "K", "status": "preserved",
                     "source": "clean_trace_external_id",
+                    "operator_schema_manifest": (
+                        os.path.abspath(operator_schema_manifest_path)
+                        if operator_schema_manifest_path else None),
+                    "schema": kernel_schema,
                 }
             else:
                 target = target_by_row.get(row["row_id"])
@@ -929,6 +1075,7 @@ def merge(table_path, capture_plan_path, shape_log_path, out_dir):
                             "input_dims") or [],
                         "input_types": kernel_trace_shape.get(
                             "input_types") or [],
+                        "kernel_shape": trace_schema,
                         "logger_schema": trace_schema,
                     }
                 else:
