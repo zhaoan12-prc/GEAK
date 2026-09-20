@@ -102,15 +102,11 @@ const TRACELENS_INPUTS = {
 };
 if (TL && Object.keys(TL).length) log(`TraceLens prior present: ${Object.keys(TL).filter(k => TL[k]).join(', ') || '(none non-null)'}.`);
 
-// ---- Kernel-fusion prior / discovery ----------------------------------------
-// A complete frozen prior (Top-K + candidates + unitside) skips discovery and goes
-// straight to KernelFusion apply-back. Otherwise discovery defaults on and produces
-// those artifacts from this run's capture. Tier A and B are gated inside
-// KernelFusion; Strategize only sees the resulting post-fusion stack.
-const FU = (A.fusion && typeof A.fusion === 'object') ? A.fusion : {};
-const suppliedFusionPriorComplete = !!(
-  FU.topk_json && FU.candidates_json && FU.unitside_json);
-const FUSION_DISCOVERY_ON = !suppliedFusionPriorComplete &&
+// ---- Kernel-fusion discovery ------------------------------------------------
+// KernelFusion owns one run-local evidence chain: Clean Trace -> Semantics ->
+// Discovery/Top-K -> Unit-side -> Apply-back.  Do not accept caller-supplied
+// candidates/Top-K/unitside artifacts as a shortcut around those gates.
+const FUSION_DISCOVERY_ON =
   String(A.fusion_discovery != null ? A.fusion_discovery : 'true') === 'true';
 // An explicitly requested discovery is a required phase: silently continuing
 // would turn "Fusion did not run" into a misleading end-to-end "no win". The
@@ -123,18 +119,11 @@ const FUSION_TOP_K = parseInt(A.fusion_top_k != null ? A.fusion_top_k : 10, 10);
 const FUSION_UNITSIDE_BUDGET = parseInt(
   A.fusion_unitside_budget != null ? A.fusion_unitside_budget : FUSION_TOP_K, 10);
 let FUSION_INPUTS = {
-  FUSION_TOPK_JSON: String(FU.topk_json || ''),
-  FUSION_CANDIDATES_JSON: String(FU.candidates_json || ''),
-  FUSION_VALIDATION_JSON: String(FU.validation_json || ''),
-  // Phase 3.0 单侧 gate: when present, only 单侧-passed fusions are nominated (see
-  // system_architect step 1e). Absent -> the Architect nominates on the Top-K alone.
-  FUSION_UNITSIDE_JSON: String(FU.unitside_json || ''),
+  FUSION_TOPK_JSON: '',
+  FUSION_CANDIDATES_JSON: '',
+  FUSION_VALIDATION_JSON: '',
+  FUSION_UNITSIDE_JSON: '',
 };
-if (FU && Object.keys(FU).length) log(`Fusion prior present: ${Object.keys(FU).filter(k => FU[k]).join(', ') || '(none non-null)'}.`);
-const fusionInputsComplete = () => !!(
-  FUSION_INPUTS.FUSION_TOPK_JSON &&
-  FUSION_INPUTS.FUSION_CANDIDATES_JSON &&
-  FUSION_INPUTS.FUSION_UNITSIDE_JSON);
 
 // ---- single-kernel pass-through: if kernel_path (and no model_path), just run the kernel layer ----
 const KERNEL_PATH = A.kernel_path || '';
@@ -3047,12 +3036,12 @@ if (want('setup')) {
 // PHASE: KernelFusion. Discovery failures are explicitly non-fatal: the formal
 // post-fusion Profile always runs next and owns the canonical Top-N.
 // ===========================================================================
-if (!FAST_MODE && (FUSION_DISCOVERY_ON || fusionInputsComplete())) {
+if (!FAST_MODE && FUSION_DISCOVERY_ON) {
   phase('KernelFusion');
   const fusionEntryTput = curTput;
-  if (fusionInputsComplete()) {
-    log('KernelFusion: complete fusion prior/state supplied; skipping capture/discovery/shape completion.');
-  } else if (FUSION_DISCOVERY_ON) {
+  // Scope all run-local discovery artifacts together. Nothing outside this
+  // block may seed Top-K or Unit-side inputs before the current capture.
+  {
     const fusionRound = 'fusion_capture';
     // Fusion needs call/module hierarchy, not the long statistical window used by
     // the native Top-N profiler. Keep this mode scoped to the dedicated sglang

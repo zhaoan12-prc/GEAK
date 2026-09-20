@@ -407,8 +407,6 @@ def map_args(
         ps_args["exec_prefix"] = str(h["exec_prefix"])
     if h.get("runtime_image") or h.get("image"):
         ps_args["runtime_image"] = str(h.get("runtime_image") or h.get("image"))
-    if isinstance(h.get("fusion"), dict):
-        ps_args["fusion"] = dict(h["fusion"])
     for key in ("fusion_discovery", "fusion_top_k", "fusion_budget",
                 "fusion_unitside_budget"):
         if h.get(key) is not None:

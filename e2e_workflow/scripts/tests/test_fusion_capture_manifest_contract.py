@@ -45,6 +45,18 @@ class FusionCaptureManifestContractTest(unittest.TestCase):
             source,
         )
 
+    def test_external_fusion_artifacts_cannot_bypass_run_local_discovery(self):
+        source = self._workflow_source()
+        self.assertNotIn("suppliedFusionPriorComplete", source)
+        self.assertNotIn("fusionInputsComplete", source)
+        self.assertNotIn("const FU =", source)
+        self.assertNotIn("(A.fusion && typeof A.fusion === 'object')", source)
+        self.assertNotIn("complete fusion prior/state supplied", source)
+        self.assertIn("if (!FAST_MODE && FUSION_DISCOVERY_ON)", source)
+        self.assertIn("FUSION_TOPK_JSON: ''", source)
+        self.assertIn("FUSION_CANDIDATES_JSON: ''", source)
+        self.assertIn("FUSION_UNITSIDE_JSON: ''", source)
+
     def test_applyback_cannot_time_out_into_a_stale_profile(self):
         source = self._workflow_source()
         self.assertIn("const FUSION_APPLY_TIMEOUT_MS", source)

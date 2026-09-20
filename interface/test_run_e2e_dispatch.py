@@ -279,9 +279,6 @@ class TestMapArgs(_RunE2ECase):
             phases="final",
             exec_prefix="docker exec geak-runtime",
             runtime_image="lmsysorg/sglang:test",
-            fusion={"topk_json": "/prior/topk.json",
-                    "candidates_json": "/prior/candidates.json",
-                    "unitside_json": "/prior/unitside.json"},
             fusion_discovery="false",
             fusion_unitside_budget=4,
             semantics_shape_capture=True,
@@ -305,7 +302,6 @@ class TestMapArgs(_RunE2ECase):
         self.assertEqual(ps["phases"], "final")
         self.assertEqual(ps["exec_prefix"], "docker exec geak-runtime")
         self.assertEqual(ps["runtime_image"], "lmsysorg/sglang:test")
-        self.assertEqual(ps["fusion"]["topk_json"], "/prior/topk.json")
         self.assertEqual(ps["fusion_discovery"], "false")
         self.assertEqual(ps["fusion_unitside_budget"], 4)
         self.assertIs(ps["semantics_shape_capture"], True)
@@ -325,6 +321,15 @@ class TestMapArgs(_RunE2ECase):
         self.assertEqual(ps["gpu_ids"], "0,1,2,3")
         self.assertEqual(ps["config_tune"], "false")
         self.assertEqual(ps["apply_to_original"], "true")
+
+    def test_legacy_fusion_prior_is_not_forwarded(self):
+        h = self._handoff(
+            fusion={"topk_json": "/prior/topk.json",
+                    "candidates_json": "/prior/candidates.json",
+                    "unitside_json": "/prior/unitside.json"},
+        )
+        ps = rx.map_args(h, timeout_s=3600)
+        self.assertNotIn("fusion", ps)
 
     def test_budget_omitted_when_unknown(self):
         """No timeout => the workflow stays budget-unaware (byte-identical to a

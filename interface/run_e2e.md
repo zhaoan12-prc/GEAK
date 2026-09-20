@@ -100,7 +100,7 @@ a ~10-15% 口径 gap. Both default to `0` (fixed) so the standalone and forwarde
 | `launch_recipe` | `launch_script` | optional |
 | `exec_prefix` | `exec_prefix` | optional command prefix for KernelFusion roles only |
 | `runtime_image` / `image` | `runtime_image` | optional image used when UnitSide must create a fresh runtime and no `exec_prefix` is supplied |
-| `fusion` / `fusion_discovery` / `fusion_*_budget` | same names | optional complete prior or discovery/budget controls; a complete topk+candidates+unitside prior short-circuits discovery |
+| `fusion_discovery` / `fusion_*_budget` | same names | optional discovery/budget controls; KernelFusion always builds its run-local Semantic, candidates, Top-K and Unit-side evidence before apply-back |
 | `semantics_shape_capture` | `semantics_shape_capture` | optional enable/disable control; KernelFusion defaults it to enabled |
 | `semantics_shape_capture_setup` | `semantics_shape_capture_setup` | structured replay contract, forwarded verbatim; must provide container, model, official benchmark, free port, TP and workload |
 | `raw_baseline_tput` | result audit metadata | pre-change session baseline; never used as the measurement-alignment signal |
