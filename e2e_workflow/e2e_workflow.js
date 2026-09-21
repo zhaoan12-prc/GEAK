@@ -3045,6 +3045,8 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
   // block may seed Top-K or Unit-side inputs before the current capture.
   {
     const fusionRound = 'fusion_capture';
+    const fusionCaptureDir = `${EVAL_DIR}/${fusionRound}`;
+    const expectedFusionManifest = `${fusionCaptureDir}/profile_trace_manifest.json`;
     // Fusion needs call/module hierarchy, not the long statistical window used by
     // the native Top-N profiler. Keep this mode scoped to the dedicated sglang
     // Fusion capture: one step per separately captured stage with Python stacks.
@@ -3057,6 +3059,10 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
       roleAgent('fusion_trace_collector', 'capture',
         'Capture only the clean production graph trace and manifest for fusion discovery; do not build Top-N.', {
           EVAL_DIR, MODEL_PATH, GPU_ID: GPU_LIST[0], WORKLOAD, ROUND: fusionRound,
+          CAPTURE_DIR: fusionCaptureDir,
+          TRACE_MANIFEST_JSON: expectedFusionManifest,
+          CAPTURE_REPEATS: 1,
+          CAPTURE_NUM_PROMPTS: Math.max(CONC * 5, CONC),
           OVERLAY_PYTHONPATH: curOverlay, EXTRA_SERVER_ARGS: curFlags,
           EXTRA_ENV: captureEnv, SKILL_DIR: WORKFLOW_DIR,
           ...FUSION_RUNTIME_INPUTS, ...TRACELENS_INPUTS,
@@ -3065,7 +3071,6 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
     // A fresh capture deterministically writes this artifact from bench_e2e.sh.
     // Keep the agent return as the preferred path, but do not discard a valid
     // capture merely because the agent timed out or omitted the path field.
-    const expectedFusionManifest = `${EVAL_DIR}/${fusionRound}/profile_trace_manifest.json`;
     const fusionTraceManifest = (fusionCapture && fusionCapture.trace_manifest_json)
       ? fusionCapture.trace_manifest_json : expectedFusionManifest;
     if (!fusionCapture || !fusionCapture.trace_manifest_json) {
