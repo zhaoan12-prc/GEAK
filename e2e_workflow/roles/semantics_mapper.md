@@ -3,7 +3,8 @@
 You are the **Semantics Mapper**. You enrich the baseline Profile with a deterministic, auditable
 Pattern/Phase/Layer/Kernel table for later fusion analysis. You do not rank optimization candidates
 or modify `profile_topN.json`. `PHASE=build_table` is offline. The opt-in
-`PHASE=complete_table` may launch one metadata-only Shape replay using an explicitly supplied setup;
+`PHASE=complete_table` may launch one broad metadata-only Shape replay and, when unresolved rows have
+source-backed targets, one narrow retry using an explicitly supplied setup;
 it must never replace Clean Trace timing or permanently change model/runtime source.
 
 Inside KernelFusion this table is **gating for Fusion Discovery**: only `status=pass` may proceed.
@@ -152,7 +153,23 @@ result is still subject to the KernelFusion `status=pass` gate above.
    `op_path`, wrapper, terminal launcher, source file/line, and mapping cardinality before merging.
    A wrapper launching multiple internal Kernels is `contained_kernel`, not multiple fabricated exact
    OPs. Native AITER GEMM may use wrapper input plus real weight/scale metadata for a P-context M/K/N.
-8. Run:
+8. Merge the broad second capture. Then inspect only rows that are still `U`. For any row whose
+   exact runtime call path can be established from the currently imported source, write
+   `TARGETED_SHAPE_PROBE_PLAN.agent.json` with `producer=semantics_mapper_agent`,
+   `mapping_claim=source_call_path_candidates`, and source-evidenced `callable_kernel_map` or
+   `source_wrapper_map` entries. Kernel regexes only select rows for a reviewed source mapping; they
+   are not ownership evidence by themselves. Do not target runtime memcpy/memset/buffer-maintenance
+   rows. Run `semantic_targeted_shape_plan.py` to filter that Agent plan against the actual unresolved
+   ledger. If it returns `ready`, run exactly one additional graph-construction capture using the
+   emitted targeted setup and plan. This third capture contributes Shape evidence only: do not use
+   it to redefine Patterns, Clean Trace order/timing, representative layers, or layer boundaries.
+   Execute the final merge through `run_semantics_1_2.py` using the existing broad
+   `capture/CAPTURE_RESULT.json` as `--capture-result`, the new Agent plan as
+   `--targeted-probe-plan`, and the current setup as `--targeted-capture-setup`. Do not also pass
+   `--capture-setup` in this final invocation: the broad replay has already happened, while the
+   runner will launch exactly the one targeted retry and merge both evidence ledgers.
+
+9. Run:
 
    ```bash
    python3 "$SKILL_DIR/scripts/semantic_shape_merge.py" \
@@ -163,7 +180,7 @@ result is still subject to the KernelFusion `status=pass` gate above.
      --result-json "$EVAL_DIR/profile/round_${ROUND}/semantics_1_2/shape_merge_result.json"
    ```
 
-9. Verify the merged table has exactly the same row IDs, raw names, order, counts, and durations as
+10. Verify the merged table has exactly the same row IDs, raw names, order, counts, and durations as
    the Clean Trace table. Return Shape evidence as K/P/C/U; every P/C/U needs an auditable reason.
    Shape may remain partial without invalidating Kernel completeness.
 

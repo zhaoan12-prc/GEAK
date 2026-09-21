@@ -13,6 +13,7 @@ import semantic_layer_boundary_transfer
 import semantic_runtime_marker_mapping
 import semantic_shape_merge
 import semantic_source_mapping
+import semantic_targeted_shape_plan
 import validate_structural_patterns
 import run_semantic_shape_capture
 
@@ -44,7 +45,8 @@ def _representative_hints(table_path):
 def run(config_path, trace_path, shape_log_path, out_dir,
         config_key="", runtime_sources=None, capture_setup_path="",
         capture_result_path="", capture_result_paths=None,
-        structural_patterns_path="", require_phases=None):
+        structural_patterns_path="", require_phases=None,
+        targeted_probe_plan_path="", targeted_capture_setup_path=""):
     os.makedirs(out_dir, exist_ok=True)
     runtime_sources = list(runtime_sources or [])
     if not structural_patterns_path:
@@ -235,6 +237,71 @@ def run(config_path, trace_path, shape_log_path, out_dir,
     merged_dir = os.path.join(out_dir, "semantics_1_2")
     merged = semantic_evidence_ledger.merge(
         phase_1_1_json, probe_tables, merged_dir)
+    targeted_shape_retry = {"status": "not_requested"}
+    if targeted_probe_plan_path:
+        runtime_probe_runs = [
+            run for run in probe_runs if run.get("kind") == "runtime_capture"]
+        if not runtime_probe_runs:
+            raise ValueError(
+                "targeted Shape retry requires a completed second runtime capture")
+        retry_setup_input = (
+            targeted_capture_setup_path or capture_setup_path)
+        if not retry_setup_input:
+            raise ValueError(
+                "targeted Shape retry requires --targeted-capture-setup "
+                "or --capture-setup")
+        retry_plan_path = os.path.join(
+            out_dir, "TARGETED_SHAPE_CAPTURE_PLAN.json")
+        retry_setup_path = os.path.join(
+            out_dir, "TARGETED_SHAPE_CAPTURE_SETUP.json")
+        targeted_shape_retry = semantic_targeted_shape_plan.build(
+            merged["semantic_table_json"],
+            runtime_probe_runs[-1]["mapped_plan"],
+            targeted_probe_plan_path, retry_setup_input,
+            runtime_sources, retry_plan_path, retry_setup_path)
+        targeted_shape_retry.update({
+            "capture_plan": retry_plan_path,
+            "capture_setup": retry_setup_path,
+        })
+        if targeted_shape_retry["status"] == "ready":
+            retry_capture = run_semantic_shape_capture.capture(
+                retry_setup_path, retry_plan_path,
+                os.path.join(out_dir, "capture_targeted"),
+                phases=targeted_shape_retry["capture_phases"])
+            retry_run_dir = os.path.join(
+                out_dir, "probe_runs", "targeted")
+            os.makedirs(retry_run_dir, exist_ok=True)
+            retry_mapped_plan = os.path.join(
+                retry_run_dir, "TARGETED_SHAPE_CAPTURE_PLAN_RUNTIME_MAPPED.json")
+            retry_mapping = semantic_runtime_marker_mapping.map_plan(
+                retry_plan_path, retry_capture["capture_trace"],
+                retry_mapped_plan, retry_capture.get("shape_log", ""),
+                retry_capture.get("callable_kernel_map", []),
+                retry_capture.get("source_wrapper_map", []),
+                clean_table_path=phase_1_1_json,
+                required_phases=retry_capture.get("capture_phases"),
+                operator_schema_manifest_path=retry_capture.get(
+                    "operator_schema_manifest", ""))
+            retry_capture["runtime_marker_mapping"] = retry_mapping
+            retry_probe = semantic_shape_merge.merge(
+                phase_1_1_json, retry_mapped_plan,
+                retry_capture["shape_log"], retry_run_dir)
+            probe_tables.append(retry_probe["semantic_table_json"])
+            probe_runs.append({
+                "kind": "targeted_runtime_capture",
+                "capture": retry_capture,
+                "mapped_plan": retry_mapped_plan,
+                "shape_merge": retry_probe,
+            })
+            capture_results.append(retry_capture)
+            merged = semantic_evidence_ledger.merge(
+                phase_1_1_json, probe_tables, merged_dir)
+            targeted_shape_retry.update({
+                "status": "completed",
+                "capture": retry_capture,
+                "runtime_marker_mapping": retry_mapping,
+                "shape_merge": retry_probe,
+            })
     published_json = os.path.join(
         out_dir, "pattern_layer_kernel_table.json")
     published_md = os.path.join(
@@ -275,10 +342,9 @@ def run(config_path, trace_path, shape_log_path, out_dir,
             for transfer in boundary_transfers
             if transfer.get("status") in ("pass", "partial")),
         "traces": [
-            os.path.abspath(capture["capture_trace"])
-            for capture in capture_results
-            if capture.get("shape_capture_execution") == "graph_capture"
-            and capture.get("capture_trace")],
+            os.path.abspath(transfer["donor"]["path"])
+            for transfer in boundary_transfers
+            if transfer.get("donor", {}).get("path")],
     }
     # --- Per-phase boundary evidence -----------------------------------------
     # `boundary_evidence` above is an AGGREGATE over the whole run: prefill's 61
@@ -335,6 +401,7 @@ def run(config_path, trace_path, shape_log_path, out_dir,
         "degraded_boundary_phases": degraded_phases,
         "blocking_degraded_boundary_phases": blocking_degraded_phases,
         "boundary_rebuild": boundary_rebuild,
+        "targeted_shape_retry": targeted_shape_retry,
         "module_scope_count": module_scope_count,
         "inputs": {
             "config": {
@@ -383,6 +450,8 @@ def main():
     parser.add_argument("--capture-result", action="append", default=[])
     parser.add_argument("--runtime-source", action="append", default=[])
     parser.add_argument("--structural-patterns", required=True)
+    parser.add_argument("--targeted-probe-plan", default="")
+    parser.add_argument("--targeted-capture-setup", default="")
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--result-json", default="")
     args = parser.parse_args()
@@ -390,7 +459,9 @@ def main():
         args.config, args.trace, args.shape_log, args.out_dir,
         args.config_key, args.runtime_source,
         args.capture_setup, capture_result_paths=args.capture_result,
-        structural_patterns_path=args.structural_patterns)
+        structural_patterns_path=args.structural_patterns,
+        targeted_probe_plan_path=args.targeted_probe_plan,
+        targeted_capture_setup_path=args.targeted_capture_setup)
     if args.result_json:
         with open(args.result_json, "w") as fh:
             json.dump(result, fh, indent=2)

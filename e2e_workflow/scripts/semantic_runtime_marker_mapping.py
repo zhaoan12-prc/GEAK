@@ -1251,13 +1251,6 @@ def map_plan(
     ambiguous = statuses.count("ambiguous_count")
     unmatched = statuses.count("not_found")
     sequence_rejected = statuses.count("clean_sequence_mismatch")
-    missing_marker_buckets = [
-        "|".join(str(value) for value in bucket)
-        for bucket, marker_ids in bucket_marker_ids.items()
-        if (not marker_ids
-            and (not required_phases or bucket[0] in required_phases)
-            and (bucket[0], bucket[1]) not in layer_fallback_keys)
-    ]
     eligibility = collections.Counter()
     eligible_targets = []
     for target in plan.get("capture_targets", []):
@@ -1266,6 +1259,35 @@ def map_plan(
             eligibility[reason] += 1
         else:
             eligible_targets.append(target)
+    source_only_covered_buckets = set()
+    for bucket, marker_ids in bucket_marker_ids.items():
+        if marker_ids:
+            continue
+        bucket_targets = [
+            target for target in plan.get("capture_targets", [])
+            if _target_bucket(target) == bucket
+            and _shape_mapping_exclusion_reason(target) is None]
+        if (bucket_targets and all(
+                target.get("runtime_marker_mapping_status") == "matched"
+                and (target.get("source_callable_evidence")
+                     or target.get("source_wrapper_evidence"))
+                for target in bucket_targets)):
+            # A targeted retry may intentionally expose only a monkeypatched
+            # source callable in the Shape log.  In that case a missing
+            # profiler range is not missing evidence: every shape-bearing row
+            # in this bucket already has a reviewed source path and an
+            # observed invocation.  This exception is deliberately narrower
+            # than the normal layer fallback and cannot assign ownership from
+            # a Kernel name alone.
+            source_only_covered_buckets.add(bucket)
+    missing_marker_buckets = [
+        "|".join(str(value) for value in bucket)
+        for bucket, marker_ids in bucket_marker_ids.items()
+        if (not marker_ids
+            and (not required_phases or bucket[0] in required_phases)
+            and (bucket[0], bucket[1]) not in layer_fallback_keys
+            and bucket not in source_only_covered_buckets)
+    ]
     eligible_matched = sum(
         target.get("runtime_marker_mapping_status") == "matched"
         for target in eligible_targets)
@@ -1327,6 +1349,9 @@ def map_plan(
         "required_phases": sorted(required_phases),
         "phase_coverage_complete": not missing_marker_buckets,
         "missing_marker_buckets": missing_marker_buckets,
+        "source_only_covered_buckets": [
+            "|".join(str(value) for value in bucket)
+            for bucket in sorted(source_only_covered_buckets)],
         "selected_forward_marker_counts": {
             "|".join(str(value) for value in bucket):
                 len(marker_ids)

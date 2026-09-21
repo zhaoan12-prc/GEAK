@@ -183,6 +183,58 @@ class RuntimeMarkerMappingTest(unittest.TestCase):
                 result["missing_marker_buckets"],
                 ["decode|1|4|0"])
 
+    def test_source_backed_targeted_probe_covers_missing_marker_bucket(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = os.path.join(tmp, "plan.json")
+            trace_path = os.path.join(tmp, "trace.json")
+            shape_log = os.path.join(tmp, "shape.jsonl")
+            out_path = os.path.join(tmp, "mapped.json")
+            target = {
+                "row_id": "event-1",
+                "phase": "prefill",
+                "representative_layer_id": 2,
+                "pos": 0,
+                "raw_name": "target_kernel",
+                "selected_bucket": {
+                    "phase": "prefill",
+                    "batch_size": 1,
+                    "input_tokens": 128,
+                },
+            }
+            with open(plan_path, "w") as fh:
+                json.dump({"capture_targets": [target]}, fh)
+            with open(trace_path, "w") as fh:
+                json.dump({"traceEvents": []}, fh)
+            with open(shape_log, "w") as fh:
+                fh.write(json.dumps({
+                    "op_type": "targeted_python_launcher",
+                    "op_instance_id": "geak-targeted-1",
+                    "op_path": (
+                        "model.layers.2.proj::launcher:pkg.mod:launch"),
+                    "phase": "prefill",
+                    "layer_id": 2,
+                }) + "\n")
+            result = mapping.map_plan(
+                plan_path, trace_path, out_path,
+                shape_log_path=shape_log,
+                callable_kernel_map=[{
+                    "kernel_pattern": "^target_kernel$",
+                    "target": "pkg.mod:launch",
+                    "scope": "kernel",
+                    "source": [{"path": "/runtime/pkg/mod.py"}],
+                }],
+                required_phases=["prefill"])
+            self.assertTrue(result["phase_coverage_complete"])
+            self.assertEqual(result["missing_marker_buckets"], [])
+            self.assertEqual(
+                result["source_only_covered_buckets"],
+                ["prefill|2|1|128"])
+            with open(out_path) as fh:
+                mapped = json.load(fh)["capture_targets"][0]
+            self.assertEqual(
+                mapped["source_mapping_status"],
+                "source_targeted_launcher_probe")
+
     def test_mapping_summary_excludes_non_shape_runtime_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
             plan_path = os.path.join(tmp, "plan.json")
