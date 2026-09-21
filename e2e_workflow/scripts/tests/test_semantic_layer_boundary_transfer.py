@@ -12,16 +12,18 @@ import semantic_layer_boundary_transfer as transfer
 
 
 class SemanticLayerBoundaryTransferTest(unittest.TestCase):
-    def _patterns(self, root):
+    def _patterns(self, root, num_layers=2):
         path = os.path.join(root, "patterns.json")
         with open(path, "w") as fh:
             json.dump({
-                "num_hidden_layers_main": 2,
+                "num_hidden_layers_main": num_layers,
                 "patterns": [{
                     "pattern_id": "P0", "pattern_display_name": "body",
-                    "layer_ids": [0, 1], "representative_candidates": [0, 1],
+                    "layer_ids": list(range(num_layers)),
+                    "representative_candidates": list(range(num_layers)),
                 }],
-                "coverage_check": {"total_main_layers": 2, "covered": 2,
+                "coverage_check": {"total_main_layers": num_layers,
+                                   "covered": num_layers,
                                    "mutually_exclusive": True,
                                    "full_coverage": True},
                 "quality": {"status": "pass"},
@@ -164,7 +166,7 @@ class SemanticLayerBoundaryTransferTest(unittest.TestCase):
                 [row["layer_id"] for row in rows[1:7]],
                 [0, 0, 1, 1, 1, 1])
 
-    def test_stable_projection_rejects_ambiguous_two_sided_gap(self):
+    def test_stable_projection_keeps_ambiguous_two_sided_gap_residual(self):
         with tempfile.TemporaryDirectory() as tmp:
             donor = self._donor(tmp, names={
                 0: ["layer0_a", "layer0_b", "capture_suffix"],
@@ -174,14 +176,35 @@ class SemanticLayerBoundaryTransferTest(unittest.TestCase):
                 "layer0_a", "layer0_b", "replay_gap",
                 "layer1_a", "layer1_b",
             ])
+            boundary = os.path.join(tmp, "boundary.json")
             result = transfer.transfer(
-                donor, recipient, self._patterns(tmp))
-            self.assertEqual(result["status"], "fail")
-            failures = result["failures"][0][
-                "stable_projection_failures"]
+                donor, recipient, self._patterns(tmp), boundary)
+            self.assertEqual(result["status"], "partial")
+            self.assertEqual(result["residual_range_count"], 1)
+            group = result["mapped_groups"][0]
             self.assertEqual(
-                failures[0]["reason"],
-                "ambiguous_unmatched_events_on_both_boundary_sides")
+                group["match_rule"],
+                "exact_equal_multiplicity_stable_identity_projection_with_residuals")
+            self.assertEqual(group["layer_ranges"], [
+                {"layer_id": 0, "start_position": 1, "end_position": 3,
+                 "representative_eligible": False},
+                {"layer_id": 1, "start_position": 4, "end_position": 6,
+                 "representative_eligible": False},
+            ])
+            self.assertEqual(
+                group["residual_ranges"][0]["recipient_gap_identities"],
+                ["replay_gap"])
+
+            built = mapping.build(
+                recipient, self._patterns(tmp), os.path.join(tmp, "out"),
+                require_phases=["decode"], boundary_map_paths=[boundary])
+            self.assertEqual(built["status"], "fail")
+            with open(built["semantic_event_audit_jsonl"]) as fh:
+                rows = [json.loads(line) for line in fh]
+            self.assertEqual(
+                [row["layer_id"] for row in rows[1:6]],
+                [0, 0, None, 1, 1])
+            self.assertEqual(rows[3]["layer_region"], "inter_layer_residual")
 
     def test_boundary_artifact_declares_auto_adopted_phase_sibling(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -206,6 +229,37 @@ class SemanticLayerBoundaryTransferTest(unittest.TestCase):
                 decode, self._patterns(tmp), os.path.join(tmp, "out"),
                 require_phases=["decode"], boundary_map_paths=[boundary])
             self.assertEqual(built["status"], "pass")
+
+    def test_residual_boundary_uses_unaffected_pattern_representative(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            names = {
+                0: ["layer0_a", "layer0_b", "capture_suffix"],
+                1: ["capture_prefix", "layer1_a", "layer1_b"],
+                2: ["layer2_a", "layer2_b"],
+                3: ["layer3_a", "layer3_b"],
+            }
+            donor = self._donor(
+                tmp, layers=(0, 1, 2, 3), names=names)
+            recipient = self._recipient(tmp, body=[
+                "layer0_a", "layer0_b", "replay_gap",
+                "layer1_a", "layer1_b",
+                "layer2_a", "layer2_b",
+                "layer3_a", "layer3_b",
+            ])
+            patterns = self._patterns(tmp, num_layers=4)
+            boundary = os.path.join(tmp, "boundary.json")
+            result = transfer.transfer(
+                donor, recipient, patterns, boundary)
+            self.assertEqual(result["status"], "partial")
+
+            built = mapping.build(
+                recipient, patterns, os.path.join(tmp, "out"),
+                require_phases=["decode"], boundary_map_paths=[boundary])
+            self.assertEqual(built["status"], "pass")
+            with open(built["semantic_table_json"]) as fh:
+                table = json.load(fh)
+            self.assertIn(
+                table["tables"][0]["representative_layer_id"], (2, 3))
 
     def test_consumer_refuses_failed_map(self):
         with tempfile.TemporaryDirectory() as tmp:

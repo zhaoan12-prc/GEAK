@@ -136,7 +136,9 @@ result is still subject to the KernelFusion `status=pass` gate above.
      sequences to be byte-for-byte equal, requires at least two stable events and two distinct stable
      identities in every layer, and requires at least 50% donor-event and recipient-body coverage.
      An unmatched internal boundary gap may be assigned only when donor markers place unmatched work
-     on one side; two-sided or otherwise unsupported gaps fail the transfer.
+     on one side. Two-sided or otherwise unsupported gaps remain explicit `transition_global`
+     residuals; their adjacent layer instances are excluded from representative selection. The phase
+     may proceed only when every `(Pattern, phase)` still has an unaffected authoritative representative.
    The transfer copies only layer cuts. Prefix preparation kernels and suffix epilogue kernels outside
    the matched body remain `transition_global`; no timestamp, duration, row, Shape, stage, or Pattern is
    copied. If neither exact full matching nor the strict projection yields one unique result, keep the

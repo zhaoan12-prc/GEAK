@@ -604,7 +604,7 @@ def _apply_boundary_map(rows, map_path, pattern_doc, trace_paths=None,
     """Apply a validated all-layer boundary artifact by step-local positions."""
     with open(map_path) as fh:
         document = json.load(fh)
-    if document.get("status") != "pass":
+    if document.get("status") not in ("pass", "partial"):
         raise ValueError(
             "refusing non-passing layer boundary map %s: %s" % (
                 map_path, document.get("failures", [])))
@@ -648,23 +648,61 @@ def _apply_boundary_map(rows, map_path, pattern_doc, trace_paths=None,
                 "recipient_sequence_sha256"):
             raise ValueError(
                 "layer boundary map sequence hash mismatch for %s" % step_id)
-        starts = [int(value) for value in group.get(
-            "layer_start_positions", [])]
-        end = int(group.get("body_end_position", -1))
-        if (len(starts) != expected or starts != sorted(starts)
-                or len(set(starts)) != len(starts)
-                or starts[0] < 0 or end > len(step_rows)
-                or end <= starts[-1]):
+        raw_ranges = group.get("layer_ranges") or []
+        if raw_ranges:
+            ranges = [{
+                "layer_id": int(item.get("layer_id", -1)),
+                "start_position": int(item.get("start_position", -1)),
+                "end_position": int(item.get("end_position", -1)),
+                "representative_eligible": bool(
+                    item.get("representative_eligible", True)),
+            } for item in raw_ranges]
+        else:
+            starts = [int(value) for value in group.get(
+                "layer_start_positions", [])]
+            end = int(group.get("body_end_position", -1))
+            ranges = [{
+                "layer_id": layer_id,
+                "start_position": start,
+                "end_position": (
+                    starts[layer_id + 1]
+                    if layer_id + 1 < len(starts) else end),
+                "representative_eligible": True,
+            } for layer_id, start in enumerate(starts)]
+        if (len(ranges) != expected
+                or [item["layer_id"] for item in ranges]
+                != list(range(expected))
+                or any(item["start_position"] < 0
+                       or item["end_position"] > len(step_rows)
+                       or item["end_position"] <= item["start_position"]
+                       for item in ranges)
+                or any(left["end_position"] > right["start_position"]
+                       for left, right in zip(ranges, ranges[1:]))):
             raise ValueError(
                 "invalid transferred layer cuts for %s" % step_id)
 
         _clear_step_layer_assignments(
             step_rows, "outside_validated_graph_capture_layer_scope")
-        for layer_id, start in enumerate(starts):
-            stop = starts[layer_id + 1] if layer_id + 1 < expected else end
-            if stop <= start:
+        for item in group.get("residual_ranges") or []:
+            start = int(item.get("start_position", -1))
+            stop = int(item.get("end_position", -1))
+            if start < 0 or stop > len(step_rows) or stop <= start:
                 raise ValueError(
-                    "empty transferred layer %d in %s" % (layer_id, step_id))
+                    "invalid transferred residual range for %s" % step_id)
+            for position in range(start, stop):
+                row = step_rows[position]
+                row["assignment"] = "transition_global"
+                row["layer_region"] = "inter_layer_residual"
+                row["layer_evidence"] = (
+                    "validated_graph_capture_inter_layer_residual")
+                row["boundary_residual"] = {
+                    "layer_boundary": item.get("layer_boundary"),
+                    "reason": item.get("reason"),
+                }
+        for item in ranges:
+            layer_id = item["layer_id"]
+            start = item["start_position"]
+            stop = item["end_position"]
             instance_id = "%s:graph-capture-donor:layer-%d" % (
                 step_id, layer_id)
             for position in range(start, stop):
@@ -677,6 +715,8 @@ def _apply_boundary_map(rows, map_path, pattern_doc, trace_paths=None,
                 row["layer_evidence"] = (
                     "validated_graph_capture_layer_scope_transfer")
                 row["layer_region"] = "layer_body"
+                row["representative_eligible"] = item[
+                    "representative_eligible"]
             step_rows[start]["boundary_role"] = "body_start_kernel"
             step_rows[stop - 1]["boundary_role"] = "end_kernel"
         applied.add(step_id)
@@ -686,12 +726,16 @@ def _apply_boundary_map(rows, map_path, pattern_doc, trace_paths=None,
             "phase": group.get("phase"),
             "batch_size": group.get("batch_size"),
             "input_tokens": group.get("input_tokens"),
-            "body_start_position": starts[0],
-            "body_end_position": end,
-            "prefix_row_count": group.get("prefix_row_count", starts[0]),
+            "body_start_position": ranges[0]["start_position"],
+            "body_end_position": ranges[-1]["end_position"],
+            "prefix_row_count": group.get(
+                "prefix_row_count", ranges[0]["start_position"]),
             "suffix_row_count": group.get(
-                "suffix_row_count", len(step_rows) - end),
+                "suffix_row_count",
+                len(step_rows) - ranges[-1]["end_position"]),
             "layer_widths": group.get("layer_widths", []),
+            "layer_ranges": ranges,
+            "residual_ranges": group.get("residual_ranges") or [],
             "match_rule": group.get("match_rule"),
         })
     return diagnostics
@@ -1023,6 +1067,8 @@ def _layer_instances(rows):
         explicit_instance = group[0].get("layer_instance_id")
         contiguous = positions == list(range(min(positions), max(positions) + 1))
         evidence_sources = sorted(set(row["layer_evidence"] for row in group))
+        representative_eligible = all(
+            row.get("representative_eligible", True) for row in group)
         boundary_complete = contiguous
         duration = sum(row["duration_us"] for row in group)
         signature = [
@@ -1048,6 +1094,7 @@ def _layer_instances(rows):
                 json.dumps(signature).encode()).hexdigest()[:16],
             "normalized_sequence": signature,
             "boundary_complete": boundary_complete,
+            "representative_eligible": representative_eligible,
             "boundary_evidence": {
                 "sources": evidence_sources,
                 "continuity": "contiguous" if contiguous else "interleaved_or_unresolved",
@@ -1055,6 +1102,7 @@ def _layer_instances(rows):
                 "end_anchor_valid": True,
                 "end_kernel": group[-1]["row_id"],
                 "end_stage": group[-1]["stage"],
+                "adjacent_to_boundary_residual": not representative_eligible,
             },
         })
     return instances
@@ -1098,7 +1146,9 @@ def _representatives(pattern_doc, instances, layer_hints=None):
     layer_hints = layer_hints or {}
     by_pattern = {}
     for instance in instances:
-        if instance["boundary_complete"] and _boundary_rank(instance) < 9:
+        if (instance["boundary_complete"]
+                and instance.get("representative_eligible", True)
+                and _boundary_rank(instance) < 9):
             by_pattern.setdefault(instance["pattern_id"], []).append(instance)
     selected = {}
     for pattern in pattern_doc.get("patterns", []):

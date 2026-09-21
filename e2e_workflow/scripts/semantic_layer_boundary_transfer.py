@@ -12,12 +12,13 @@ device sequence to occur as one exact, contiguous normalized sequence inside a
 workload-compatible Clean Trace step.  When graph construction and graph replay
 expose different backend events, it may instead use an exact stable projection:
 retain only raw identities with equal total multiplicity on both sides, require
-the complete projected sequences to be identical, require multiple distinct
-anchors in every layer and majority coverage, and assign an unmatched internal
-gap only when donor markers prove that the gap belongs to one side.  Ambiguity
-fails closed, while outer prefix/suffix work remains global.  Stage names, model
-names, attention kinds and recurring subsequences are never used to invent a
-boundary.
+the complete projected sequences to be identical, and require multiple distinct
+anchors in every layer plus majority coverage.  A one-sided unmatched internal
+gap follows the marker-proven side.  A two-sided or otherwise unsupported gap
+remains an explicit inter-layer residual: its adjacent layers stay mapped but
+cannot become representatives.  Outer prefix/suffix work remains global. Stage
+names, model names, attention kinds and recurring subsequences are never used to
+invent a boundary.
 """
 import argparse
 import bisect
@@ -366,8 +367,11 @@ def _stable_projection_map(sequence, donor, expected_layers):
             "recipient_body_fraction": round(recipient_fraction, 6),
         }
 
-    starts = [first_recipient_anchor]
+    starts = [None] * expected_layers
+    ends = [None] * expected_layers
+    starts[0] = first_recipient_anchor
     boundary_gaps = []
+    residual_ranges = []
     for layer_id in range(1, expected_layers):
         previous_last_donor = donor_anchor_positions[layer_id - 1][-1]
         current_first_donor = donor_anchor_positions[layer_id][0]
@@ -386,30 +390,66 @@ def _stable_projection_map(sequence, donor, expected_layers):
             return None, {"reason": "negative_recipient_boundary_gap"}
         if recipient_gap == 0:
             start = current_first_recipient
+            previous_end = start
             side = "none"
         elif previous_unstable_suffix and current_unstable_prefix:
-            return None, {
-                "reason": "ambiguous_unmatched_events_on_both_boundary_sides",
+            # Both marker-labelled donor layers contain boundary-local events
+            # that did not survive the strict stable projection.  The old
+            # implementation rejected the complete 0..N-1 Decode pass here,
+            # even when every layer still had a large, ordered stable core.
+            # Preserve the two proven cores and leave only the recipient gap
+            # unassigned.  The consumer records it as transition_global and
+            # prevents the adjacent instances from becoming representatives.
+            previous_end = previous_last_recipient + 1
+            start = current_first_recipient
+            side = "inter_layer_residual"
+            residual_ranges.append({
                 "layer_boundary": [layer_id - 1, layer_id],
+                "start_position": previous_end,
+                "end_position": start,
                 "previous_donor_unstable_suffix": previous_unstable_suffix,
                 "current_donor_unstable_prefix": current_unstable_prefix,
                 "recipient_unmatched_gap": recipient_gap,
-            }
+                "previous_donor_suffix_identities": donor_sequence[
+                    previous_last_donor + 1:previous_donor_stop],
+                "current_donor_prefix_identities": donor_sequence[
+                    current_donor_start:current_first_donor],
+                "recipient_gap_identities": sequence[
+                    previous_end:start],
+                "reason": "ambiguous_unmatched_events_on_both_boundary_sides",
+            })
         elif current_unstable_prefix:
             # The donor marker proves its unmatched boundary-local work is a
             # prefix of the current layer, so include the recipient gap there.
             start = previous_last_recipient + 1
+            previous_end = start
             side = "current_layer_prefix"
         elif previous_unstable_suffix:
             start = current_first_recipient
+            previous_end = start
             side = "previous_layer_suffix"
         else:
-            return None, {
-                "reason": "recipient_boundary_gap_has_no_donor_side_evidence",
+            # The gap is real production work, but neither donor layer contains
+            # a corresponding unstable edge.  Keep it explicit and global
+            # instead of fabricating ownership or deleting the whole phase.
+            previous_end = previous_last_recipient + 1
+            start = current_first_recipient
+            side = "inter_layer_residual"
+            residual_ranges.append({
                 "layer_boundary": [layer_id - 1, layer_id],
+                "start_position": previous_end,
+                "end_position": start,
+                "previous_donor_unstable_suffix": 0,
+                "current_donor_unstable_prefix": 0,
                 "recipient_unmatched_gap": recipient_gap,
-            }
-        starts.append(start)
+                "previous_donor_suffix_identities": [],
+                "current_donor_prefix_identities": [],
+                "recipient_gap_identities": sequence[
+                    previous_end:start],
+                "reason": "recipient_boundary_gap_has_no_donor_side_evidence",
+            })
+        ends[layer_id - 1] = previous_end
+        starts[layer_id] = start
         boundary_gaps.append({
             "layer_boundary": [layer_id - 1, layer_id],
             "recipient_unmatched_gap": recipient_gap,
@@ -426,11 +466,16 @@ def _stable_projection_map(sequence, donor, expected_layers):
     # postprocessing.  Keeping them global is conservative and prevents the
     # exact first/final-layer contamination this transfer is meant to remove.
     end = last_recipient_anchor + 1
-    widths = [
-        (starts[index + 1] if index + 1 < expected_layers else end)
-        - starts[index]
-        for index in range(expected_layers)
-    ]
+    ends[-1] = end
+    layer_ranges = [{
+        "layer_id": layer_id,
+        "start_position": starts[layer_id],
+        "end_position": ends[layer_id],
+        "representative_eligible": not any(
+            layer_id in item["layer_boundary"] for item in residual_ranges),
+    } for layer_id in range(expected_layers)]
+    widths = [item["end_position"] - item["start_position"]
+              for item in layer_ranges]
     if any(width <= 0 for width in widths):
         return None, {
             "reason": "non_positive_stable_projection_layer_width",
@@ -442,9 +487,14 @@ def _stable_projection_map(sequence, donor, expected_layers):
         "body_end_position": end,
         "layer_start_positions": starts,
         "layer_widths": widths,
+        "layer_ranges": layer_ranges,
+        "residual_ranges": residual_ranges,
         "prefix_row_count": starts[0],
         "suffix_row_count": len(sequence) - end,
-        "match_rule": "exact_equal_multiplicity_stable_identity_projection",
+        "match_rule": (
+            "exact_equal_multiplicity_stable_identity_projection_with_residuals"
+            if residual_ranges else
+            "exact_equal_multiplicity_stable_identity_projection"),
         "stable_projection": {
             "stable_identity_count": len(stable_identities),
             "stable_event_count": len(donor_values),
@@ -456,6 +506,7 @@ def _stable_projection_map(sequence, donor, expected_layers):
             "per_layer_anchor_identity_counts": [
                 len(values) for values in donor_anchor_identities],
             "boundary_gaps": boundary_gaps,
+            "residual_boundary_count": len(residual_ranges),
             "first_layer_donor_unstable_prefix": (
                 donor_anchor_positions[0][0] - layer_starts[0]),
             "last_layer_donor_unstable_suffix": donor_last_suffix,
@@ -514,6 +565,15 @@ def _map_step(step_rows, donor_passes, expected_layers):
             "body_end_position": end,
             "layer_start_positions": list(starts),
             "layer_widths": widths,
+            "layer_ranges": [{
+                "layer_id": layer_id,
+                "start_position": starts[layer_id],
+                "end_position": (
+                    starts[layer_id + 1]
+                    if layer_id + 1 < expected_layers else end),
+                "representative_eligible": True,
+            } for layer_id in range(expected_layers)],
+            "residual_ranges": [],
             "prefix_row_count": starts[0],
             "suffix_row_count": len(step_rows) - end,
             "donor": {
@@ -539,8 +599,9 @@ def _map_step(step_rows, donor_passes, expected_layers):
                 **(failure or {}),
             })
             continue
-        key = (tuple(stable["layer_start_positions"]),
-               stable["body_end_position"])
+        key = tuple(
+            (item["start_position"], item["end_position"])
+            for item in stable.get("layer_ranges", []))
         stable_mappings[key] = (stable, donor)
     if len(stable_mappings) != 1:
         return None, {
@@ -628,8 +689,14 @@ def transfer(donor_trace, recipient_traces, pattern_path, out_path=""):
             "marker_count": len(markers),
             "expected_layers": expected_layers,
         })
-    status = "pass" if groups and not failures else (
-        "not_needed" if skipped_authoritative and not failures else "fail")
+    has_residuals = any(
+        group.get("residual_ranges") for group in groups)
+    status = (
+        "fail" if failures or not groups else
+        "partial" if has_residuals else
+        "pass")
+    if skipped_authoritative and not groups and not failures:
+        status = "not_needed"
     document = {
         "schema_version": 2,
         "transfer": "graph_construction_main_layer_boundaries",
@@ -661,6 +728,8 @@ def transfer(donor_trace, recipient_traces, pattern_path, out_path=""):
         },
         "mapped_groups": groups,
         "mapped_step_count": len(groups),
+        "residual_range_count": sum(
+            len(group.get("residual_ranges") or []) for group in groups),
         "skipped_authoritative_steps": skipped_authoritative,
         "failures": failures,
     }
@@ -685,7 +754,8 @@ def main():
         "mapped_step_count": result["mapped_step_count"],
         "failures": result["failures"],
     }, indent=2))
-    return 0 if result["status"] in ("pass", "not_needed") else 2
+    return 0 if result["status"] in (
+        "pass", "partial", "not_needed") else 2
 
 
 if __name__ == "__main__":

@@ -89,8 +89,9 @@ class RunSemantics12Test(unittest.TestCase):
                     mock.patch.object(
                         runner.semantic_layer_boundary_transfer, "transfer",
                         return_value={
-                            "status": "pass",
+                            "status": "partial",
                             "mapped_groups": [{"phase": "decode"}],
+                            "residual_range_count": 1,
                             "failures": [],
                         }), \
                     mock.patch.object(
@@ -114,6 +115,8 @@ class RunSemantics12Test(unittest.TestCase):
             self.assertEqual(result["status"], "pass")
             self.assertEqual(
                 result["boundary_rebuild"]["verified_phases"], ["decode"])
+            self.assertEqual(
+                result["boundary_rebuild"]["residual_range_count"], 1)
             self.assertEqual(result["blocking_degraded_boundary_phases"], [])
 
     def test_orchestrates_strict_geak_pipeline(self):

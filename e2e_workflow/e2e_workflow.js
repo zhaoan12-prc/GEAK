@@ -2243,6 +2243,7 @@ let KB_REF_INPUTS = {};
 
 let EVAL_DIR, MODEL_NAME, BASELINE_TPUT, NOISE_BAND, curFlags, curEnv;
 let profile, strategy, kernelQueue = [], headQueue = [], semantics, fusionCapture;
+let fusionSemanticsAttempted = false;
 
 // KernelFusion must establish the current stack before the original Profile.
 let curOverlay = ST.overlay || '';
@@ -3038,6 +3039,7 @@ if (want('setup')) {
 // ===========================================================================
 if (!FAST_MODE && FUSION_DISCOVERY_ON) {
   phase('KernelFusion');
+  fusionSemanticsAttempted = SEMANTICS_MAPPING_ON;
   const fusionEntryTput = curTput;
   // Scope all run-local discovery artifacts together. Nothing outside this
   // block may seed Top-K or Unit-side inputs before the current capture.
@@ -3455,7 +3457,8 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
   // produced it; otherwise preserve the original fallback.
   const haveFusionSemantics = !!(semantics && semantics.semantic_table_json &&
     semantics.status === 'pass');
-  if (!haveFusionSemantics && SEMANTICS_MAPPING_ON && profile && profile.trace_manifest_json) {
+  if (!haveFusionSemantics && !fusionSemanticsAttempted &&
+      SEMANTICS_MAPPING_ON && profile && profile.trace_manifest_json) {
     semantics = await safeAgent(
       roleAgent('semantics_mapper', 'build_table',
         'Build auditable Pattern/Phase/Layer/Kernel tables from the clean baseline trace.', {
@@ -3489,6 +3492,10 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
           'report at the EVAL_DIR root. The table still stands, but nobody will see a ' +
           'shape-blind phase before it reaches apply-back.');
     }
+  } else if (!haveFusionSemantics && fusionSemanticsAttempted) {
+    log('Baseline semantics sidecar skipped: KernelFusion already published the authoritative ' +
+        'Semantic result for this run. Preserve its failure/partial report instead of overwriting ' +
+        '01_SEMANTIC.md with a round_0 fallback.');
   } else if (!haveFusionSemantics) {
     semantics = { status: SEMANTICS_MAPPING_ON ? 'failed' : 'disabled',
       notes: SEMANTICS_MAPPING_ON ? 'baseline profiler returned no raw trace manifest' : 'disabled by args.semantics_mapping' };

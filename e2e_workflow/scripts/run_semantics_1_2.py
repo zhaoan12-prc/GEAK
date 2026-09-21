@@ -175,7 +175,7 @@ def run(config_path, trace_path, shape_log_path, out_dir,
             patterns_path, boundary_path)
         capture_result["layer_boundary_transfer"] = transfer
         boundary_transfers.append(transfer)
-        if transfer.get("status") == "pass":
+        if transfer.get("status") in ("pass", "partial"):
             boundary_map_paths.append(boundary_path)
 
     if boundary_map_paths:
@@ -248,13 +248,13 @@ def run(config_path, trace_path, shape_log_path, out_dir,
     graph_capture_verified_phases = sorted({
         str(group.get("phase") or "").lower()
         for transfer in boundary_transfers
-        if transfer.get("status") == "pass"
+        if transfer.get("status") in ("pass", "partial")
         for group in transfer.get("mapped_groups", [])
         if group.get("phase")})
     boundary_match_rules = sorted({
         str(group.get("match_rule") or "")
         for transfer in boundary_transfers
-        if transfer.get("status") == "pass"
+        if transfer.get("status") in ("pass", "partial")
         for group in transfer.get("mapped_groups", [])
         if group.get("match_rule")})
     boundary_rebuild = {
@@ -264,11 +264,16 @@ def run(config_path, trace_path, shape_log_path, out_dir,
             if boundary_map_paths else "unavailable"),
         "reason": (
             "complete 0..N-1 graph-construction layer markers supplied cuts; "
-            "the donor-to-Clean-Trace transfer passed an audited exact "
-            "identity rule for the same phase and workload bucket"),
+            "the donor-to-Clean-Trace transfer preserved every validated layer "
+            "core for the same phase and workload bucket; any unsupported "
+            "inter-layer gaps remain explicit residual rows"),
         "match_rules": boundary_match_rules,
         "verified_phases": graph_capture_verified_phases,
         "transfers": boundary_transfers,
+        "residual_range_count": sum(
+            int(transfer.get("residual_range_count", 0) or 0)
+            for transfer in boundary_transfers
+            if transfer.get("status") in ("pass", "partial")),
         "traces": [
             os.path.abspath(capture["capture_trace"])
             for capture in capture_results
