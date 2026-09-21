@@ -352,6 +352,90 @@ class RuntimeMarkerMappingTest(unittest.TestCase):
         self.assertEqual(
             targets[1]["runtime_marker_mapping_status"], "not_found")
 
+    def test_partial_marker_bucket_uses_unique_semantic_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = os.path.join(tmp, "plan.json")
+            trace_path = os.path.join(tmp, "trace.json")
+            shape_log = os.path.join(tmp, "shape.jsonl")
+            out_path = os.path.join(tmp, "mapped.json")
+            bucket = {"phase": "decode", "batch_size": 4,
+                      "input_tokens": 0}
+            with open(plan_path, "w") as fh:
+                json.dump({"capture_targets": [
+                    {
+                        "phase": "decode", "pattern_id": "P0",
+                        "representative_layer_id": 3,
+                        "selected_bucket": bucket, "pos": 0,
+                        "stage": "gemm", "raw_name": "known_kernel",
+                    },
+                    {
+                        "phase": "decode", "pattern_id": "P0",
+                        "representative_layer_id": 3,
+                        "selected_bucket": bucket, "pos": 1,
+                        "stage": "topk", "raw_name": "missing_kernel",
+                    },
+                ]}, fh)
+            marker = (
+                "GEAK_SEMANTICS|op=known-op|phase=DECODE|bs=4|toks=4|"
+                "layer=3|path=model.layers.3.q_proj")
+            with open(trace_path, "w") as fh:
+                json.dump({"traceEvents": [
+                    {
+                        "cat": "user_annotation", "pid": 1, "tid": 2,
+                        "name": (
+                            "GEAK_LAYER_SCOPE|phase=DECODE|bs=4|toks=4|"
+                            "layer=3|path=model.layers.3"),
+                        "ts": 0, "dur": 100,
+                    },
+                    {"cat": "user_annotation", "name": marker,
+                     "pid": 1, "tid": 2, "ts": 10, "dur": 20},
+                    {"cat": "hip_runtime", "name": "hipLaunchKernel",
+                     "pid": 1, "tid": 2, "ts": 15, "dur": 1,
+                     "args": {"kernel": "known_kernel", "correlation": 1}},
+                ]}, fh)
+            with open(shape_log, "w") as fh:
+                fh.write(json.dumps({
+                    "phase": "decode", "layer_id": 3,
+                    "op_path": "model.layers.3.mlp.topk",
+                    "op_name": "topk", "op_type": "TopK",
+                    "op_instance_id": "topk-op",
+                }) + "\n")
+
+            result = mapping.map_plan(
+                plan_path, trace_path, out_path, shape_log)
+            self.assertEqual(result["matched_target_count"], 2)
+            self.assertEqual(
+                result["shape_log_semantic_wrapper_matched_target_count"],
+                1)
+            with open(out_path) as fh:
+                mapped = json.load(fh)["capture_targets"]
+            self.assertEqual(
+                mapped[1]["candidate_op_instance_id"], "topk-op")
+
+    def test_semantic_fallback_rejects_duplicate_wrapper_invocations(self):
+        targets = [{
+            "phase": "decode", "representative_layer_id": 3,
+            "stage": "norm", "raw_name": "norm_kernel",
+            "runtime_marker_mapping_status": "not_found",
+        }]
+        records = [
+            {
+                "phase": "decode", "layer_id": 3,
+                "op_path": "model.layers.3.norm",
+                "op_type": "RMSNorm", "op_instance_id": op_id,
+            }
+            for op_id in ("input-norm", "post-attention-norm")]
+        with tempfile.TemporaryDirectory() as tmp:
+            shape_log = os.path.join(tmp, "shape.jsonl")
+            with open(shape_log, "w") as fh:
+                for record in records:
+                    fh.write(json.dumps(record) + "\n")
+            count = mapping._apply_shape_log_semantic_wrapper_mapping(
+                targets, shape_log, {("decode", 3)})
+        self.assertEqual(count, 0)
+        self.assertEqual(
+            targets[0]["runtime_marker_mapping_status"], "not_found")
+
     def test_semantic_wrapper_prefers_unique_typed_and_deepest_wrapper(self):
         records = [
             {
@@ -573,6 +657,92 @@ class RuntimeMarkerMappingTest(unittest.TestCase):
             self.assertEqual(
                 mapped["candidate_op_instance_id"], "geak-op-1")
 
+    def test_decode_layer_scope_keeps_repeated_wrapper_in_one_forward(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = os.path.join(tmp, "plan.json")
+            trace_path = os.path.join(tmp, "trace.json")
+            out_path = os.path.join(tmp, "mapped.json")
+            bucket = {
+                "phase": "decode",
+                "batch_size": 4,
+                "input_tokens": 0,
+            }
+            with open(plan_path, "w") as fh:
+                json.dump({"capture_targets": [
+                    {
+                        "phase": "decode", "pattern_id": "P0",
+                        "representative_layer_id": 1,
+                        "selected_bucket": bucket, "pos": 0,
+                        "row_id": "event-1", "raw_name": "attn_kernel",
+                    },
+                    {
+                        "phase": "decode", "pattern_id": "P0",
+                        "representative_layer_id": 1,
+                        "selected_bucket": bucket, "pos": 1,
+                        "row_id": "event-2", "raw_name": "mlp_kernel",
+                    },
+                ]}, fh)
+
+            def marker(op_id, path, ts, dur):
+                return {
+                    "cat": "user_annotation", "pid": 1, "tid": 2,
+                    "name": (
+                        "GEAK_SEMANTICS|op=%s|phase=DECODE|bs=4|"
+                        "toks=4|layer=1|path=%s" % (op_id, path)),
+                    "ts": ts, "dur": dur,
+                }
+
+            repeated = (
+                "model.layers.1::launcher:"
+                "sglang.srt.layers.layernorm:_forward_with_allreduce_fusion")
+            events = [
+                {
+                    "cat": "user_annotation", "pid": 1, "tid": 2,
+                    "name": (
+                        "GEAK_LAYER_SCOPE|phase=DECODE|bs=4|toks=4|"
+                        "layer=1|path=model.layers.1"),
+                    "ts": 10, "dur": 80,
+                },
+                marker("geak-call-1", repeated, 12, 20),
+                {"cat": "hip_runtime", "name": "hipLaunchKernel",
+                 "pid": 1, "tid": 2, "ts": 15, "dur": 1,
+                 "args": {"kernel": "attn_kernel", "correlation": 1}},
+                marker("geak-call-2", repeated, 40, 20),
+                {"cat": "hip_runtime", "name": "hipLaunchKernel",
+                 "pid": 1, "tid": 2, "ts": 45, "dur": 1,
+                 "args": {"kernel": "mlp_kernel", "correlation": 2}},
+                # A later replay of the same bucket must not be mixed in.
+                {
+                    "cat": "user_annotation", "pid": 1, "tid": 2,
+                    "name": (
+                        "GEAK_LAYER_SCOPE|phase=DECODE|bs=4|toks=4|"
+                        "layer=1|path=model.layers.1"),
+                    "ts": 100, "dur": 80,
+                },
+                marker("geak-call-3", repeated, 102, 20),
+                {"cat": "hip_runtime", "name": "hipLaunchKernel",
+                 "pid": 1, "tid": 2, "ts": 105, "dur": 1,
+                 "args": {"kernel": "attn_kernel", "correlation": 3}},
+                marker("geak-call-4", repeated, 140, 20),
+                {"cat": "hip_runtime", "name": "hipLaunchKernel",
+                 "pid": 1, "tid": 2, "ts": 145, "dur": 1,
+                 "args": {"kernel": "mlp_kernel", "correlation": 4}},
+            ]
+            with open(trace_path, "w") as fh:
+                json.dump({"traceEvents": events}, fh)
+
+            result = mapping.map_plan(plan_path, trace_path, out_path)
+            self.assertEqual(result["matched_target_count"], 2)
+            self.assertEqual(result["ambiguous_target_count"], 0)
+            self.assertEqual(
+                result["selected_forward_marker_counts"]
+                ["decode|1|4|0"], 2)
+            with open(out_path) as fh:
+                mapped = json.load(fh)["capture_targets"]
+            self.assertEqual(
+                [item["candidate_op_instance_id"] for item in mapped],
+                ["geak-call-1", "geak-call-2"])
+
     def test_repeated_kernel_is_resolved_by_mapped_neighbor_positions(self):
         with tempfile.TemporaryDirectory() as tmp:
             plan_path = os.path.join(tmp, "plan.json")
@@ -592,7 +762,13 @@ class RuntimeMarkerMappingTest(unittest.TestCase):
             with open(plan_path, "w") as fh:
                 json.dump({"capture_targets": targets}, fh)
 
-            events = []
+            events = [{
+                "cat": "user_annotation", "pid": 1, "tid": 2,
+                "name": (
+                    "GEAK_LAYER_SCOPE|phase=DECODE|bs=4|toks=4|"
+                    "layer=1|path=model.layers.1"),
+                "ts": 0, "dur": 100,
+            }]
             launches = (
                 ("generic", "noise", 10),
                 ("before", "before", 30),

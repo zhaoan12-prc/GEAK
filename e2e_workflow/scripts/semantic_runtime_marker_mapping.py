@@ -9,6 +9,7 @@ import re
 
 
 MARKER_PREFIX = "GEAK_SEMANTICS|"
+LAYER_SCOPE_PREFIX = "GEAK_LAYER_SCOPE|"
 RUNTIME_CATEGORIES = {"cuda_runtime", "hip_runtime"}
 DEVICE_CATEGORIES = {"kernel", "gpu_memcpy", "gpu_memset"}
 
@@ -375,14 +376,86 @@ def _marker_matches_bucket(marker, bucket):
     return True
 
 
-def _first_forward_marker_ids(markers, bucket):
-    """Select one complete wrapper-marker pass for a clean-trace bucket.
+def _layer_scope_markers(events):
+    """Return explicit full-layer invocation ranges from the capture trace."""
+    scopes = []
+    for index, event in enumerate(events):
+        name = str(event.get("name", ""))
+        if (event.get("cat") != "user_annotation"
+                or not name.startswith(LAYER_SCOPE_PREFIX)
+                or event.get("ts") is None
+                or event.get("dur") is None):
+            continue
+        fields = _marker_fields(name)
+        scopes.append({
+            "index": index,
+            "name": name,
+            "phase": _phase(fields.get("phase")),
+            "layer_id": _integer(fields.get("layer")),
+            "batch_size": _integer(fields.get("bs")),
+            "input_tokens": _integer(fields.get("toks")),
+            "op_path": fields.get("path"),
+            "pid": event.get("pid"),
+            "tid": event.get("tid"),
+            "ts": float(event["ts"]),
+            "end": float(event["ts"]) + float(event["dur"]),
+        })
+    return scopes
 
-    Shape replays may execute the same decode bucket many times.  Matching all
-    of them against the single representative clean layer makes every repeated
-    kernel ambiguous.  Within one layer forward, registered module paths occur
-    once; the first repeated path therefore starts the next forward.
+
+def _module_path(op_path):
+    return str(op_path or "").split("::launcher:", 1)[0]
+
+
+def _common_module_path(markers):
+    paths = [
+        _module_path(marker.get("op_path")).split(".")
+        for marker in markers if marker.get("op_path")]
+    if not paths:
+        return ""
+    common = []
+    for components in zip(*paths):
+        if len(set(components)) != 1:
+            break
+        common.append(components[0])
+    return ".".join(common)
+
+
+def _markers_in_scope(markers, scope):
+    selected = []
+    for marker in markers:
+        if (marker["pid"] != scope["pid"]
+                or marker["tid"] != scope["tid"]):
+            continue
+        contained = (
+            scope["ts"] <= marker["ts"]
+            and marker["end"] <= scope["end"])
+        # The module hook may enter immediately before the dedicated layer
+        # scope and exit immediately after it.  Keep that one outer module
+        # marker as part of the same invocation too.
+        wraps_scope = (
+            _module_path(marker.get("op_path")) == scope.get("op_path")
+            and marker["ts"] <= scope["ts"]
+            and scope["end"] <= marker["end"])
+        if contained or wraps_scope:
+            selected.append(marker)
+    return selected
+
+
+def _first_forward_marker_ids(markers, bucket, layer_scopes=None):
+    """Select one complete layer invocation for a clean-trace bucket.
+
+    The capture emits an explicit ``GEAK_LAYER_SCOPE`` range around each main
+    decoder-layer invocation.  That range, rather than repeated inner wrapper
+    names, is the authoritative boundary: one wrapper may legitimately execute
+    multiple times inside a layer (for example pre-attention and pre-MLP norm).
+
+    Older/synthetic traces may not contain layer scopes.  For those, use the
+    earliest outer module marker that spans the common module path.  This is a
+    conservative compatibility fallback; it never treats an arbitrary repeated
+    child path as proof that a new forward started.
     """
+    effective_bucket = bucket
     candidates = sorted(
         (marker for marker in markers
          if _marker_matches_bucket(marker, bucket)),
@@ -404,20 +477,44 @@ def _first_forward_marker_ids(markers, bucket):
                     abs(value[1] - target_tokens),
                     abs(value[0] - batch_size),
                     value))
+            effective_bucket = (
+                phase, layer_id, selected_bucket[0], selected_bucket[1])
             candidates = sorted(
                 (marker for marker in compatible
                  if (marker["batch_size"], marker["input_tokens"])
                  == selected_bucket),
                 key=lambda marker: marker["index"])
+    if not candidates:
+        return set()
+
+    scopes = sorted(
+        (scope for scope in (layer_scopes or [])
+         if _marker_matches_bucket(scope, effective_bucket)),
+        key=lambda scope: scope["index"])
     selected = []
-    seen_paths = set()
-    for marker in candidates:
-        path = marker.get("op_path")
-        if selected and path and path in seen_paths:
+    for scope in scopes:
+        selected = _markers_in_scope(candidates, scope)
+        if selected:
             break
-        selected.append(marker)
-        if path:
-            seen_paths.add(path)
+
+    if not selected:
+        common_path = _common_module_path(candidates)
+        envelope = next((
+            marker for marker in candidates
+            if marker.get("op_path") == common_path), None)
+        if envelope is not None:
+            selected = _markers_in_scope(candidates, {
+                "pid": envelope["pid"],
+                "tid": envelope["tid"],
+                "ts": envelope["ts"],
+                "end": envelope["end"],
+                "op_path": common_path,
+            })
+        else:
+            # No structural invocation envelope exists.  Fail narrowly by
+            # selecting only the first observed marker; selecting every replay
+            # would make repeated kernels look uniquely attributable.
+            selected = candidates[:1]
     return {
         marker["op_instance_id"] for marker in selected
         if marker.get("op_instance_id")
@@ -473,11 +570,10 @@ def _apply_mapping(
     }
 
 
-def _shape_log_first_forward(path, targeted_only=False):
-    selected = {}
-    seen_paths = {}
+def _shape_log_records(path, targeted_only=False):
+    records = {}
     if not path or not os.path.exists(path):
-        return selected
+        return records
     with open(path) as fh:
         for line in fh:
             record = json.loads(line)
@@ -488,6 +584,15 @@ def _shape_log_first_forward(path, targeted_only=False):
             key = (
                 _phase(record.get("phase")),
                 int(record.get("layer_id", -1)))
+            records.setdefault(key, []).append(record)
+    return records
+
+
+def _shape_log_first_forward(path, targeted_only=False):
+    selected = {}
+    seen_paths = {}
+    for key, records in _shape_log_records(path, targeted_only).items():
+        for record in records:
             op_path = record.get("op_path")
             if op_path in seen_paths.setdefault(key, set()):
                 continue
@@ -801,16 +906,22 @@ def _semantic_wrapper_candidates(records, stage, layer_id):
 
 
 def _apply_shape_log_semantic_wrapper_mapping(
-        targets, shape_log_path, missing_bucket_keys):
+        targets, shape_log_path, eligible_bucket_keys):
     """Use a unique executed semantic wrapper without positional guessing."""
-    records_by_key = _shape_log_first_forward(shape_log_path)
+    # Keep duplicate invocations visible here.  A path may execute twice in one
+    # layer (for example the same norm launcher before attention and before the
+    # MLP); collapsing those records would turn an ambiguous fallback into a
+    # falsely unique one.
+    records_by_key = _shape_log_records(shape_log_path)
     matched = 0
-    for phase, layer_id in missing_bucket_keys:
+    for phase, layer_id in eligible_bucket_keys:
         records = records_by_key.get((phase, layer_id), [])
         for target in targets:
             if target.get("runtime_marker_mapping_status") == "matched":
                 continue
             if not _layer_fallback_eligible(target):
+                continue
+            if _shape_mapping_exclusion_reason(target) is not None:
                 continue
             if _phase(target.get("phase")) != phase:
                 continue
@@ -818,8 +929,7 @@ def _apply_shape_log_semantic_wrapper_mapping(
                 continue
             candidates = _semantic_wrapper_candidates(
                 records, target.get("stage"), layer_id)
-            paths = {item.get("op_path") for item in candidates}
-            if len(paths) != 1:
+            if len(candidates) != 1:
                 continue
             record = candidates[0]
             target["candidate_op_path"] = record["op_path"]
@@ -965,6 +1075,7 @@ def map_plan(
     events = _load(capture_trace_path)
     schema_manifest = _load_schema_manifest(operator_schema_manifest_path)
     markers, entries = _runtime_entries(events, schema_manifest)
+    layer_scopes = _layer_scope_markers(events)
     marker_launch_counts = collections.Counter(
         entry["marker"]["op_instance_id"] for entry in entries)
 
@@ -982,7 +1093,7 @@ def map_plan(
         bucket = key[3]
         if bucket is not None and bucket not in bucket_marker_ids:
             bucket_marker_ids[bucket] = _first_forward_marker_ids(
-                markers, bucket)
+                markers, bucket, layer_scopes)
     required_phases = {
         _phase(value) for value in (required_phases or [])}
     active_phases = {
@@ -1098,9 +1209,13 @@ def map_plan(
         for bucket, marker_ids in bucket_marker_ids.items()
         if not marker_ids
     }
+    semantic_fallback_bucket_keys = {
+        (bucket[0], bucket[1])
+        for bucket in bucket_marker_ids
+    }
     semantic_wrapper_matched = _apply_shape_log_semantic_wrapper_mapping(
         plan.get("capture_targets", []), shape_log_path,
-        missing_bucket_keys)
+        semantic_fallback_bucket_keys)
     region_fallback_matched = _apply_shape_log_region_fallback(
         plan.get("capture_targets", []), shape_log_path)
     layer_fallback_matched, layer_fallback_keys = (
