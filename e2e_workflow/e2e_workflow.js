@@ -3061,8 +3061,6 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
           EVAL_DIR, MODEL_PATH, GPU_ID: GPU_LIST[0], WORKLOAD, ROUND: fusionRound,
           CAPTURE_DIR: fusionCaptureDir,
           TRACE_MANIFEST_JSON: expectedFusionManifest,
-          CAPTURE_REPEATS: 1,
-          CAPTURE_NUM_PROMPTS: Math.max(CONC * 5, CONC),
           OVERLAY_PYTHONPATH: curOverlay, EXTRA_SERVER_ARGS: curFlags,
           EXTRA_ENV: captureEnv, SKILL_DIR: WORKFLOW_DIR,
           ...FUSION_RUNTIME_INPUTS, ...TRACELENS_INPUTS,

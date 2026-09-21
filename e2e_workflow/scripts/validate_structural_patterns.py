@@ -281,7 +281,12 @@ def validate(pattern_path, config_path, runtime_sources, out_path=""):
         ordinary = [
             layer["layer_id"] for layer in values
             if not _is_contextual_representative(layer)]
-        candidates = ordinary or layer_ids
+        # Prefer layers without model-entry/model-exit context.  Do not remove
+        # an edge-only Pattern, though: when its sole implementation is the
+        # first or final layer, that contextual layer is the required fallback.
+        # Kernel mapping still keeps outer global prefix/suffix rows outside
+        # the representative layer body.
+        candidates = ordinary if ordinary else layer_ids
         config_evidence = []
         source_evidence = []
         seen_config = set()

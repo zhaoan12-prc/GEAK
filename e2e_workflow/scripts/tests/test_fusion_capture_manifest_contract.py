@@ -36,20 +36,22 @@ class FusionCaptureManifestContractTest(unittest.TestCase):
         )
         self.assertIn("CAPTURE_DIR: fusionCaptureDir", source)
         self.assertIn("TRACE_MANIFEST_JSON: expectedFusionManifest", source)
-        self.assertIn("CAPTURE_REPEATS: 1", source)
-        self.assertIn("CAPTURE_NUM_PROMPTS: Math.max(CONC * 5, CONC)", source)
+        self.assertNotIn("CAPTURE_REPEATS:", source)
+        self.assertNotIn("CAPTURE_NUM_PROMPTS:", source)
         self.assertIn('TRACE_MANIFEST_JSON: fusionTraceManifest', source)
         self.assertNotIn(
             "notes: 'fusion capture produced no raw trace manifest'",
             source,
         )
 
-    def test_capture_role_uses_bounded_deterministic_output(self):
+    def test_capture_role_uses_deterministic_output_and_workload_sizing(self):
         with open(os.path.join(WORKFLOW, "roles", "fusion_trace_collector.md")) as fh:
             source = fh.read()
         self.assertIn("`OUT_DIR=CAPTURE_DIR`", source)
-        self.assertIn("`REPEATS=CAPTURE_REPEATS`", source)
-        self.assertIn("`NUM_PROMPTS=CAPTURE_NUM_PROMPTS`", source)
+        self.assertIn("Do not override", source)
+        self.assertIn("workload-derived `NUM_PROMPTS`, `REPEATS`", source)
+        self.assertNotIn("CAPTURE_NUM_PROMPTS", source)
+        self.assertNotIn("CAPTURE_REPEATS", source)
         self.assertIn("publish exactly `TRACE_MANIFEST_JSON`", source)
         self.assertIn("Do not return before the foreground capture command", source)
 

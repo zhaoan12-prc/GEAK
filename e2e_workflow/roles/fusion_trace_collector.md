@@ -5,10 +5,9 @@ Produce a raw production serving trace and its manifest; do not parse Top-N,
 classify kernels, enrich roofline data, or perform GEAK Profile work.
 
 Inputs: `EVAL_DIR`, `MODEL_PATH`, `GPU_ID`, `WORKLOAD`, `ROUND`,
-`CAPTURE_DIR`, `TRACE_MANIFEST_JSON`, `CAPTURE_REPEATS`,
-`CAPTURE_NUM_PROMPTS`, `OVERLAY_PYTHONPATH`, `EXTRA_SERVER_ARGS`,
-`EXTRA_ENV`, optional `TRACELENS_TRACE_FILE`, `EXEC_PREFIX`, and
-`SKILL_DIR`.
+`CAPTURE_DIR`, `TRACE_MANIFEST_JSON`, `OVERLAY_PYTHONPATH`,
+`EXTRA_SERVER_ARGS`, `EXTRA_ENV`, optional `TRACELENS_TRACE_FILE`,
+`EXEC_PREFIX`, and `SKILL_DIR`.
 
 When `EXEC_PREFIX` is non-empty, run executable commands as
 `<EXEC_PREFIX> <command>`; do not treat it as an environment assignment.
@@ -16,18 +15,16 @@ When `EXEC_PREFIX` is non-empty, run executable commands as
 1. Reuse `TRACELENS_TRACE_FILE` only when it exists and contains a usable
    top-level serving trace. An analysis Markdown file is not a raw trace.
 2. Otherwise run the existing `EVAL_DIR/bench_e2e.sh` serving capture with
-   `OUT_DIR=CAPTURE_DIR`, `REPEATS=CAPTURE_REPEATS`,
-   `NUM_PROMPTS=CAPTURE_NUM_PROMPTS`, and `PROFILE=1`, preserving the supplied
-   overlay, flags, env, and Fusion-only profiler controls. `CAPTURE_DIR` is the
-   one authoritative output directory; do not insert an extra `profile/` or
-   `round_` component around it. The short pre-profile benchmark only warms the
-   production path and supplies TPOT for profiler sizing; it is not an
-   acceptance measurement, so do not expand its repeat or prompt count. For
-   sglang, `GEAK_FUSION_TRACE=1` keeps the actual trace at one step per
-   separately captured stage instead of expanding it to the native profiler's
-   40/64-step statistical window, while `SGLANG_PROFILE_WITH_STACK=true`
-   requests CPU/Python stack evidence. Other backends retain their existing
-   adapter behavior.
+   `OUT_DIR=CAPTURE_DIR` and `PROFILE=1`, preserving the supplied workload,
+   overlay, flags, env, and Fusion-only profiler controls. Do not override
+   workload-derived `NUM_PROMPTS`, `REPEATS`, or other request-shape settings.
+   `CAPTURE_DIR` is the one authoritative output directory; do not insert an
+   extra `profile/` or `round_` component around it. For sglang,
+   `GEAK_FUSION_TRACE=1` keeps the actual trace at one step per separately
+   captured stage instead of expanding it to the native profiler's 40/64-step
+   statistical window, while `SGLANG_PROFILE_WITH_STACK=true` requests
+   CPU/Python stack evidence. Other backends retain their existing adapter
+   behavior.
 3. Select the clean steady production graph trace for benefit/timing evidence.
    Warmup/capture and metadata-only eager traces may supplement semantics, but
    must not replace production timing.

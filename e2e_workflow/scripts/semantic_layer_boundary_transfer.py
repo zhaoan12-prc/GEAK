@@ -15,8 +15,8 @@ retain only raw identities with equal total multiplicity on both sides, require
 the complete projected sequences to be identical, and require multiple distinct
 anchors in every layer plus majority coverage.  A one-sided unmatched internal
 gap follows the marker-proven side.  A two-sided or otherwise unsupported gap
-remains an explicit inter-layer residual: its adjacent layers stay mapped but
-cannot become representatives.  Outer prefix/suffix work remains global. Stage
+remains an explicit inter-layer residual while both proven layer cores remain
+eligible as representatives.  Outer prefix/suffix work remains global. Stage
 names, model names, attention kinds and recurring subsequences are never used to
 invent a boundary.
 """
@@ -398,8 +398,8 @@ def _stable_projection_map(sequence, donor, expected_layers):
             # implementation rejected the complete 0..N-1 Decode pass here,
             # even when every layer still had a large, ordered stable core.
             # Preserve the two proven cores and leave only the recipient gap
-            # unassigned.  The consumer records it as transition_global and
-            # prevents the adjacent instances from becoming representatives.
+            # unassigned.  The consumer records it as transition_global.  The
+            # gap does not invalidate either independently anchored layer core.
             previous_end = previous_last_recipient + 1
             start = current_first_recipient
             side = "inter_layer_residual"
@@ -471,8 +471,11 @@ def _stable_projection_map(sequence, donor, expected_layers):
         "layer_id": layer_id,
         "start_position": starts[layer_id],
         "end_position": ends[layer_id],
-        "representative_eligible": not any(
-            layer_id in item["layer_boundary"] for item in residual_ranges),
+        # An unresolved inter-layer transition is deliberately excluded from
+        # both layer bodies.  It therefore does not make either stable body an
+        # invalid representative.  Representative eligibility is revoked only
+        # when the layer body itself cannot be mapped authoritatively.
+        "representative_eligible": True,
     } for layer_id in range(expected_layers)]
     widths = [item["end_position"] - item["start_position"]
               for item in layer_ranges]
