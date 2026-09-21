@@ -86,8 +86,9 @@ FUSION_NAME_MARKERS = ("fused_", "_and_", "_cat_", "_absorb", "fused", "_fused")
 
 # Stage names as they appear in `stage_inventory[].stage`, mapped to the op_tag
 # vocabulary of available_fusion_kernels.json. Kept explicit rather than inferred so a
-# vocabulary drift shows up as an unmapped stage in the report instead of silently
-# shrinking the in-scope set.
+# vocabulary drift shows up as a non-blocking unmapped-stage warning instead of
+# silently shrinking the in-scope set. An unknown stage is an audit blind spot, not
+# evidence that the agent missed a candidate.
 STAGE_TO_TAGS = {
     "quant": {"quant", "cast"},
     "gemm": {"gemm", "gemm_prologue", "gemm_epilogue"},
@@ -448,6 +449,7 @@ def audit(inventory_path, candidates_path, dispositions=None, budget=None,
     deferred_tail = [r for r in rows
                      if r["status"] == "un_dispositioned" and not r["in_budget"]]
     errors = []
+    warnings = []
     for row in open_rows:
         errors.append(
             "inventory-coverage gap #%d: `%s` (%s) — %s. Propose a candidate citing "
@@ -455,10 +457,11 @@ def audit(inventory_path, candidates_path, dispositions=None, budget=None,
             % (row["rank"], row["name"], "/".join(row["modules"][:1]) or "?",
                row["reason"], row["name"]))
     if unmapped_stages:
-        errors.append(
+        warnings.append(
             "stage(s) %s are present in the trace but absent from STAGE_TO_TAGS — "
-            "inventory relevance was computed WITHOUT them, so this audit is "
-            "incomplete. Extend the map." % sorted(set(unmapped_stages)))
+            "02b could not audit provider coverage for them. This is an audit-scope "
+            "warning, not evidence of a missing candidate." %
+            sorted(set(unmapped_stages)))
 
     counts = {"in_scope": len(rows)}
     for row in rows:
@@ -468,7 +471,7 @@ def audit(inventory_path, candidates_path, dispositions=None, budget=None,
         "phase": "inventory_coverage",
         "seam_join": bool(seam_windows),
         "seam_windows": len(seam_windows),
-        "status": "fail" if (errors and require_disposition) else "pass",
+        "status": "fail" if (open_rows and require_disposition) else "pass",
         "inventory_json": os.path.abspath(inventory_path),
         "candidates_json": os.path.abspath(candidates_path),
         "kernels_scanned": len(kernels),
@@ -479,6 +482,7 @@ def audit(inventory_path, candidates_path, dispositions=None, budget=None,
         "budget": budget,
         "counts": counts,
         "errors": errors,
+        "warnings": warnings,
         "open_count": len(open_rows),
         "deferred_tail_count": len(deferred_tail),
         "rows": rows,
@@ -505,6 +509,11 @@ def render_markdown(result):
            result["counts"].get("dispositioned", 0),
            result["counts"].get("un_dispositioned", 0)))
     lines.append("")
+    if result.get("warnings"):
+        lines.append("## 审计范围提示（不阻塞）")
+        for warning in result["warnings"]:
+            lines.append("- %s" % warning)
+        lines.append("")
     if result["open_count"]:
         lines.append(
             "> 🔴 **%d 个未答复**。这个闸门从不要求你去融合它；它要求你**回答**。"

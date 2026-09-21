@@ -53,6 +53,49 @@ class FusionInventoryCoverageTest(unittest.TestCase):
             self.assertTrue(open_row["in_budget"])
             self.assertEqual(result["status"], "fail")
 
+    def test_unmapped_stage_warns_without_blocking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inventory = {"providers_scanned": ["test"], "kernels": []}
+            candidates = {
+                "stage_inventory": [{"stage": "linear_attn"}, {"stage": "rope"}],
+                "candidates": [],
+            }
+            result = coverage.audit(
+                self._write(tmp, "inventory.json", inventory),
+                self._write(tmp, "candidates.json", candidates),
+                require_disposition=True)
+
+            self.assertEqual(result["status"], "pass")
+            self.assertEqual(result["open_count"], 0)
+            self.assertEqual(result["errors"], [])
+            self.assertEqual(result["unmapped_stages"], ["linear_attn", "rope"])
+            self.assertTrue(result["warnings"])
+            self.assertIn("审计范围提示（不阻塞）", coverage.render_markdown(result))
+
+    def test_real_gap_still_blocks_with_unmapped_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inventory = {"providers_scanned": ["test"], "kernels": [
+                {"name": "fused_norm_quant", "op_tags": ["norm", "quant"]},
+            ]}
+            candidates = {
+                "stage_inventory": [
+                    {"stage": "norm"},
+                    {"stage": "quant"},
+                    {"stage": "linear_attn"},
+                ],
+                "candidates": [],
+            }
+            result = coverage.audit(
+                self._write(tmp, "inventory.json", inventory),
+                self._write(tmp, "candidates.json", candidates),
+                require_disposition=True)
+
+            self.assertEqual(result["status"], "fail")
+            self.assertEqual(result["open_count"], 1)
+            self.assertEqual(len(result["errors"]), 1)
+            self.assertEqual(result["unmapped_stages"], ["linear_attn"])
+            self.assertTrue(result["warnings"])
+
 
 if __name__ == "__main__":
     unittest.main()

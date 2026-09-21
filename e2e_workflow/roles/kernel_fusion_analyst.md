@@ -725,6 +725,8 @@ python3 "$SKILL_DIR/scripts/fusion_inventory_coverage.py" \
   × `pattern_layer_count`。「优先选层覆盖最广的缝」是**算出来的**，不是记住的。
 - 每个在范围内的核必须落到 `enumerated`（有候选引用它）或 `--dispose NAME=REASON`
   （写明为什么不做）。闸门**从不要求你去融合它，只要求你回答**。
+- `unmapped_stages` 只表示 02b 的静态词表无法复核该 stage，属于不阻塞的审计范围提示；
+  不得为了通过门禁增加模型专用 hardcode。只有已确认的 provider kernel 未枚举且未 disposition 才阻塞。
 - `--budget N` 按 **primary stage 分层**取前 N（不是全局前 N），否则最贵的那个 stage 会把别的
   stage 的核全挤出可答复窗口。预算外的尾巴照样打印——**切口是你选的一个数字，不是一次隐形的意外**。
 - 不要用 `--allow-undispositioned` 把红色消掉，理由同 `--allow-partial-coverage`。
