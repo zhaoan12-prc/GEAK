@@ -179,6 +179,53 @@ class FusionApplyBackTest(unittest.TestCase):
             self.assertEqual(res["coverage"]["unaccounted"], 2)
             self.assertEqual(res["status"], "fail")
 
+    def test_in_budget_unitside_pass_cannot_be_deferred(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            unit = self._write(tmp, "unit.json", {"results": [
+                {"candidate_id": "dc_nq", "unit_side_status": "pass",
+                 "reason": "1.9x"},
+                {"candidate_id": "pf_kv", "unit_side_status": "equivalent_pass",
+                 "reason": "representative passed"}]})
+            res = self._run(
+                tmp, unitside_path=unit, budget=4,
+                apply=self._apply(deferred=[
+                    {"exec_id": "e03", "reason": "next round"},
+                    {"exec_id": "e04", "reason": "server launch is expensive"},
+                ]))
+
+            self.assertEqual(res["status"], "fail")
+            self.assertTrue(any("e03 is an in-budget" in e for e in res["errors"]),
+                            res["errors"])
+            self.assertTrue(any("e04 is an in-budget" in e for e in res["errors"]),
+                            res["errors"])
+            required = {r["exec_id"]: r["applyback_required"]
+                        for r in res["results"]}
+            self.assertTrue(required["e03"])
+            self.assertTrue(required["e04"])
+            self.assertEqual(
+                res["applyback_completion"]["incomplete_exec_ids"],
+                ["e03", "e04"])
+            self.assertFalse(res["applyback_completion"]["complete"])
+            with open(os.path.join(tmp, "out.md")) as fh:
+                md = fh.read()
+            self.assertIn("预算内单侧通过项不得延期", md)
+
+    def test_out_of_budget_unitside_pass_may_be_deferred(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            unit = self._write(tmp, "unit.json", {"results": [
+                {"candidate_id": "pf_kv", "unit_side_status": "pass",
+                 "reason": "1.2x"}]})
+            res = self._run(
+                tmp, unitside_path=unit, budget=3,
+                apply=self._apply(deferred=[
+                    {"exec_id": "e03", "reason": "not unit-side eligible"},
+                    {"exec_id": "e04", "reason": "rank beyond apply-back budget"},
+                ]))
+
+            self.assertEqual(res["status"], "pass")
+            row = next(r for r in res["results"] if r["exec_id"] == "e04")
+            self.assertFalse(row["applyback_required"])
+
     def test_a_row_with_no_unitside_verdict_says_where_the_gap_starts(self):
         with tempfile.TemporaryDirectory() as tmp:
             res = self._run(tmp)

@@ -26,7 +26,10 @@ exactly one of:
   * `blocked_by_exclusion` -- a conflicting entry in its exclusive group was applied.
                               Derived, not asserted: only entries that genuinely
                               conflict with an APPLIED entry get this.
-  * `deferred_with_reason` -- knowingly left for next round, WITH a reason
+  * `deferred_with_reason` -- knowingly left for next round, WITH a reason. This is
+                              INVALID for an in-budget tier-A/B row whose unit-side
+                              status passed: that row must be applied or blocked by an
+                              actual apply-back attempt.
   * `deferred_budget`      -- past `--budget` in board rank order. Legitimate, but
                               recorded and named. A budget is a decision to stop, and
                               a decision to stop is a thing the reader must SEE.
@@ -57,6 +60,7 @@ import sys
 ACCOUNTED = {"applied", "blocked", "blocked_by_exclusion",
              "deferred_with_reason", "deferred_budget"}
 EXPLICIT = {"applied", "blocked", "deferred_with_reason"}
+APPLYBACK_ELIGIBLE = {"pass", "equivalent_pass", "subsumed_pass"}
 
 
 def _load(path):
@@ -249,6 +253,17 @@ def validate(topk_path, apply_path, unitside_path=None, budget=None,
         exec_id = entry.get("exec_id")
         rank = entry.get("rank")
         hits = row["hits"]
+        unit_states = [unit_index.get(cid) for cid in entry.get("candidate_ids") or []]
+        unit_states = [u for u in unit_states if u]
+        unit_statuses = sorted({u[0] for u in unit_states})
+        within_budget = (
+            budget is None or rank is None or int(rank) <= int(budget)
+        )
+        applyback_required = bool(
+            str(entry.get("tier") or "").upper() in ("A", "B") and
+            within_budget and
+            any(status in APPLYBACK_ELIGIBLE for status in unit_statuses)
+        )
         disposition, reason, source = None, "", ""
 
         if hits:
@@ -268,8 +283,6 @@ def validate(topk_path, apply_path, unitside_path=None, budget=None,
         else:
             # No claim was made. Before calling it a hole, check the two places a
             # disposition legitimately comes from without the integrator saying so.
-            unit_states = [unit_index.get(cid) for cid in entry.get("candidate_ids") or []]
-            unit_states = [u for u in unit_states if u]
             if unit_states and all(u[0] in ("fail", "blocked") for u in unit_states):
                 disposition = "blocked"
                 reason = "单侧 gate: " + "; ".join(
@@ -310,6 +323,14 @@ def validate(topk_path, apply_path, unitside_path=None, budget=None,
                           + unit_note)
                 source = "none"
 
+        if disposition == "deferred_with_reason" and applyback_required:
+            errors.append(
+                "%s is an in-budget tier-%s row with passing unit-side evidence (%s), "
+                "so deferred_with_reason is not a valid terminal state. Run live "
+                "apply-back and report applied, or blocked with the attempted "
+                "engagement/A/B/accuracy evidence."
+                % (exec_id, entry.get("tier"), ", ".join(unit_statuses)))
+
         results.append({
             "exec_id": exec_id,
             "rank": rank,
@@ -318,6 +339,8 @@ def validate(topk_path, apply_path, unitside_path=None, budget=None,
             "action": entry.get("action"),
             "handle": entry.get("handle"),
             "candidate_ids": entry.get("candidate_ids") or [],
+            "unit_side_statuses": unit_statuses,
+            "applyback_required": applyback_required,
             "forward_us": entry.get("forward_us"),
             "forward_pct": entry.get("forward_pct"),
             "disposition": disposition,
@@ -334,6 +357,12 @@ def validate(topk_path, apply_path, unitside_path=None, budget=None,
     counts = {}
     for r in results:
         counts[r["disposition"]] = counts.get(r["disposition"], 0) + 1
+
+    required_applyback = [r for r in results if r["applyback_required"]]
+    incomplete_applyback = [
+        r for r in required_applyback
+        if r["disposition"] not in ("applied", "blocked", "blocked_by_exclusion")
+    ]
 
     truncated = [r["exec_id"] for r in results if r["disposition"] == "deferred_budget"]
     budget_record = {
@@ -372,6 +401,13 @@ def validate(topk_path, apply_path, unitside_path=None, budget=None,
             "complete": not unaccounted,
         },
         "coverage_ok": not coverage_fail,
+        "applyback_completion": {
+            "required": len(required_applyback),
+            "completed": len(required_applyback) - len(incomplete_applyback),
+            "incomplete": len(incomplete_applyback),
+            "incomplete_exec_ids": [r["exec_id"] for r in incomplete_applyback],
+            "complete": not incomplete_applyback,
+        },
         "budget": budget_record,
         "counts": counts,
         "results": results,
@@ -421,6 +457,14 @@ def render_markdown(result):
     lines.append("执行清单 **%d** 条：已交代 **%d** / 无交代 **%d**。"
                  % (cov.get("execution_list_size", 0), cov.get("accounted", 0),
                     cov.get("unaccounted", 0)))
+    completion = result.get("applyback_completion") or {}
+    if completion.get("required"):
+        lines.append("")
+        lines.append("预算内且单侧通过、必须完成 Applyback **%d** 条：已完成 **%d** / "
+                     "**未完成 %d**。"
+                     % (completion.get("required", 0),
+                        completion.get("completed", 0),
+                        completion.get("incomplete", 0)))
     c = result.get("counts") or {}
     lines.append("")
     lines.append("去向分布：" + " / ".join(
@@ -462,6 +506,13 @@ def render_markdown(result):
             "`--waive <exec_id>=<理由>`。"
             % (cov.get("unaccounted"),
                "、".join("`%s`" % e for e in cov.get("unaccounted_exec_ids") or [])))
+        lines.append("")
+    if completion.get("incomplete"):
+        lines.append(
+            "> 🔴 **预算内单侧通过项不得延期**：%s。它们必须完成 live Applyback，"
+            "最终落到 applied，或在实际接入/engagement/A/B/accuracy 尝试后 blocked。"
+            % "、".join("`%s`" % e for e in
+                         completion.get("incomplete_exec_ids") or []))
         lines.append("")
 
     e2e = result.get("e2e") or {}

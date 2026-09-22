@@ -195,7 +195,7 @@ contiguous (B,N,K) weight, the fnuz variant, the arg the gate would have supplie
 re-check parity in-adapter before the A/B. Only after the overlay is written and it fails
 to engage, fails parity for a diagnosed reason, or loses the A/B, may it be `blocked` —
 and the reason must state what was attempted and what the measurement was.
-| `deferred_with_reason` | knowingly left for next round | you — `deferred[]`, **with a reason** |
+| `deferred_with_reason` | only for a row that is not an in-budget tier-A/B unit-side pass | you — `deferred[]`, **with a reason** |
 | `blocked_by_exclusion` | a conflicting entry in its exclusive group was applied | derived by the harness |
 | `deferred_budget` | ranked beyond `FUSION_BUDGET` | derived by the harness |
 | `unaccounted` | nobody said anything | **the gate FAILS** |
@@ -220,6 +220,16 @@ Three things about this that are easy to get wrong:
 
 Reasons must be reasons. `"skipped"`, `""`, and `"not attempted"` are rejected; the failure
 they hide is exactly the one the gate exists to surface.
+
+🔴 **An in-budget tier-A/B row with `unit_side_status` in `pass`, `equivalent_pass`, or
+`subsumed_pass` may NOT be returned as `deferred_with_reason`.** Unit-side already paid the
+cost to prove correctness and isolated speedup; apply-back must now wire it and run the live
+engagement + A/B + accuracy gates. The only valid terminal states are `applied`, or `blocked`
+after an actual attempt with its evidence. A single TP-sized serving set is normal: run the
+baseline and candidate sequentially on the same GPUs. "No relaunch after hang" forbids retrying
+a server initialization that hung; it does not forbid cleanly stopping a successful baseline
+and launching the candidate configuration. If apply-back itself cannot reach a terminal result,
+let the phase fail so the orchestrator preserves the pre-Fusion state and continues Profile.
 
 Run the gate yourself before returning, and fix what it reports rather than working around it:
 

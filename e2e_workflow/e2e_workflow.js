@@ -797,9 +797,10 @@ const STRATEGY_SCHEMA = obj({
 // Profile + Strategize phases that follow own the post-fusion Top-N and routing.
 // COVERAGE: `accepted_fusions` alone made a 2-of-12 round render as a success. The
 // Top-K execution_list is the denominator now, so the return also carries the rows that
-// did NOT land — `rejected` (blocked, with a reason) and `deferred` (left for next round,
-// with a reason) — plus the applyback gate's own verdict. `fusion_applyback_harness.py`
-// fails on any exec_id nobody accounted for; "not mentioned" is a hole, not a skip.
+// did NOT land — `rejected` (blocked, with a reason) and `deferred` (only rows that are
+// not in-budget unit-side passes) — plus the applyback gate's own verdict.
+// `fusion_applyback_harness.py` fails on any exec_id nobody accounted for and on any
+// in-budget tier-A/B unit-side pass returned as deferred.
 const FUSION_APPLY_SCHEMA = obj({
   accepted_fusions: arrObj,   // [{exec_id, fusion, rung, overlay_path, tpot_delta_pct, throughput_delta_pct, nonoverlap, gsm8k_base, gsm8k_cand, engaged}]
   final_overlay: { type: 'string' },      // stacked combined-loader overlay dir (PYTHONPATH), '' if none accepted
@@ -807,7 +808,7 @@ const FUSION_APPLY_SCHEMA = obj({
   accepted_flags: { type: 'string' },
   accepted_env: { type: 'string' },
   rejected: arrObj,           // [{exec_id, reason}] — attempted or ruled out
-  deferred: arrObj,           // [{exec_id, reason}] — knowingly left for next round
+  deferred: arrObj,           // [{exec_id, reason}] — never an in-budget unit-side pass
   deferred_author_count: { type: 'number' },
   applyback_gate_json: { type: 'string' }, applyback_report_md: { type: 'string' },
   // Which knowledge/learned cards this run merged/inserted. Phase 2.1 requires a
@@ -3293,7 +3294,10 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
       'via a combined-loader; on wire/gate/accuracy failure DEGRADE to the next ladder rung, then move to the next ' +
       'candidate. For tier-A run the same serving A/B + engagement gate and return accepted_flags/accepted_env. Skip tier-C. COVERAGE: FUSION_TOPK_JSON.execution_list is the ' +
       'denominator — EVERY exec_id must end applied / blocked+reason (rejected[]) / deferred+reason ' +
-      '(deferred[]); a row you filtered out (not 单侧-pass, not tier-A/B, past budget) still needs its ' +
+      '(deferred[]); however an in-budget tier-A/B row with unit_side_status pass/equivalent_pass/' +
+      'subsumed_pass MUST complete live apply-back and may not be deferred. A single TP-sized server ' +
+      'set is expected: run baseline and candidate sequentially; no-relaunch-on-hang only forbids ' +
+      'retrying a hung initialization. A row you filtered out (not 单侧-pass, not tier-A/B, past budget) still needs its ' +
       'one-line reason. Run scripts/fusion_applyback_harness.py --topk --apply --unitside --budget ' +
       'before returning and fix what it reports; return its report + json paths. ' +
       'THEN CURATE knowledge/learned/: for each fusion that passed its e2e+accuracy gate, MERGE ' +

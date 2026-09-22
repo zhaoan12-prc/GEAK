@@ -1006,8 +1006,10 @@ The ranker now emits, alongside the ranked table:
   2026-08-26 it was 12 rows drawn from 42 candidates.
 - `execution_list` — one `exec_id` per ranked row, carrying the concrete
   `candidate_ids` it stands for. **UnitSide and KernelFusion apply-back are accounted
-  against this list**: every entry must end `applied`, `blocked`, or
-  `deferred_with_reason`. Not being mentioned is a coverage hole, not a skip.
+  against this list**: every entry must have a terminal disposition. An in-budget tier-A/B
+  row whose unit-side status passed must finish `applied` or `blocked` after a real
+  apply-back attempt; it cannot use `deferred_with_reason`. Not being mentioned is a
+  coverage hole, not a skip.
 - `subsumed_by` / `ladder_top` / `subsumes` / `unit_cost` — the ladder. A row whose
   removable-row set is a strict SUBSET of another surviving row's is a lower rung of
   the same ladder (AR+norm inside AR+norm+quant). Both rows stay on the board — the
