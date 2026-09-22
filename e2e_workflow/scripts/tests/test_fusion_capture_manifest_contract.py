@@ -158,10 +158,19 @@ class FusionCaptureManifestContractTest(unittest.TestCase):
             "FUSION_UNITSIDE_JSON: FUSION_INPUTS.FUSION_UNITSIDE_JSON",
             apply_block,
         )
-        self.assertIn(
-            "refusing to run Profile on the pre-Fusion stack",
-            source,
-        )
+
+    def test_applyback_failure_preserves_prefusion_state_and_continues_profile(self):
+        source = self._workflow_source()
+        fallback = source.index(
+            "KernelFusion apply-back failed or returned no terminal result")
+        profile = source.index("phase('Profile');", fallback)
+        block = source[fallback:profile]
+        self.assertLess(fallback, profile)
+        self.assertIn("pre-Fusion overlay/flags/env/throughput", block)
+        self.assertIn("applied: [], blocked: [], deferred: []", block)
+        self.assertIn("else if (!fapply) fusionStatus = 'applyback_failed';", block)
+        self.assertNotIn(
+            "KernelFusion apply-back did not reach a terminal state", source)
 
 
 if __name__ == "__main__":

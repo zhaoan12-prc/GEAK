@@ -3315,14 +3315,20 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
       }),
     { phase: 'KernelFusion', label: 'fusion_integrator:apply_back',
       schema: FUSION_APPLY_SCHEMA, timeoutMs: FUSION_APPLY_TIMEOUT_MS }, 1);
-  // Once apply-back has started, a missing terminal result is not equivalent to
-  // "no Fusion win".  Continuing would profile stale curOverlay/curFlags while
-  // an uncancelled integrator may still finish later and write contradictory
-  // artifacts.  Stop at the phase boundary instead of contaminating every
-  // downstream GEAK decision.
+  // KernelFusion is an optional optimization track. If apply-back fails to return a
+  // terminal result, preserve the exact pre-Fusion runtime state and continue with the
+  // formal Profile. Record the failure explicitly so reports do not confuse "Fusion
+  // failed" with "Fusion ran and found no win".
   if (!fapply) {
-    throw new Error(
-      'KernelFusion apply-back did not reach a terminal state; refusing to run Profile on the pre-Fusion stack.');
+    log('KernelFusion apply-back failed or returned no terminal result; preserving the ' +
+        'pre-Fusion overlay/flags/env/throughput and continuing to formal Profile.');
+    fusionDisposition = {
+      applied: [], blocked: [], deferred: [], dispositioned: 0,
+      deferred_author_count: 0,
+      applyback_report_md: '', applyback_gate_json: '', learned_cards: [],
+      notes: 'KernelFusion apply-back failed before producing a terminal result; ' +
+             'the pre-Fusion runtime state was preserved for downstream Profile.',
+    };
   }
   const acc = (fapply && Array.isArray(fapply.accepted_fusions)) ? fapply.accepted_fusions : [];
   // Surface the coverage verdict in the run log next to the win count. Two accepted
