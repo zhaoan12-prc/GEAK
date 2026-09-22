@@ -111,6 +111,9 @@ class FusionCaptureManifestContractTest(unittest.TestCase):
             "FUSION_VALIDATION_JSON: discover.validation_json",
             rank_block,
         )
+        self.assertIn("WORKLOAD_ISL: ISL", rank_block)
+        self.assertIn("WORKLOAD_OSL: OSL", rank_block)
+        self.assertIn("WORKLOAD_CONC: CONC", rank_block)
 
     def test_partial_semantics_cannot_enter_fusion_discovery(self):
         source = self._workflow_source()

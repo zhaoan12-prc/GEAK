@@ -343,6 +343,9 @@ def validate(topk_path, apply_path, unitside_path=None, budget=None,
             "applyback_required": applyback_required,
             "forward_us": entry.get("forward_us"),
             "forward_pct": entry.get("forward_pct"),
+            "workload_weight": entry.get("workload_weight"),
+            "workload_savings_us": entry.get("workload_savings_us"),
+            "workload_forward_pct": entry.get("workload_forward_pct"),
             "disposition": disposition,
             "reason": reason,
             "source": source,
@@ -531,9 +534,15 @@ def render_markdown(result):
     lines.append("| # | exec | 阶段 | 难度 | 融合 | 对应候选 | 预期 forward 收益 | 去向 | 依据 | 说明 |")
     lines.append("|---:|---|:--:|:--:|---|---|---:|:--:|:--:|---|")
     for r in result["results"]:
-        gain = ("%d µs（%.2f%%）" % (r["forward_us"], r["forward_pct"])
-                if r.get("forward_us") is not None
-                and r.get("forward_pct") is not None else "-")
+        if (r.get("workload_savings_us") is not None and
+                r.get("workload_forward_pct") is not None):
+            gain = "%.0f µs（%.2f%% workload；单次 %.0f µs / phase %.2f%%）" % (
+                r["workload_savings_us"], r["workload_forward_pct"],
+                r.get("forward_us") or 0.0, r.get("forward_pct") or 0.0)
+        else:
+            gain = ("%d µs（%.2f%%）" % (r["forward_us"], r["forward_pct"])
+                    if r.get("forward_us") is not None
+                    and r.get("forward_pct") is not None else "-")
         lines.append("| %s | `%s` | %s | %s | %s | %s | %s | **%s** | %s | %s |" % (
             _esc(r.get("rank")), _esc(r.get("exec_id")), _esc(r.get("phase")),
             _esc(r.get("tier")), _esc(r.get("action")),

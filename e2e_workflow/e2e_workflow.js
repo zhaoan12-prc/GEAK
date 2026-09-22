@@ -3132,7 +3132,9 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
               FUSION_CANDIDATES_JSON: discover.fusion_candidates_json,
               FUSION_VALIDATION_JSON: discover.validation_json,
               SEMANTIC_TABLE_JSON: semantics.semantic_table_json,
-              TOP_K: FUSION_TOP_K, SKILL_DIR: WORKFLOW_DIR,
+              TOP_K: FUSION_TOP_K,
+              WORKLOAD_ISL: ISL, WORKLOAD_OSL: OSL, WORKLOAD_CONC: CONC,
+              SKILL_DIR: WORKFLOW_DIR,
               ...FUSION_RUNTIME_INPUTS,
             }),
           { phase: 'KernelFusion', label: 'fusion-analyst:rank', schema: FUSION_RANK_SCHEMA }, 1);

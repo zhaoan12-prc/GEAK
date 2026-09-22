@@ -40,7 +40,9 @@ Optional:
   TP, and workload. When supplied, it is authoritative for environment lookup.
 - `RUNTIME_IMAGE`, `MODEL_PATH`, `TP`: explicit overrides when the setup file
   is unavailable or ambiguous
-- `TOP_K`: ignored in Phase 2.1; reserved for the later Phase 2.2 extension
+- `TOP_K`: ignored in Phase 2.1; used by Phase 2.2
+- `WORKLOAD_ISL`, `WORKLOAD_OSL`, `WORKLOAD_CONC`: requested serving workload;
+  Phase 2.2 uses it to weight the merged prefill/decode ranking
 
 If a required artifact is absent or unreadable, return `status=failed`. If
 Semantics quality is useful but degraded, continue with `status=partial` and
@@ -944,7 +946,8 @@ python3 "$SKILL_DIR/scripts/fusion_topk_harness.py" \
   --validation "$FUSION_DIR/fusion_candidate_result.json" \
   --semantic-table "$SEMANTIC_TABLE_JSON" \
   --out-md "$EVAL_DIR/03_FUSION_TOPK.md" \
-  --out-json "$FUSION_DIR/fusion_topk.json" --top-k 10
+  --out-json "$FUSION_DIR/fusion_topk.json" --top-k "$TOP_K" \
+  --isl "$WORKLOAD_ISL" --osl "$WORKLOAD_OSL" --conc "$WORKLOAD_CONC"
 ```
 
 板子写 `$EVAL_DIR/03_FUSION_TOPK.md`（根目录，和其他阶段报告并排），`fusion_topk.json`
@@ -978,12 +981,15 @@ The ranker is deterministic and encodes these rules — do not hand-rank:
   fact, not exact. C counts by authoring. Blocked occurrences stay in `full_us`
   for reference but not in the ranked benefit. The action verb: `开启` (A flag) /
   `接入` (B integrate existing kernel) / `实现` (C author).
-- **One merged action table** with a 阶段 (phase) column — prefill and decode
-  are different forwards so their `整-forward 占比` uses each phase's own total
-  (never summed), but they share one ranked list. Each row is an actionable
+- **One merged action table** with a 阶段 (phase) column. It retains each phase's
+  local `forward_pct` for diagnosis, then estimates request-level forward benefit
+  for the real workload: prefill weight = 1, decode weight = `max(OSL - 1, 0)`.
+  The first output token is produced by prefill. ISL and concurrency are already
+  represented by the captured phase shape, so they are recorded but not multiplied
+  again. Each row is an actionable
   `(recipe, phase)`: 实现难度 / 阶段 / 优先行动（集成什么）/ 覆盖范围 (`pattern×层数`)
-  / 对应 flag 或 API / 预期整-forward 收益 / 现成算子 / 互斥.
-- **Ordered by difficulty A→B→C, then by 整-forward 占比 within a tier**
+  / 对应 flag 或 API / 预期 workload forward 收益 / 现成算子 / 互斥.
+- **Ordered by difficulty A→B→C, then by `workload_forward_pct` within a tier**
   (quick wins first). The main table lists **A and B** (`--tiers A,B`); C
   author-track is rendered in a separate deferred section **using the same
   columns** as A/B, ordered C1→C2→C3 then by benefit.

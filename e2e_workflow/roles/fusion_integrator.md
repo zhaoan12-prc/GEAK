@@ -136,7 +136,9 @@ This is the KernelFusion apply-back driver — the orchestrator has no fs access
    was benched and passed and that microbench covered this rung's rows — it is a pass,
    not a gap. `budget_skipped` / `not_validated` are NOT eligible: they were never
    measured, and they must be returned in `deferred[]` saying exactly that, never as
-   "not a win". Order by Top-K `forward_pct`, up to `FUSION_BUDGET`. Tier-A belongs here, not ConfigSweep: apply its one flag/env,
+   "not a win". Preserve the Top-K `execution_list` order (within a tier it is
+   ranked by the real-workload `workload_forward_pct`), up to `FUSION_BUDGET`.
+   Tier-A belongs here, not ConfigSweep: apply its one flag/env,
    run serving A/B, verify the fused kernel/route engagement, and keep or revert it
    before moving to the next row.
 2. Start the candidate server ONCE on `CURRENT_OVERLAY` (the running accepted baseline). Walk the

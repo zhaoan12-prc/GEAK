@@ -108,6 +108,79 @@ class FusionTopkTest(unittest.TestCase):
             # C1 author-track deferred, not ranked
             self.assertEqual(result["deferred_author_count"], 1)
 
+    def _cross_phase_rank(self, tmp, workload=None):
+        table = {"tables": [
+            {"phase": "prefill", "pattern_id": "P0",
+             "rows": [{"row_id": "p", "provider": "aiter"}]},
+            {"phase": "decode", "pattern_id": "P0",
+             "rows": [{"row_id": "d", "provider": "aiter"}]},
+        ]}
+        candidates = {"candidates": [
+            {"candidate_id": "prefill_win", "phase": "prefill",
+             "pattern_id": "P0", "family": "prefill_family",
+             "implementation_class": "existing_api_needs_adapter",
+             "readiness": "ready_for_api_validation",
+             "exact_kernel_status": "yes", "removable_row_ids": ["p"],
+             "existing_apis": [{"name": "prefill_kernel"}]},
+            {"candidate_id": "decode_win", "phase": "decode",
+             "pattern_id": "P0", "family": "decode_family",
+             "implementation_class": "existing_api_needs_adapter",
+             "readiness": "ready_for_api_validation",
+             "exact_kernel_status": "yes", "removable_row_ids": ["d"],
+             "existing_apis": [{"name": "decode_kernel"}]},
+        ]}
+        validation = {"metrics": {
+            "phase_total_forward_us": {"prefill": 1000.0, "decode": 100.0},
+            "candidate_savings": [
+                {"candidate_id": "prefill_win", "estimate_us": 10.0,
+                 "stack_estimate_us": 100.0},
+                {"candidate_id": "decode_win", "estimate_us": 1.0,
+                 "stack_estimate_us": 5.0},
+            ]}}
+        return topk.rank(
+            self._write(tmp, "cross-c.json", candidates),
+            self._write(tmp, "cross-v.json", validation),
+            self._write(tmp, "cross-t.json", table), 10,
+            workload=workload)
+
+    def test_real_workload_moves_repeated_decode_ahead_of_prefill(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, actions, _ = self._cross_phase_rank(
+                tmp, {"isl": 8192, "osl": 1000, "conc": 4})
+            # Locally prefill is 10% and decode is only 5%, but the request has
+            # 999 decode forwards, so decode is the larger throughput target.
+            self.assertEqual([a["phase"] for a in actions],
+                             ["decode", "prefill"])
+            decode = actions[0]
+            self.assertEqual(result["workload"]["decode_forwards"], 999)
+            self.assertEqual(result["workload_total_forward_us"], 100900.0)
+            self.assertEqual(decode["forward_pct"], 5.0)
+            self.assertEqual(decode["workload_weight"], 999)
+            self.assertEqual(decode["workload_savings_us"], 4995.0)
+            self.assertEqual(decode["workload_forward_pct"], 4.9504)
+            self.assertEqual(
+                result["execution_list"][0]["workload_forward_pct"], 4.9504)
+
+    def test_osl_one_assigns_no_decode_forward(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, actions, _ = self._cross_phase_rank(
+                tmp, {"isl": 8192, "osl": 1, "conc": 4})
+            self.assertEqual(result["workload"]["decode_forwards"], 0)
+            self.assertEqual([a["phase"] for a in actions],
+                             ["prefill", "decode"])
+            self.assertEqual(actions[1]["workload_savings_us"], 0.0)
+            self.assertEqual(actions[1]["workload_forward_pct"], 0.0)
+
+    def test_missing_workload_preserves_phase_local_ranking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, actions, _ = self._cross_phase_rank(tmp)
+            self.assertFalse(result["workload"]["available"])
+            self.assertEqual(result["workload"]["ranking_metric"],
+                             "phase_forward_pct")
+            self.assertEqual([a["phase"] for a in actions],
+                             ["prefill", "decode"])
+            self.assertIsNone(actions[0]["workload_forward_pct"])
+
     def test_mutually_exclusive_cross_tier_both_listed(self):
         # Two decode candidates sharing a removable row (mutually exclusive):
         # a high-benefit A and a low-benefit B. Different tiers -> BOTH are

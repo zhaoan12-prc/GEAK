@@ -9,8 +9,9 @@ facts; it consumes the harness-computed savings and adds:
   * grouping of candidates that share one implementation into a "recipe"
     (build once, reuse across patterns) — benefit aggregates across patterns
     within a phase, effort is counted once;
-  * per-phase ranking (prefill and decode are different forwards; never summed),
-    scored by benefit-per-effort, with mutual-exclusion groups flagged.
+  * workload-aware ranking: retain each phase's local benefit, then weight one
+    prefill forward plus ``OSL - 1`` decode forwards for the requested workload;
+  * benefit-per-effort scoring, with mutual-exclusion groups flagged.
 """
 import argparse
 import json
@@ -93,6 +94,70 @@ def _load(path):
         return json.load(fh)
 
 
+def _nonnegative_int(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _workload_model(workload, phase_total):
+    """Build the request-level phase weights used by the merged Top-K.
+
+    The prefill trace already represents the requested ISL shape, so ISL must
+    not multiply its measured forward time again. The first output token is
+    produced by prefill; the remaining output tokens each require one decode
+    forward, hence ``decode_forwards = max(OSL - 1, 0)``. Concurrency is also
+    already represented by the captured serving shape and is metadata here.
+
+    Older standalone callers may omit workload. They keep the legacy phase-
+    local ranking instead of silently inventing an OSL.
+    """
+    workload = workload if isinstance(workload, dict) else {}
+    isl = _nonnegative_int(workload.get("isl"))
+    osl = _nonnegative_int(workload.get("osl"))
+    conc = _nonnegative_int(workload.get("conc"))
+    available = isl is not None and osl is not None
+    if not available:
+        return {
+            "available": False,
+            "isl": isl,
+            "osl": osl,
+            "conc": conc,
+            "prefill_forwards": None,
+            "decode_forwards": None,
+            "ranking_metric": "phase_forward_pct",
+            "reason": "isl/osl not supplied; preserved phase-local ranking",
+        }, {}, None
+
+    phase_weights = {
+        "prefill": 1,
+        "decode": max(osl - 1, 0),
+    }
+    total = sum(
+        float(phase_total.get(phase, 0.0) or 0.0) * weight
+        for phase, weight in phase_weights.items())
+    return {
+        "available": True,
+        "isl": isl,
+        "osl": osl,
+        "conc": conc,
+        "prefill_forwards": phase_weights["prefill"],
+        "decode_forwards": phase_weights["decode"],
+        "ranking_metric": "workload_forward_pct",
+    }, phase_weights, round(total, 3)
+
+
+def _ranking_pct(row):
+    workload_pct = row.get("workload_forward_pct")
+    if workload_pct is not None:
+        return workload_pct
+    return row.get("forward_pct") or 0.0
+
+
 def _row_provider_index(table):
     index = {}
     for item in table.get("tables", []):
@@ -168,7 +233,7 @@ def _is_actionable(candidate, savings, tier, guard_blocked_ids):
 
 
 def rank(candidates_path, validation_path, semantic_table_path, top_k,
-         tiers="A,B"):
+         tiers="A,B", workload=None):
     payload = _load(candidates_path)
     validation = _load(validation_path)
     table = _load(semantic_table_path)
@@ -181,6 +246,8 @@ def rank(candidates_path, validation_path, semantic_table_path, top_k,
     savings_by_id = {
         s["candidate_id"]: s for s in metrics.get("candidate_savings", [])}
     phase_total = metrics.get("phase_total_forward_us", {}) or {}
+    workload_info, phase_weights, workload_total = _workload_model(
+        workload, phase_total)
     # Collective candidates whose fused path a size guard blocks at this shape
     # (harness-computed, deterministic). These are 现成算子=有 but not applicable
     # here, so they drop off the actionable board.
@@ -305,6 +372,13 @@ def rank(candidates_path, validation_path, semantic_table_path, top_k,
             benefit = round(recipe["phase_benefit_us"][phase], 3)
             forward = float(phase_total.get(phase, 0.0) or 0.0)
             pct = round(benefit / forward * 100.0, 4) if forward else None
+            workload_weight = phase_weights.get(phase)
+            workload_savings = (
+                round(benefit * workload_weight, 3)
+                if workload_weight is not None else None)
+            workload_pct = (
+                round(workload_savings / workload_total * 100.0, 4)
+                if workload_savings is not None and workload_total else None)
             phase_tiers = recipe["phase_tiers"].get(phase)
             if phase_tiers:
                 phase_tier = min(phase_tiers, key=lambda t: tier_rank.get(t, 9))
@@ -328,9 +402,14 @@ def rank(candidates_path, validation_path, semantic_table_path, top_k,
                 "actionable_us": benefit,
                 "full_us": round(recipe["phase_full_us"][phase], 3),
                 "forward_pct": pct,
+                "workload_weight": workload_weight,
+                "workload_savings_us": workload_savings,
+                "workload_forward_pct": workload_pct,
                 "tier": phase_tier,
                 "route": TIER_ROUTE.get(phase_tier, "?"),
-                "score": round(pct / weight, 5) if pct is not None else None,
+                "score": round(
+                    (workload_pct if workload_pct is not None else pct) / weight,
+                    5) if (workload_pct is not None or pct is not None) else None,
                 "coverage": ", ".join(dict.fromkeys(cover)),
                 "handle": handle,
                 "exact": "有" if any(
@@ -407,6 +486,9 @@ def rank(candidates_path, validation_path, semantic_table_path, top_k,
                 "handle": pp.get("handle", ""),
                 "forward_us": pp["actionable_us"],
                 "forward_pct": pp["forward_pct"],
+                "workload_weight": pp["workload_weight"],
+                "workload_savings_us": pp["workload_savings_us"],
+                "workload_forward_pct": pp["workload_forward_pct"],
                 "exact": pp.get("exact", "无"),
                 "recipe_key": recipe["recipe_key"],
                 "removable_key": removable_key,
@@ -418,7 +500,7 @@ def rank(candidates_path, validation_path, semantic_table_path, top_k,
             else:
                 deferred_author.append(row)
     actions.sort(key=lambda a: (
-        tier_rank.get(a["tier"], 9), -(a["forward_pct"] or 0.0)))
+        tier_rank.get(a["tier"], 9), -_ranking_pct(a)))
     # Fold ONLY true duplicates: same phase + same removable-row set = the same
     # fusion realized by different backend kernel variants → one row. Different
     # removable sets (AR+norm vs AR+norm+quant) or different tiers stay SEPARATE
@@ -475,7 +557,7 @@ def rank(candidates_path, validation_path, semantic_table_path, top_k,
             a["_subsumed_by_index"] = None
             continue
         supersets = [
-            (len(b["removable_key"]), -(b["forward_pct"] or 0.0), j)
+            (len(b["removable_key"]), -_ranking_pct(b), j)
             for j, b in by_index
             if j != i and b["phase"] == a["phase"]
             and b["removable_key"] and ka < b["removable_key"]]
@@ -531,6 +613,9 @@ def rank(candidates_path, validation_path, semantic_table_path, top_k,
                 cid for cid in candidate_ids if cid != representative],
             "forward_us": a["forward_us"],
             "forward_pct": a["forward_pct"],
+            "workload_weight": a["workload_weight"],
+            "workload_savings_us": a["workload_savings_us"],
+            "workload_forward_pct": a["workload_forward_pct"],
             "exclusive_group": None,
             # Every entry must end in one of these downstream. "not mentioned"
             # is not an outcome.
@@ -619,6 +704,7 @@ def rank(candidates_path, validation_path, semantic_table_path, top_k,
             "members": [
                 {"exec_id": m["exec_id"], "action": m["action"],
                  "tier": m["tier"], "forward_pct": m["forward_pct"],
+                 "workload_forward_pct": m["workload_forward_pct"],
                  "conflicts_with": m.get("conflicts_with", []),
                  "candidate_ids": m["candidate_ids"]}
                 for m in members],
@@ -667,6 +753,8 @@ def rank(candidates_path, validation_path, semantic_table_path, top_k,
         "shown_tiers": sorted(show_tiers),
         "tier_weights": TIER_WEIGHT,
         "phase_total_forward_us": phase_total,
+        "workload": workload_info,
+        "workload_total_forward_us": workload_total,
         "recipe_count": len(ranked_recipes),
         "topk_actions": actions,
         "deferred_author_count": len(deferred_author),
@@ -680,6 +768,20 @@ def rank(candidates_path, validation_path, semantic_table_path, top_k,
 
 def _esc(value):
     return str(value or "").replace("|", "\\|")
+
+
+def _render_gain(row):
+    """Render the metric that actually determines merged-board order."""
+    workload_pct = row.get("workload_forward_pct")
+    workload_us = row.get("workload_savings_us")
+    if workload_pct is not None and workload_us is not None:
+        local = ("%.2f%%" % row["forward_pct"]
+                 if row.get("forward_pct") is not None else "n/a")
+        return "%.0f µs（%.2f%%；单次 %.0f µs / phase %s）" % (
+            workload_us, workload_pct, row.get("forward_us") or 0.0, local)
+    return ("%.0f µs（%.2f%%）" %
+            (row.get("forward_us") or 0.0, row["forward_pct"])) \
+        if row.get("forward_pct") is not None else "n/a"
 
 
 def tier_rank_c(tier):
@@ -731,7 +833,7 @@ def _render_coverage(result):
     lines.append("")
     for a in result.get("truncated_actions") or []:
         lines.append("  - 截断：%s（%s，%.2f%%）" % (
-            a["action"], a["tier"], a.get("forward_pct") or 0.0))
+            a["action"], a["tier"], _ranking_pct(a)))
     if result.get("truncated_actions"):
         lines.append("")
     return lines
@@ -772,8 +874,9 @@ def _render_execution_list(result):
             _esc(entry["action"]),
             ", ".join("`%s`" % c for c in entry["candidate_ids"]) or "-",
             unit_text,
-            ("%.2f%%" % entry["forward_pct"])
-            if entry.get("forward_pct") is not None else "n/a",
+            ("%.2f%%" % _ranking_pct(entry))
+            if (entry.get("workload_forward_pct") is not None or
+                entry.get("forward_pct") is not None) else "n/a",
             entry.get("exclusive_group") or "-", ladder))
     lines.append("")
     if any(e.get("subsumed_by") for e in exec_list):
@@ -801,8 +904,9 @@ def _render_execution_list(result):
             conflict = member.get("conflicts_with") or []
             lines.append("> - `%s` %s（%s，%s）%s" % (
                 member["exec_id"], _esc(member["action"]), member["tier"],
-                ("%.2f%%" % member["forward_pct"])
-                if member.get("forward_pct") is not None else "n/a",
+                ("%.2f%%" % _ranking_pct(member))
+                if (member.get("workload_forward_pct") is not None or
+                    member.get("forward_pct") is not None) else "n/a",
                 ("　与 %s 冲突" % ", ".join("`%s`" % c for c in conflict))
                 if conflict else ""))
         lines.append(">")
@@ -814,9 +918,11 @@ def _render_execution_list(result):
 def render_markdown(result, actions):
     lines = ["# Kernel Fusion Top-K (Phase 2.2)", ""]
     fwd = result["phase_total_forward_us"]
+    workload = result.get("workload") or {}
     lines.append(
         "一张合并 Top-K（prefill/decode 用「阶段」列区分）。按**实现难度 A→B** 排序"
-        "（先摘低垂果实），同实现难度内按整-forward 收益占比排。C（需自写 kernel）见文末"
+        "（先摘低垂果实），同实现难度内按真实 workload 的累计 forward 收益占比排。"
+        "C（需自写 kernel）见文末"
         "同格式表，暂缓。**收益均为 roofline 工程估算，落地前以 benchmark 确认。**")
     lines.append("")
     lines.append("实现难度 = 落地工作量：**A** = 配置开启（翻 flag / 确认已启用，零代码）；"
@@ -824,8 +930,21 @@ def render_markdown(result, actions):
                  "**C** = 没有现成算子，需自写 kernel。")
     lines.append("**现成算子** = 有没有可用的现成 fused kernel：**有** = A/B（kernel 已存在）；"
                  "**无** = C（需 author）。它只表示算子在不在，不表示接起来轻重。")
-    lines.append("整-forward 占比分母：prefill ≈ %.0f µs / decode ≈ %.0f µs（各自 forward，不混算）。"
+    lines.append("单次 forward：prefill ≈ %.0f µs / decode ≈ %.0f µs。"
                  % (fwd.get("prefill", 0.0), fwd.get("decode", 0.0)))
+    if workload.get("available"):
+        lines.append(
+            "真实 workload：ISL=%s / OSL=%s / conc=%s；prefill forward × %s，"
+            "decode forward × %s（OSL−1），累计 forward 分母 ≈ %.0f µs。"
+            "ISL/conc 已体现在采集到的 phase shape 中，不重复相乘。"
+            % (workload.get("isl"), workload.get("osl"),
+               workload.get("conc"), workload.get("prefill_forwards"),
+               workload.get("decode_forwards"),
+               result.get("workload_total_forward_us") or 0.0))
+    else:
+        lines.append(
+            "⚠️ 未提供完整 ISL/OSL，无法做 request-level 加权；本次兼容旧行为，"
+            "同难度内按各 phase 自身的 forward 占比排序。")
     lines.append("互斥（✳）的融合方案（同批算子、每处只落一个）都列出、标注供你/3.2 选，不替你择优。")
     lines.append("")
     lines.append(
@@ -837,22 +956,20 @@ def render_markdown(result, actions):
     lines.extend(_render_coverage(result))
     _HEADER = (
         "| 排名 | 实现难度 | 阶段 | 优先行动（集成什么） | 覆盖范围 | "
-        "对应 Kernel / API（怎么开）| 预期整-forward 收益 | 现成算子 | 互斥 |")
+        "对应 Kernel / API（怎么开）| 预期 workload forward 收益 | 现成算子 | 互斥 |")
     _SEP = "|---:|:--:|:--:|---|---|---|---:|:--:|:--:|"
 
     def _render_rows(rows):
         for i, a in enumerate(rows, 1):
-            pct = ("%.2f%%" % a["forward_pct"]) if a[
-                "forward_pct"] is not None else "n/a"
             handle = a["handle"] or "-"
             if a.get("variant_count", 1) > 1:
                 handle += "（%d 个等价 kernel 变体）" % a["variant_count"]
             mex = "✳" if a.get("mutually_exclusive_with") else "-"
             lines.append(
-                "| %d | **%s** | %s | %s | %s | `%s` | %.0f µs（%s）| %s | %s |"
+                "| %d | **%s** | %s | %s | %s | `%s` | %s | %s | %s |"
                 % (i, a["tier"], a["phase"].capitalize(),
                    _esc(a["action"]), _esc(a["coverage"] or "-"),
-                   _esc(handle), a["forward_us"], pct, a["exact"], mex))
+                   _esc(handle), _render_gain(a), a["exact"], mex))
 
     lines.append(_HEADER)
     lines.append(_SEP)
@@ -874,7 +991,7 @@ def render_markdown(result, actions):
         lines.append(_SEP)
         _render_rows(sorted(
             result["deferred_author"],
-            key=lambda x: (tier_rank_c(x["tier"]), -(x["forward_pct"] or 0.0))))
+            key=lambda x: (tier_rank_c(x["tier"]), -_ranking_pct(x))))
         lines.append("")
     lines.extend(_render_execution_list(result))
     lines.append(
@@ -886,9 +1003,10 @@ def render_markdown(result, actions):
 
 
 def run(candidates_path, validation_path, semantic_table_path,
-        out_md, out_json, top_k, tiers="A,B"):
+        out_md, out_json, top_k, tiers="A,B", workload=None):
     result, actions, _ = rank(
-        candidates_path, validation_path, semantic_table_path, top_k, tiers)
+        candidates_path, validation_path, semantic_table_path, top_k, tiers,
+        workload)
     os.makedirs(os.path.dirname(os.path.abspath(out_json)), exist_ok=True)
     with open(out_json, "w") as fh:
         json.dump(result, fh, indent=2, ensure_ascii=False)
@@ -905,14 +1023,18 @@ def main():
     parser.add_argument("--out-md", required=True)
     parser.add_argument("--out-json", required=True)
     parser.add_argument("--top-k", type=int, default=12)
+    parser.add_argument("--isl", type=int)
+    parser.add_argument("--osl", type=int)
+    parser.add_argument("--conc", type=int)
     parser.add_argument(
         "--tiers", default="A,B",
         help="difficulty tiers to include in the ranked table (default A,B; "
              "C author-track is summarized separately)")
     args = parser.parse_args()
+    workload = {"isl": args.isl, "osl": args.osl, "conc": args.conc}
     result = run(
         args.candidates, args.validation, args.semantic_table,
-        args.out_md, args.out_json, args.top_k, args.tiers)
+        args.out_md, args.out_json, args.top_k, args.tiers, workload)
     print(json.dumps({
         "recipe_count": result["recipe_count"],
         "topk_actions": len(result["topk_actions"]),
