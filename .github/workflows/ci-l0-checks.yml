@@ -132,6 +132,10 @@ jobs:
             e2e_workflow/scripts/tests/test_bench_replica_lifecycle.py \
             e2e_workflow/scripts/tests/test_roofline_skill.py \
             e2e_workflow/scripts/tests/test_vllm_adapter_profiler_config.py \
+            e2e_workflow/scripts/tests/test_vllm_phase_annotate.py \
+            e2e_workflow/scripts/tests/test_vllm_semantic_capture.py \
+            e2e_workflow/scripts/tests/test_semantic_runtime_capture.py \
+            e2e_workflow/scripts/tests/test_fusion_candidate_harness.py \
             geak/test_bootstrap.py
 
       - name: expert skill static validation

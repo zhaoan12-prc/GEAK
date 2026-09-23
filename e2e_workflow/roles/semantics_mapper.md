@@ -46,6 +46,19 @@ Phase 1.2 additionally receives `STRUCTURAL_PATTERNS_JSON`, `SEMANTIC_TABLE_JSON
      shape-affecting parameters, and resolved quantization implementation. Names such as attention,
      linear attention, Mamba, MoE, or dense are opaque values for reporting; GEAK does not enumerate
      them as supported kinds.
+   - **Declare `runtime_dispatch_branch` in `body_signature` whenever the runtime routes the layer
+     through a NAMED custom op** — the op's exact registered name (e.g.
+     `vllm::qwen_gdn_attention_core`, `vllm::unified_attention_with_output`). It is load-bearing,
+     not documentation: the deterministic mapper uses it as a per-layer boundary anchor when the
+     trace has no `nn.Module` frames, which is the DEFAULT on vLLM (its V1 engine compiles the model,
+     so per-layer python frames disappear into the compiled graph; these ops survive precisely
+     because they are the graph's `splitting_ops`).
+     * **Every Pattern must declare one, or none is used.** The mapper refuses a partial anchor set
+       rather than half-mapping: on a hybrid model, anchoring only some layer kinds produces layer
+       "bodies" that silently span several real layers.
+     * **A wrong name is caught, not believed.** The mapper checks that the i-th anchor's op is the
+       one the Pattern owning layer i declared, and declines the whole step if not. Write the name
+       you verified in the source; do not guess a plausible one.
    - Put first/last position, model entry/exit, terminal postprocess, collective/residual handoff,
      and pre/post-layer loop behavior in `instance_context`. These facts never participate in the
      Pattern hash. A last layer with the same core body as an interior layer remains in that Pattern.
@@ -88,6 +101,16 @@ Phase 1.2 additionally receives `STRUCTURAL_PATTERNS_JSON`, `SEMANTIC_TABLE_JSON
    **Prefill tables first, then Decode tables**. Keep `--table-phases all`;
    the deterministic script owns this ordering.
 
+4b. **Read the boundary provenance before you trust the table.** In
+   `layer_instance_audit.json`, each `boundary_partition_diagnostics[]` entry has a
+   `partition_method` (`authoritative_scope_ownership`, or `none` when the step stayed
+   `boundary_unresolved`) and a `boundary_evidence` list naming what cut the layers:
+   `python_module_span*` / `validated_graph_capture_layer_scope*` (strongest), then
+   `explicit_layer_marker*` and `declared_dispatch_op_span` (the Pattern-declared dispatch-op
+   anchors, phase-shifted within the layer). Report the mix per phase in `notes`. On vLLM the
+   normal picture is prefill steps cut by `declared_dispatch_op_span` and DECODE steps
+   unresolved until the graph-construction boundary transfer below runs — decode replays
+   under a CUDA graph and emits no per-layer CPU op at all.
 5. Read `semantic_mapping_quality.json` and return its real status:
    - `pass`: structural coverage and every required phase have authoritative layer boundaries,
      representative integrity, exact layer order, and conservation.

@@ -538,6 +538,284 @@ class PhaseCoverageTest(unittest.TestCase):
         self.assertFalse(coverage["decode_sequence_covered"])
         self.assertEqual(coverage["decode_evidence"], "no_decode_trace_analysed")
 
+    # ------------------------------------------------------------------ #
+    # declared dispatch-op layer anchors (the torch.compile / hybrid-model path)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _hybrid_pattern_doc(n=8, linear_branch="vllm::qwen_gdn_attention_core",
+                            full_branch="vllm::unified_attention_with_output"):
+        """n layers, every 4th one full-attention -- the Qwen3.5 hybrid shape."""
+        full = [i for i in range(n) if i % 4 == 3]
+        lin = [i for i in range(n) if i % 4 != 3]
+        def pat(pid, attn, layers, branch):
+            sig = {"attention_type": attn, "runtime_dispatch_branch": branch}
+            return {"pattern_id": pid, "attention_type": attn,
+                    "layer_ids": layers, "structural_signature": sig}
+        return {"num_hidden_layers_main": n,
+                "patterns": [pat("P_lin", "linear", lin, linear_branch),
+                             pat("P_full", "full", full, full_branch)]}
+
+    @staticmethod
+    def _step_and_anchors(doc, n=8, base=1000, step=10, swap=None, drop=0):
+        """One annotated step plus one cpu_op anchor per layer, in layer order."""
+        events = [{"cat": "gpu_user_annotation", "name": "step[EXTEND bs=1 toks=64]",
+                   "ts": base, "dur": step * (n + 2)},
+                  {"cat": "user_annotation", "name": "step[EXTEND bs=1 toks=64]",
+                   "ts": base, "dur": step * (n + 2)}]
+        by_layer = {}
+        for pattern in doc["patterns"]:
+            for layer in pattern["layer_ids"]:
+                by_layer[layer] = pattern["structural_signature"][
+                    "runtime_dispatch_branch"]
+        for layer in range(n - drop):
+            name = by_layer[layer]
+            if swap and layer in swap:
+                name = swap[layer]
+            events.append({"cat": "cpu_op", "name": name,
+                           "ts": base + step * (layer + 1), "dur": 1})
+        return events
+
+    def test_dispatch_anchors_resolve_every_layer_when_modules_are_compiled_away(self):
+        """The vllm case: no nn.Module frames, one splitting op per layer."""
+        doc = self._hybrid_pattern_doc()
+        events = self._step_and_anchors(doc)
+        spans = mapping._collect_step_spans(events)
+        scopes, diag = mapping._dispatch_anchor_scopes(events, spans, doc)
+
+        self.assertEqual(diag["status"], "mapped")
+        self.assertEqual(len(scopes), 8)
+        self.assertEqual([s["layer_id"] for s in scopes], list(range(8)))
+        # Pattern assignment must follow the declared layout, not the anchor order alone.
+        self.assertEqual([s["pattern_id"] for s in scopes],
+                         ["P_lin", "P_lin", "P_lin", "P_full"] * 2)
+        # Contiguous, non-overlapping partition.
+        for earlier, later in zip(scopes, scopes[1:]):
+            self.assertEqual(earlier["end"], later["ts"])
+        self.assertTrue(all(s["scope_source"] == "declared_dispatch_op" for s in scopes))
+
+    @staticmethod
+    def _dispatch_rows(layers=2, per_layer=3, phase="decode"):
+        rows = []
+        for layer in range(layers):
+            for pos in range(per_layer):
+                rows.append({
+                    "row_id": "r%d-%d" % (layer, pos),
+                    "step_id": "step-0",
+                    "device_seq_index": layer * per_layer + pos,
+                    "layer_id": layer,
+                    "layer_instance_id": "step-0:pass-0:layer-%d" % layer,
+                    "layer_evidence": "declared_dispatch_op_span",
+                    "stage": ("attn", "gemm", "norm")[pos % 3],
+                    "assignment": "layer_body", "phase": phase,
+                })
+        return rows
+
+    def test_dispatch_scoped_rows_keep_their_ownership_verbatim(self):
+        """An exact op boundary must not be re-cut.
+
+        On fix/vllm a medoid refinement meant for module spans applied a PREFILL template
+        to a decode step and pushed the attention run into the previous segment -- the
+        decode P_full_attn representative came back with no `attn` kernel. Mainline's
+        partition only accepts scope ownership, so each layer must still open on its own
+        attention kernel.
+        """
+        rows = self._dispatch_rows()
+        doc = {"num_hidden_layers_main": 2, "patterns": [
+            {"pattern_id": "P0", "layer_ids": [0]},
+            {"pattern_id": "P1", "layer_ids": [1]}]}
+        diagnostics, _ = mapping._authoritative_layer_partition(rows, doc)
+        self.assertEqual(diagnostics[0]["status"], "mapped")
+        self.assertEqual(diagnostics[0]["mapped_event_count"], 6)
+        self.assertEqual(rows[0]["stage"], "attn")
+        self.assertEqual(rows[0]["boundary_role"], "body_start_kernel")
+        self.assertEqual(rows[2]["boundary_role"], "end_kernel")
+        self.assertEqual(rows[3]["stage"], "attn")
+        self.assertEqual(rows[3]["boundary_role"], "body_start_kernel")
+
+    def test_unclaimed_rows_before_the_first_layer_stay_global(self):
+        """An event no scope claimed is not folded into a neighbour.
+
+        Folding it in would inflate that layer's measured cost, which is the number the
+        fusion ranking is built on.
+        """
+        rows = self._dispatch_rows()
+        for row in rows:
+            row["device_seq_index"] += 1
+        rows.insert(0, {"row_id": "pre", "step_id": "step-0", "device_seq_index": 0,
+                        "layer_id": None, "layer_instance_id": None,
+                        "layer_evidence": "unresolved", "stage": "memory",
+                        "assignment": "transition_global", "phase": "decode"})
+        doc = {"num_hidden_layers_main": 2, "patterns": []}
+        diagnostics, _ = mapping._authoritative_layer_partition(rows, doc)
+        self.assertEqual(diagnostics[0]["status"], "mapped")
+        self.assertEqual(rows[0]["assignment"], "transition_global")
+        self.assertIsNone(rows[0]["layer_id"])
+
+    def test_unclaimed_row_inside_a_dispatch_scope_leaves_the_step_unresolved(self):
+        """Fail closed: a hole inside a layer breaks ownership contiguity.
+
+        fix/vllm tolerated this (the hole became transition_global and the step still
+        mapped). Mainline requires every authoritative instance to be contiguous, so the
+        step is reported boundary_unresolved instead. Pinned so that a real vLLM trace
+        which trips it is seen as this case, not as a regression elsewhere.
+        """
+        rows = self._dispatch_rows()
+        rows[1].update(layer_id=None, layer_instance_id=None,
+                       layer_evidence="unresolved", assignment="transition_global")
+        doc = {"num_hidden_layers_main": 2, "patterns": []}
+        diagnostics, _ = mapping._authoritative_layer_partition(rows, doc)
+        self.assertEqual(diagnostics[0]["status"], "boundary_unresolved")
+
+    def test_dispatch_anchors_decline_when_a_pattern_declares_no_branch(self):
+        """A layer kind with no anchor is the 6-of-24 defect; refuse, do not part-map.
+
+        Half-anchoring is worse than not anchoring: it segments the layers it can see
+        and silently swallows the rest into whatever segment happens to be open.
+        """
+        doc = self._hybrid_pattern_doc()
+        doc["patterns"][1]["structural_signature"]["runtime_dispatch_branch"] = ""
+        events = self._step_and_anchors(doc)
+        spans = mapping._collect_step_spans(events)
+        scopes, diag = mapping._dispatch_anchor_scopes(events, spans, doc)
+        self.assertEqual(scopes, [])
+        self.assertEqual(diag["status"], "patterns_without_dispatch_branch")
+        self.assertEqual(diag["patterns_missing_branch"], ["P_full"])
+
+    def test_dispatch_anchors_decline_a_step_that_is_missing_anchors(self):
+        """CUDA-graph decode emits no per-layer cpu_op; that step must not be mapped."""
+        doc = self._hybrid_pattern_doc()
+        events = self._step_and_anchors(doc, drop=3)
+        spans = mapping._collect_step_spans(events)
+        scopes, diag = mapping._dispatch_anchor_scopes(events, spans, doc)
+        self.assertEqual(scopes, [])
+        self.assertEqual(diag["steps"][0]["status"], "anchor_count_mismatch")
+        self.assertEqual(diag["steps"][0]["anchor_count"], 5)
+
+    def test_dispatch_anchors_decline_when_order_disagrees_with_the_patterns(self):
+        """The check that makes this evidence: anchor kind must match the layer's Pattern."""
+        doc = self._hybrid_pattern_doc()
+        events = self._step_and_anchors(
+            doc, swap={0: "vllm::unified_attention_with_output"})
+        spans = mapping._collect_step_spans(events)
+        scopes, diag = mapping._dispatch_anchor_scopes(events, spans, doc)
+        self.assertEqual(scopes, [])
+        self.assertEqual(diag["steps"][0]["status"],
+                         "anchor_order_disagrees_with_patterns")
+        self.assertEqual(diag["steps"][0]["first_mismatch_layer"], 0)
+
+    def test_module_spans_still_win_over_dispatch_anchors(self):
+        """The fallback must not displace real module evidence when it exists."""
+        doc = self._hybrid_pattern_doc()
+        events = self._step_and_anchors(doc)
+        for layer in range(8):
+            events.append({"cat": "python_function",
+                           "name": "nn.Module: SomeDecoderLayer_%d" % layer,
+                           "ts": 1000 + 10 * (layer + 1) - 2, "dur": 8})
+        spans = mapping._collect_step_spans(events)
+        scopes, diag = mapping._module_layer_scopes(events, spans, doc)
+        self.assertEqual(len(scopes), 8)
+        self.assertNotIn("scope_source", scopes[0])
+        self.assertFalse(any(d.get("source", "").startswith("declared_dispatch")
+                             for d in diag))
+
+    # ------------------------------------------------------------------ #
+    # attention stages resolved from the parent operator
+    # ------------------------------------------------------------------ #
+    def test_generically_named_attention_kernel_resolves_from_its_parent_op(self):
+        """vLLM's TRITON_ATTN launches `_fwd_kernel`, which matches no name rule.
+
+        It landed as `unknown`, so the LARGEST prefill row on Qwen3.5-2B (298.5 us, the
+        attention operator itself) was not a donor -- and Phase 2.1's escalation gate then
+        demanded a fusion candidate for the model's own attention. The parent op is
+        authoritative: it is the registered op the kernel ran under.
+        """
+        stage, rule, source = mapping._stage_detail(
+            "_fwd_kernel", "kernel", "vllm::unified_attention_with_output")
+        self.assertEqual(stage, "attn")
+        self.assertEqual(source, "parent_operator")
+        self.assertEqual(rule, "attention.full.parent")
+
+    def test_parent_op_fallback_still_prefers_linear_attention(self):
+        stage, _rule, _src = mapping._stage_detail(
+            "chunk_fwd_kernel", "kernel", "ChunkGatedDeltaRuleFunction")
+        self.assertEqual(stage, "linear_attn")
+
+    def test_kernel_name_rules_still_win_over_the_parent(self):
+        # A kernel whose own name is conclusive must not be re-decided by its parent.
+        stage, _rule, source = mapping._stage_detail(
+            "kernel_paged_attention_2d", "kernel", "ChunkGatedDeltaRuleFunction")
+        self.assertEqual(stage, "attn")
+        self.assertEqual(source, "kernel_name")
+
+    def test_dispatch_anchor_rows_are_an_authoritative_partition(self):
+        """End to end: the anchor scopes must survive the authoritative-only partition.
+
+        Stage recurrence may never assign layer ids, so without an accepted scope a
+        compiled vllm step is boundary_unresolved. Each kernel here is launched by its
+        layer's dispatch op (External id), which is what puts it in that layer's scope.
+        """
+        doc = self._hybrid_pattern_doc()
+        events = self._step_and_anchors(doc)
+        for index, event in enumerate(list(events)):
+            if event.get("cat") != "cpu_op":
+                continue
+            event["args"] = {"External id": 500 + index}
+            events.append({"cat": "kernel", "name": "k_%d" % index,
+                           "ts": event["ts"] + 2, "dur": 1,
+                           "args": {"External id": 500 + index}})
+        rows, _, _, _, _ = mapping._event_rows(events, doc)
+        self.assertTrue(rows)
+        self.assertTrue(all(row["layer_evidence"] == "declared_dispatch_op_span"
+                            for row in rows))
+        diagnostics, _ = mapping._authoritative_layer_partition(rows, doc)
+        self.assertEqual(len(diagnostics), 1)
+        self.assertEqual(diagnostics[0]["status"], "mapped")
+        self.assertEqual(diagnostics[0]["boundary_evidence"],
+                         ["declared_dispatch_op_span"])
+        self.assertEqual([item["layer_id"] for item in diagnostics[0]["layer_boundaries"]],
+                         list(range(8)))
+        self.assertEqual(mapping._boundary_rank(
+            {"boundary_evidence": {"sources": ["declared_dispatch_op_span"]}}), 1)
+
+    def test_unannotated_single_file_trace_names_the_missing_annotation(self):
+        """vllm without the phase-annotation hook: NOTHING is phase-tagged.
+
+        Pinned because the old wording for this case was `no_decode_trace_analysed`, which
+        reads as "we did not look at a decode trace" and sends you to re-capture -- when the
+        actual fault is that the trace carries no step spans at all, so prefill is equally
+        untagged. The remedy is arming the hook, not another capture.
+        """
+        coverage = mapping._phase_coverage(
+            instances=[{"phase": None}],
+            tables=[{"phase": None, "rows": [{"shape": {"source": "unresolved"}}]}],
+            trace_paths=["vllm-instance-rank-0.1234.pt.trace.json.gz"],
+            adopted_siblings=[], table_phases=None, require_phases=None)
+        self.assertEqual(coverage["trace_phase_tags"], [])
+        self.assertFalse(coverage["phase_annotation_present"])
+        self.assertEqual(coverage["decode_evidence"], "no_phase_annotation_in_trace")
+
+    def test_annotated_single_file_trace_blames_the_window_not_the_capture(self):
+        """Annotation worked, but this window held only prefill steps."""
+        coverage = mapping._phase_coverage(
+            instances=[{"phase": "extend"}],
+            tables=[{"phase": "prefill", "rows": [
+                {"shape": {"source": "kernel_exact"}}]}],
+            trace_paths=["vllm-instance-rank-0.1234.pt.trace.json.gz"],
+            adopted_siblings=[], table_phases=None, require_phases=None)
+        self.assertTrue(coverage["phase_annotation_present"])
+        self.assertEqual(coverage["decode_evidence"],
+                         "mixed_trace_no_decode_steps_in_window")
+
+    def test_split_file_capture_keeps_its_original_verdict(self):
+        """sglang's per-phase filenames are conclusive; that arm must not shift."""
+        coverage = mapping._phase_coverage(
+            instances=[{"phase": "extend"}],
+            tables=[{"phase": "prefill", "rows": [
+                {"shape": {"source": "kernel_exact"}}]}],
+            trace_paths=["a-TP-0-EXTEND.trace.json.gz"],
+            adopted_siblings=[], table_phases=None, require_phases=None)
+        self.assertEqual(coverage["decode_evidence"], "no_decode_trace_analysed")
+
     def test_sequence_and_shape_coverage_fail_independently(self):
         """A replay DECODE trace gives the sequence but no shapes."""
         coverage = mapping._phase_coverage(
