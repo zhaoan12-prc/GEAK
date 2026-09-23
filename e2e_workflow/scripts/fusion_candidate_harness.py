@@ -945,22 +945,30 @@ def validate(semantic_table_path, candidates_path,
         # Collective fused-AR size guard becomes a machine-checked fact so the
         # prefill=no / decode=yes Exact decision is deterministic instead of
         # re-derived (and mis-numbered) by the model each run.
+        # Both are required only when the table has a collective to guard: at TP=1
+        # there is none, and demanding them made the agent record an inapplicable
+        # threshold just to pass.
+        has_collective = any(
+            row.get("stage") == "communication" for row in source_rows.values())
+        missing = errors if has_collective else warnings
         collective_guard = environment.get("collective_fused_ar_guard")
         if (not isinstance(collective_guard, dict)
                 or not isinstance(collective_guard.get("threshold_bytes"), int)
                 or not collective_guard.get("source_expr")
                 or not collective_guard.get("source_ref")):
-            errors.append(
-                "environment API inventory must record collective_fused_ar_guard "
-                "{threshold_bytes:int, source_expr, source_ref}")
+            if has_collective or collective_guard is not None:
+                missing.append(
+                    "environment API inventory must record collective_fused_ar_guard "
+                    "{threshold_bytes:int, source_expr, source_ref}")
             collective_guard = None
         model_dims = environment.get("model_dims")
         if (not isinstance(model_dims, dict)
                 or not isinstance(model_dims.get("hidden_size"), int)
                 or not isinstance(model_dims.get("dtype_bytes"), int)):
-            errors.append(
-                "environment API inventory must record model_dims "
-                "{hidden_size:int, dtype_bytes:int}")
+            if has_collective or model_dims is not None:
+                missing.append(
+                    "environment API inventory must record model_dims "
+                    "{hidden_size:int, dtype_bytes:int}")
             model_dims = None
         # Cross-check the declared threshold against the guard registry keyed by
         # the recorded aiter commit, so the threshold number itself cannot drift.
