@@ -64,6 +64,33 @@ class FusionCaptureManifestContractTest(unittest.TestCase):
             "KernelFusion was explicitly required but produced no apply-back-ready Top-K",
             source,
         )
+        required = source.index(
+            "KernelFusion was explicitly required but produced no apply-back-ready Top-K")
+        profile = source.index("phase('Profile');", required)
+        block = source[required:profile]
+        self.assertNotIn("throw new Error", block)
+        self.assertIn("Recording failure and continuing to formal Profile", block)
+        self.assertIn("failed_stage: requiredFailureStage", block)
+
+    def test_unexpected_fusion_exception_restores_state_and_continues_profile(self):
+        source = self._workflow_source()
+        start = source.index("const fusionEntryState = {")
+        caught = source.index("} catch (e) {", start)
+        profile = source.index("phase('Profile');", caught)
+        block = source[caught:profile]
+        self.assertIn("curOverlay = fusionEntryState.overlay;", block)
+        self.assertIn("curFlags = fusionEntryState.flags;", block)
+        self.assertIn("curEnv = fusionEntryState.env;", block)
+        self.assertIn("curTput = fusionEntryState.throughput;", block)
+        self.assertIn(
+            "acceptedFusions.length = fusionEntryState.acceptedFusionCount;",
+            block,
+        )
+        self.assertIn("FUSION_INPUTS = { ...fusionEntryState.inputs };", block)
+        self.assertIn("status: 'unexpected_exception'", block)
+        self.assertIn("failed_stage: fusionFailureStage", block)
+        self.assertIn("continuing to formal Profile", block)
+        self.assertLess(caught, profile)
 
     def test_external_fusion_artifacts_cannot_bypass_run_local_discovery(self):
         source = self._workflow_source()

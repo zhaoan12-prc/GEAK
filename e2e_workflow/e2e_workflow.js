@@ -108,10 +108,10 @@ if (TL && Object.keys(TL).length) log(`TraceLens prior present: ${Object.keys(TL
 // candidates/Top-K/unitside artifacts as a shortcut around those gates.
 const FUSION_DISCOVERY_ON =
   String(A.fusion_discovery != null ? A.fusion_discovery : 'true') === 'true';
-// An explicitly requested discovery is a required phase: silently continuing
-// would turn "Fusion did not run" into a misleading end-to-end "no win". The
-// implicit default remains best-effort for backward compatibility. Callers may
-// override this independently with fusion_required=false.
+// An explicitly requested discovery remains visible as a required-phase failure
+// in the disposition, but KernelFusion never prevents the formal Profile and
+// later GEAK phases from running. Callers may override this independently with
+// fusion_required=false.
 const FUSION_REQUIRED = String(A.fusion_required != null
   ? A.fusion_required
   : (A.fusion_discovery != null ? A.fusion_discovery : 'false')) === 'true';
@@ -3042,6 +3042,16 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
   phase('KernelFusion');
   fusionSemanticsAttempted = SEMANTICS_MAPPING_ON;
   const fusionEntryTput = curTput;
+  const fusionEntryState = {
+    overlay: curOverlay,
+    flags: curFlags,
+    env: curEnv,
+    throughput: curTput,
+    acceptedFusionCount: acceptedFusions.length,
+    inputs: { ...FUSION_INPUTS },
+  };
+  let fusionFailureStage = 'capture';
+  try {
   // Scope all run-local discovery artifacts together. Nothing outside this
   // block may seed Top-K or Unit-side inputs before the current capture.
   {
@@ -3076,6 +3086,7 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
       log(`KernelFusion capture agent returned no manifest; trying deterministic capture artifact ${expectedFusionManifest}.`);
     }
     if (SEMANTICS_MAPPING_ON && fusionTraceManifest) {
+      fusionFailureStage = 'semantic';
       semantics = await safeAgent(
         roleAgent('semantics_mapper', 'build_table',
           'Build fusion semantics from the clean production graph trace. Eager/shape evidence may only fill semantic gaps. If EXEC_PREFIX is set, use it as the literal command prefix.', {
@@ -3087,6 +3098,7 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
         { phase: 'KernelFusion', label: 'semantics-mapper:fusion', schema: SEMANTICS_SCHEMA }, 1);
       if (FUSION_SHAPE_CAPTURE_ON && semantics &&
           semantics.status !== 'failed' && semantics.status !== 'fail') {
+        fusionFailureStage = 'shape_completion';
         const completed = await safeAgent(
           roleAgent('semantics_mapper', 'complete_table',
             'Complete unresolved shapes without replacing production-trace timing or phase attribution. If EXEC_PREFIX is set, use it as the literal command prefix.', {
@@ -3106,6 +3118,7 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
     }
 
     if (semantics && semantics.status === 'pass' && semantics.semantic_table_json) {
+      fusionFailureStage = 'discovery';
       const discover = await safeAgent(
         roleAgent('kernel_fusion_analyst', 'generate_plans',
           'Generate and deterministically validate the complete run-local fusion inventory. If EXEC_PREFIX is set, use it as the literal command prefix.', {
@@ -3124,6 +3137,7 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
           discover.fusion_candidates_json && discover.validation_json) {
         FUSION_INPUTS.FUSION_CANDIDATES_JSON = discover.fusion_candidates_json;
         FUSION_INPUTS.FUSION_VALIDATION_JSON = discover.validation_json;
+        fusionFailureStage = 'rank';
         const ranked = await safeAgent(
           roleAgent('kernel_fusion_analyst', 'rank_topk',
             'Run the deterministic Top-K ranker and return both the board path and concrete execution_list. If EXEC_PREFIX is set, use it as the literal command prefix.', {
@@ -3140,6 +3154,7 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
           { phase: 'KernelFusion', label: 'fusion-analyst:rank', schema: FUSION_RANK_SCHEMA }, 1);
         if (ranked && ranked.status !== 'failed' && ranked.fusion_topk_json) {
           FUSION_INPUTS.FUSION_TOPK_JSON = ranked.fusion_topk_json;
+          fusionFailureStage = 'unit_validation';
           // ---- unit-side scheduling: spend the budget on LADDER TOPS ------
           // The budget is a microbench-run count, and it used to be spent in
           // flat board order. On DSR1 2026-09-03 that meant e01 (AR+norm, 4
@@ -3252,6 +3267,7 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
             }
           }
           const deferred = budgetSkipped.map(item => ({ ...item, disposition: 'budget_skipped' }));
+          fusionFailureStage = 'unit_aggregate';
           const aggregate = await safeAgent(
             roleAgent('fusion_unit_validator', 'aggregate',
               'Aggregate only the Top-K execution_list candidate ids. Pass EQUIVALENT_COVERED rows as ' +
@@ -3283,6 +3299,7 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
   // empty and simply falls through to the unconditional formal Profile.
   let fapply = null;
   if (FUSION_INPUTS.FUSION_TOPK_JSON && FUSION_INPUTS.FUSION_UNITSIDE_JSON) {
+  fusionFailureStage = 'apply_back';
   const FUSION_BUDGET = parseInt(A.fusion_budget != null ? A.fusion_budget : 6, 10);
   log(`KernelFusion apply-back: integrating tier-A/B fusions, budget ${FUSION_BUDGET}.`);
   fapply = await safeAgent(
@@ -3384,14 +3401,24 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
   } else {
     log('KernelFusion discovery/validation produced no apply-back-ready Top-K; degrading to formal Profile.');
     if (FUSION_REQUIRED) {
-      throw new Error(
+      const requiredFailureStage = (!semantics || semantics.status !== 'pass')
+        ? 'semantic'
+        : (!FUSION_INPUTS.FUSION_TOPK_JSON ? 'discovery' : 'unit_validation');
+      const requiredFailure =
         'KernelFusion was explicitly required but produced no apply-back-ready Top-K. ' +
-        `Expected deterministic capture manifest: ${EVAL_DIR}/fusion_capture/profile_trace_manifest.json`);
+        `Expected deterministic capture manifest: ${EVAL_DIR}/fusion_capture/profile_trace_manifest.json`;
+      log(`ERROR: ${requiredFailure} Recording failure and continuing to formal Profile.`);
+      fusionDisposition = {
+        applied: [], blocked: [], deferred: [],
+        failed_stage: requiredFailureStage,
+        notes: requiredFailure,
+      };
     }
   }
   // Checkpoint only — not a new runtime baseline. Later stages keep using curTput;
   // Finalize/Director still score against BASELINE_TPUT.
   {
+    fusionFailureStage = 'disposition';
     const appliedN = (fusionDisposition && Array.isArray(fusionDisposition.applied))
       ? fusionDisposition.applied.length : 0;
     let fusionStatus = 'no_win';
@@ -3409,6 +3436,27 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
       exit_throughput_tok_s: curTput,
       delta_pct: fusionDeltaPct,
     });
+  }
+  } catch (e) {
+    const message = (e && e.message) ? e.message : String(e);
+    curOverlay = fusionEntryState.overlay;
+    curFlags = fusionEntryState.flags;
+    curEnv = fusionEntryState.env;
+    curTput = fusionEntryState.throughput;
+    acceptedFusions.length = fusionEntryState.acceptedFusionCount;
+    FUSION_INPUTS = { ...fusionEntryState.inputs };
+    fusionDisposition = {
+      status: 'unexpected_exception',
+      failed_stage: fusionFailureStage,
+      applied: [], blocked: [], deferred: [],
+      dispositioned: 0,
+      entry_throughput_tok_s: fusionEntryState.throughput,
+      exit_throughput_tok_s: fusionEntryState.throughput,
+      delta_pct: 0,
+      notes: `KernelFusion ${fusionFailureStage} raised an unexpected exception: ${message}`,
+    };
+    log(`ERROR: KernelFusion ${fusionFailureStage} raised an unexpected exception: ${message}. ` +
+        'Restored the pre-Fusion runtime state and continuing to formal Profile.');
   }
 }
 
