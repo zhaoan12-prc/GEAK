@@ -54,6 +54,35 @@ class TraceCapabilityTest(unittest.TestCase):
             self.assertEqual(result["status"], "failed")
             self.assertEqual(result["analysis_rank_trace"], "")
 
+    def test_auto_select_reads_vllm_execute_annotations(self):
+        # vLLM has no profile_by_stage: one trace per rank, phases told apart only by the
+        # execute_* step annotation. Without reading it every rank looked like it had
+        # "missing_decode_annotation" and every vLLM fusion capture failed its manifest.
+        with tempfile.TemporaryDirectory() as tmp:
+            events = [
+                {"cat": "gpu_user_annotation", "ts": 100, "dur": 50,
+                 "name": "execute_1024_context_1(sq1024sk1024sqsq1048576sqsk1048576)"
+                         "_generation_0(sq0sk0sqsq0sqsk0)"},
+                {"cat": "gpu_user_annotation", "ts": 200, "dur": 50,
+                 "name": "execute_16_context_0(sq0sk0sqsq0sqsk0)"
+                         "_generation_16(sq16sk16409sqsq16sqsk16409)"},
+            ]
+            events.extend({"cat": "kernel", "name": "k%d" % index, "ts": ts,
+                           "dur": 1, "args": {"stream": 1}}
+                          for index, ts in enumerate((110, 120, 210, 220, 230)))
+            path = os.path.join(
+                tmp, "dp0_pp0_tp0_dcp0_ep0_rank0.1790.pt.trace.json.gz")
+            with gzip.open(path, "wt") as fh:
+                json.dump({"traceEvents": events}, fh)
+
+            result = trace_capability.build_manifest(tmp, auto_select_rank=True)
+
+            self.assertEqual(result["status"], "pass")
+            self.assertEqual(result["analysis_rank"], 0)
+            entry = result["trace_files"][0]
+            self.assertEqual(entry["device_events_by_phase"],
+                             {"decode": 3, "extend": 2})
+
     def test_auto_selects_rank_with_largest_decode_stage(self):
         with tempfile.TemporaryDirectory() as tmp:
             for rank, kernel_count in ((0, 2), (1, 5), (2, 3)):

@@ -12,6 +12,8 @@ import os
 import re
 from collections import Counter
 
+import parse_profile
+
 
 TRACE_SUFFIXES = (".json", ".json.gz", ".pt.trace.json", ".pt.trace.json.gz")
 SGLANG_STEP_RE = re.compile(
@@ -163,10 +165,20 @@ def _stage_device_coverage(path):
     for event in events:
         if not isinstance(event, dict) or event.get("cat") != "gpu_user_annotation":
             continue
-        match = SGLANG_STEP_RE.match(str(event.get("name", "")))
-        if not match or event.get("ts") is None or event.get("dur") is None:
+        if event.get("ts") is None or event.get("dur") is None:
             continue
-        phase = match.group(1).lower()
+        name = str(event.get("name", ""))
+        match = SGLANG_STEP_RE.match(name)
+        if match:
+            phase = match.group(1).lower()
+        else:
+            # vLLM writes ONE mixed-phase trace annotated execute_*_context_*_generation_*;
+            # classify each step the way parse_profile does, under sglang's phase names.
+            step = (parse_profile._classify_step(name)
+                    if name.startswith("execute_") else None)
+            if not step:
+                continue
+            phase = "extend" if step[0] else "decode"
         start = float(event["ts"])
         end = start + float(event["dur"])
         # A retry may contain several steps. Use the best single step rather
