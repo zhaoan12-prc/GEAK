@@ -156,6 +156,31 @@ No background notification will ever wake you up again. Run every replay exactly
 4. Call StructuredOutput only after `DONE` and after reading `SEMANTICS_1_2_RUN.json` (pass or
    fail). If the runner exited without writing it, return `failed` with the log tail in `notes`.
 
+**On vLLM, steps 4–6 use a CUDA-graph-off capture as the boundary donor.** The graph-construction
+replay below relies on module hooks that emit `GEAK_LAYER_SCOPE`; on vLLM those hooks sit inside the
+torch.compile region and stop the engine from starting, so they cannot be used. Instead:
+
+- **Step 4 (donor capture).** Run `EVAL_DIR/bench_e2e.sh` again with the SAME workload, `CONC`, flags,
+  env and overlay as the Clean Trace, plus `--compilation-config.cudagraph_mode=NONE` (dotted form —
+  a JSON `--compilation-config` replaces the object and drops the platform defaults) and a separate
+  `OUT_DIR`. Graph replay off keeps torch.compile, so the kernel set stays the production one, and the
+  CPU walks the model on every step, so every decode step carries the Patterns' declared dispatch ops.
+  Never use `--enforce-eager`: it also disables torch.compile and describes a different graph. This
+  capture supplies layer cuts (and later Shape evidence) only; its timing is never used.
+  It loads the full model and outlives one Bash call: launch it detached and wait for it exactly as in
+  *Running and waiting for a replay* above (poll for its `profile_trace_manifest.json`).
+- **Step 5 (transfer).** Run `semantic_layer_boundary_transfer.py` with the donor capture's rank-0
+  trace. With no `GEAK_LAYER_SCOPE` markers it builds donor layer scopes from the declared
+  `runtime_dispatch_branch` ops and applies the same exact / stable-projection rules; the map records
+  `donor.scope_source=declared_dispatch_op_span`. Steps already cut by dispatch ops in the Clean Trace
+  (normally prefill) are skipped as authoritative.
+- **Step 6** is unchanged.
+
+Measured on Qwen3.5-35B-A3B-FP8 (vllm-openai-rocm v0.27.1, gfx942, CONC 16): the Clean Trace mapped
+prefill 3/3 and decode 0/13; the donor transferred all 13 decode steps (stable identity projection,
+~59% event coverage) and the rebuilt table passed every gate. Coverage near the 50% floor is the
+risk to watch on other models — report `stable_projection.donor_event_fraction` in `notes`.
+
 1. Read `SHAPE_CAPTURE_PLAN_JSON`; its representative layers and selected buckets are the only
    allowed layer/bucket filters. Never copy filters from a historical run.
 2. Validate `SHAPE_CAPTURE_SETUP` supplies the current container/image setup, model, official
