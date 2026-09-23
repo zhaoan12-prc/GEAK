@@ -141,10 +141,29 @@ torch.compile region and stop the engine from starting, so they cannot be used. 
   `donor.scope_source=declared_dispatch_op_span`. Steps already cut by dispatch ops in the Clean Trace
   (normally prefill) are skipped as authoritative.
 - **Step 6** is unchanged.
+- **Steps 7–9 (Shape).** Graph replay records no `Input Dims`, so the rebuilt table's decode rows are
+  `unresolved`. Instead of a shape log, project Shape and parent operator from the donor over the
+  correspondence the boundary map already validated:
+
+  ```bash
+  python3 "$SKILL_DIR/scripts/semantic_donor_shape_projection.py" \
+    --table "<table rebuilt with --layer-boundary-map>/pattern_layer_kernel_table.json" \
+    --boundary-map "<boundary map>" --recipient-trace "<Clean Trace rank-0>" \
+    --donor-trace "<donor rank-0>" --patterns "$STRUCTURAL_PATTERNS_JSON" \
+    --out-dir "$EVAL_DIR/profile/round_${ROUND}/semantics_1_2"
+  ```
+
+  A row is paired only through the boundary map's own rule (exact sequence, or stable identity
+  projection) or, inside a transferred layer cut, when the donor and Clean Trace layer sequences are
+  identical. It is projected only if every same-bucket donor pass gives it the same shape and parent
+  operator. Projected rows are `P` (`source=donor_trace_stable_projection`); anything else stays `U`
+  with a reason in `DONOR_SHAPE_PROJECTION.json`. Row identity, order, counts and durations are never
+  changed. Then continue with step 10.
 
 Measured on Qwen3.5-35B-A3B-FP8 (vllm-openai-rocm v0.27.1, gfx942, CONC 16): the Clean Trace mapped
 prefill 3/3 and decode 0/13; the donor transferred all 13 decode steps (stable identity projection,
-~59% event coverage) and the rebuilt table passed every gate. Coverage near the 50% floor is the
+~59% event coverage), the rebuilt table passed every gate, and donor projection resolved decode Shape
+and parent operator for 59/59 representative rows. Coverage near the 50% floor is the
 risk to watch on other models — report `stable_projection.donor_event_fraction` in `notes`.
 
 1. Read `SHAPE_CAPTURE_PLAN_JSON`; its representative layers and selected buckets are the only

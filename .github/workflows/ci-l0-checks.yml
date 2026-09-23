@@ -136,6 +136,8 @@ jobs:
             e2e_workflow/scripts/tests/test_vllm_semantic_capture.py \
             e2e_workflow/scripts/tests/test_semantic_runtime_capture.py \
             e2e_workflow/scripts/tests/test_fusion_candidate_harness.py \
+            e2e_workflow/scripts/tests/test_semantic_donor_shape_projection.py \
+            e2e_workflow/scripts/tests/test_semantic_layer_boundary_transfer.py \
             geak/test_bootstrap.py
 
       - name: expert skill static validation
