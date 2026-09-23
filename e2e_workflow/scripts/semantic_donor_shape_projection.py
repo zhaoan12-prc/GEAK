@@ -29,8 +29,10 @@ import copy
 import json
 import os
 
+import semantic_evidence_ledger
 import semantic_kernel_mapping
 import semantic_layer_boundary_transfer as transfer
+import semantic_shape_merge
 
 SOURCE = "donor_trace_stable_projection"
 EXACT_RULE = "exact_contiguous_normalized_device_sequence"
@@ -279,11 +281,18 @@ def project(table_path, boundary_map_path, recipient_trace, donor_trace,
         "step_failures": step_failures,
     }
     out_doc["donor_shape_projection"] = summary
+    # Rows now carry shapes; the embedded coverage summary and the markdown table
+    # must say so, or readers see decode "0/N" beside resolved rows.
+    semantic_evidence_ledger.refresh_phase_coverage(out_doc)
     os.makedirs(out_dir, exist_ok=True)
     table_out = os.path.join(out_dir, "pattern_layer_kernel_table.json")
     with open(table_out, "w") as fh:
         json.dump(out_doc, fh, indent=2)
+    markdown_out = os.path.join(out_dir, "ORDERED_UNIQUE_LAYER_TABLES.md")
+    with open(markdown_out, "w") as fh:
+        fh.write(semantic_shape_merge._markdown(out_doc))
     summary["table_json"] = table_out
+    summary["table_md"] = markdown_out
     with open(os.path.join(out_dir, "DONOR_SHAPE_PROJECTION.json"), "w") as fh:
         json.dump(summary, fh, indent=2)
     return summary

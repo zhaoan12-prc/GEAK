@@ -54,6 +54,7 @@ Steps:
    cp "$SKILL_DIR/scripts/bench_summarize.py" "$EVAL_DIR/bench_summarize.py"   # writes bench_summary.json; also refused without it
    cp -r "$SKILL_DIR/scripts/adapters" "$EVAL_DIR/adapters"   # bench_e2e.sh sources adapters/<backend>.sh next to itself
    cp "$SKILL_DIR/scripts/parse_profile.py" "$EVAL_DIR/parse_profile.py"
+   cp "$SKILL_DIR/scripts/trace_capability.py" "$EVAL_DIR/trace_capability.py"   # KernelFusion capture manifests
    ```
    - If `LAUNCH_SCRIPT` is empty, the baseline is the stack's default config + `MODEL_PATH` +
      `WORKLOAD` (bench_e2e.sh needs no model default — `MODEL` is passed). Record the resolved server

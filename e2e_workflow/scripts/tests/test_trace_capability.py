@@ -54,6 +54,14 @@ class TraceCapabilityTest(unittest.TestCase):
             self.assertEqual(result["status"], "failed")
             self.assertEqual(result["analysis_rank_trace"], "")
 
+    def test_discovery_ignores_hidden_scratch_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            open(os.path.join(tmp, ".vllm_bench_1_2.json"), "w").write("{}")
+            trace = os.path.join(tmp, "dp0_pp0_tp0_dcp0_ep0_rank0.1.pt.trace.json.gz")
+            with gzip.open(trace, "wt") as fh:
+                json.dump({"traceEvents": []}, fh)
+            self.assertEqual(trace_capability.discover(tmp), [trace])
+
     def test_auto_select_reads_vllm_execute_annotations(self):
         # vLLM has no profile_by_stage: one trace per rank, phases told apart only by the
         # execute_* step annotation. Without reading it every rank looked like it had
