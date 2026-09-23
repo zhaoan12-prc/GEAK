@@ -806,6 +806,24 @@ class PhaseCoverageTest(unittest.TestCase):
         self.assertEqual(coverage["decode_evidence"],
                          "mixed_trace_no_decode_steps_in_window")
 
+    def test_unresolved_decode_steps_are_not_reported_as_an_empty_window(self):
+        """vLLM graph replay: 13 decode steps in the window, no decode boundary."""
+        coverage = mapping._phase_coverage(
+            instances=[{"phase": "extend"}],
+            tables=[{"phase": "prefill", "rows": [
+                {"shape": {"source": "kernel_exact"}}]}],
+            trace_paths=["dp0_pp0_tp0_dcp0_ep0_rank0.1.pt.trace.json.gz"],
+            adopted_siblings=[], table_phases=None, require_phases=None,
+            step_phases={"prefill", "decode"})
+        self.assertEqual(coverage["decode_evidence"],
+                         "decode_steps_present_boundaries_unresolved")
+        self.assertTrue(coverage["decode_requires_boundary_donor"])
+        self.assertFalse(coverage["decode_requires_graph_capture"])
+        plan = mapping._shape_capture_plan(
+            [], {"patterns": []}, __file__, coverage=coverage)
+        self.assertIn("boundary donor",
+                      plan["capture_policy"]["decode_capture_requires"][0])
+
     def test_split_file_capture_keeps_its_original_verdict(self):
         """sglang's per-phase filenames are conclusive; that arm must not shift."""
         coverage = mapping._phase_coverage(
