@@ -78,6 +78,21 @@ class SemanticLayerBoundaryTransferTest(unittest.TestCase):
             json.dump({"traceEvents": events}, fh)
         return path
 
+    def test_dispatch_anchored_step_counts_as_already_authoritative(self):
+        # A vLLM prefill step cut by Pattern-declared dispatch ops is already complete;
+        # retrying a transfer on it only produced a bucket-mismatch failure that failed
+        # the whole map even though every decode step transferred.
+        def rows(evidence):
+            return [{"layer_instance_id": "s:pass-0:layer-%d" % layer,
+                     "layer_id": layer, "layer_evidence": evidence,
+                     "device_seq_index": layer} for layer in range(3)]
+        self.assertTrue(transfer._complete_authoritative_step(
+            rows("declared_dispatch_op_span"), 3))
+        self.assertTrue(transfer._complete_authoritative_step(
+            rows("python_module_span_external_id"), 3))
+        self.assertFalse(transfer._complete_authoritative_step(
+            rows("cpu_op_scope"), 3))
+
     def test_exact_full_pass_transfers_cuts_and_preserves_outer_context(self):
         with tempfile.TemporaryDirectory() as tmp:
             patterns = self._patterns(tmp)

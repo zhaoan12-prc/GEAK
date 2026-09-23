@@ -216,7 +216,8 @@ def _complete_authoritative_step(step_rows, expected_layers):
     for row in step_rows:
         instance_id = row.get("layer_instance_id")
         evidence = str(row.get("layer_evidence") or "")
-        if instance_id and evidence.startswith("python_module_span"):
+        if instance_id and (evidence.startswith("python_module_span")
+                            or evidence == "declared_dispatch_op_span"):
             groups.setdefault(instance_id, []).append(row)
     ordered = sorted(groups.values(), key=lambda group: min(
         row["device_seq_index"] for row in group))
