@@ -480,7 +480,8 @@ def _dispatch_anchor_scopes(events, spans, pattern_doc):
         step = _cpu_step_at(event["ts"], cpu_spans, span_starts)
         if step is None:
             continue
-        by_step.setdefault(step[5], []).append((event["ts"], name, step))
+        by_step.setdefault(step[5], []).append(
+            (event["ts"], name, step, event.get("pid"), event.get("tid")))
 
     scopes = []
     diagnostics = {"status": "mapped", "anchor_ops": sorted(branches),
@@ -497,7 +498,7 @@ def _dispatch_anchor_scopes(events, spans, pattern_doc):
         # trace has a CPU annotation, otherwise the GPU window end is the best available.
         step_end = step[8] if len(step) >= 9 else step[1]
         ordered = []
-        for layer_id, (ts, name, _step) in enumerate(anchors):
+        for layer_id, (ts, name, _step, pid, tid) in enumerate(anchors):
             pattern = pattern_by_layer.get(layer_id) or {}
             if branch_by_pattern.get(pattern.get("pattern_id")) != name:
                 ordered = None
@@ -519,6 +520,12 @@ def _dispatch_anchor_scopes(events, spans, pattern_doc):
                 "layer_instance_id": "%s:pass-0:layer-%d" % (step_id, layer_id),
                 "type_validation": "pass",
                 "scope_source": "declared_dispatch_op",
+                # The launching thread and the step bucket let a boundary transfer
+                # use these scopes as a donor exactly like GEAK_LAYER_SCOPE markers.
+                "pid": pid,
+                "tid": tid,
+                "batch_size": step[4],
+                "input_tokens": step[3],
             })
         if ordered is None:
             diagnostics["steps"].append(record)

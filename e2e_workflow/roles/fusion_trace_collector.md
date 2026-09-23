@@ -68,16 +68,17 @@ When `EXEC_PREFIX` is non-empty, run executable commands as
      If Phase 1 comes back single-phase, raise `GEAK_FUSION_MAX_ITERS` and confirm the load
      was actually saturated; do not silently accept half the coverage.
 
-     **Add `--compilation-config.cudagraph_mode=NONE` to the fusion capture's server args.**
-     This is what makes DECODE analysable on vllm, and the exact flag matters:
-     - Under CUDA-graph replay the whole layer stack is one launch. The CPU walks nothing,
-       so decode has no per-layer op and no shapes — Phase 1 can only report
-       `sequence_only_shapes_unresolved`.
+     **Keep CUDA graphs ON for this capture; decode structure comes from a separate donor.**
+     This capture is the Clean Trace — the only timing source — so it must run the production
+     stack. Under graph replay its decode steps carry no per-layer op, so Phase 1 leaves them
+     `boundary_unresolved` and `decode_requires_graph_capture=true`. The semantics mapper then
+     runs a second, CUDA-graph-off capture as the boundary donor (`semantics_mapper.md`,
+     PHASE=complete_table). What that donor needs to know:
      - `cudagraph_mode=NONE` disables graph capture but KEEPS torch.compile, so the kernel
        set stays the production one. Measured on Qwen3.5-2B (gfx942, v0.27.1): 367 vs 375
        decode kernels/step, identical 27-kernel distinct set, **0.989 sequence similarity**,
        and per-layer dispatch anchors on every step (16 x 24) instead of only the 2 eager
-       prefill steps. Phase 1 then resolves BOTH phases' shapes at 100%.
+       prefill steps.
      - **Do NOT use `--enforce-eager` for this.** It also disables torch.compile, so
        inductor's fusions vanish: 1113 kernels/step, 13 kernels present in only one of the
        two traces, **0.063 similarity**. Those shapes describe a different graph than the
@@ -85,9 +86,8 @@ When `EXEC_PREFIX` is non-empty, run executable commands as
      - Use the DOTTED form. Passing `--compilation-config '{...}'` wholesale replaces the
        object and drops the platform-resolved defaults (`custom_ops`, `pass_config`);
        `--compilation-config.cudagraph_mode=NONE` merges.
-     - The capture is still a SEPARATE server from the measured one — cudagraph off changes
-       throughput. It supplies structure and shapes only; timing comes from the production
-       capture, and every fusion is still gated by an A/B on the untouched stack.
+     - The donor is a SEPARATE server from the measured one — cudagraph off changes
+       throughput. It supplies structure and shapes only.
        **Budget for it.** On MiniMax-M3 (60L MoE, TP8, gfx942) decode fell from ~410 to
        ~18 tok/s with graph replay off — ~3.5 s per step. Size the capture workload for the
        WINDOW, not for a throughput measurement: a short OSL and a small prompt count are

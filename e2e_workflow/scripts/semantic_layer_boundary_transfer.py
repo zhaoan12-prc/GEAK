@@ -109,6 +109,38 @@ def _scope_markers(events):
     return markers
 
 
+def _dispatch_scope_markers(events, pattern_doc):
+    """Donor layer scopes from the Pattern-declared dispatch ops.
+
+    Used when the donor carries no GEAK_LAYER_SCOPE markers. On vLLM the module
+    hooks that emit those markers cannot run inside torch.compile, but a capture
+    with CUDA-graph replay off walks the model on every step, so each layer's
+    declared dispatch op is present and semantic_kernel_mapping cuts exact
+    per-layer scopes from them. They are shaped like markers so every matching
+    rule below applies unchanged.
+    """
+    spans = semantic_kernel_mapping._collect_step_spans(events)
+    scopes, _ = semantic_kernel_mapping._dispatch_anchor_scopes(
+        events, spans, pattern_doc)
+    markers = []
+    for index, scope in enumerate(scopes):
+        markers.append({
+            "event_index": index,
+            "name": scope["name"],
+            "phase": _phase(scope.get("phase")),
+            "batch_size": _integer(scope.get("batch_size")),
+            "input_tokens": _integer(scope.get("input_tokens")),
+            "layer_id": scope["layer_id"],
+            "op_path": scope["name"],
+            "pid": scope.get("pid"),
+            "tid": scope.get("tid"),
+            "ts": float(scope["ts"]),
+            "end": float(scope["end"]),
+            "entries": [],
+        })
+    return markers
+
+
 def _attach_device_entries(events, markers):
     """Attach correlated device launches to their enclosing layer scope."""
     by_thread = {}
@@ -173,8 +205,9 @@ def _attach_device_entries(events, markers):
             item["runtime_event_index"], item["device_event_index"]))
 
 
-def _complete_donor_passes(events, expected_layers):
-    markers = _scope_markers(events)
+def _complete_donor_passes(events, expected_layers, markers=None):
+    if markers is None:
+        markers = _scope_markers(events)
     _attach_device_entries(events, markers)
     passes = []
     by_bucket = {}
@@ -652,6 +685,12 @@ def transfer(donor_trace, recipient_traces, pattern_path, out_path=""):
     donor_events = semantic_kernel_mapping._load_events(donor_trace)
     markers, donor_passes = _complete_donor_passes(
         donor_events, expected_layers)
+    donor_scope_source = "geak_layer_scope_markers"
+    if not markers:
+        markers, donor_passes = _complete_donor_passes(
+            donor_events, expected_layers,
+            _dispatch_scope_markers(donor_events, pattern_doc))
+        donor_scope_source = "declared_dispatch_op_span"
     recipient_events = semantic_kernel_mapping._load_events_multi(
         recipient_traces)
     rows, _, _, _, _ = semantic_kernel_mapping._event_rows(
@@ -686,7 +725,9 @@ def transfer(donor_trace, recipient_traces, pattern_path, out_path=""):
 
     if not markers:
         failures.append({
-            "reason": "donor_has_no_geak_layer_scope_markers"})
+            "reason": "donor_has_no_layer_scopes",
+            "detail": ("no GEAK_LAYER_SCOPE markers, and no step carries a "
+                       "complete, Pattern-ordered set of declared dispatch ops")})
     elif not donor_passes:
         failures.append({
             "reason": "donor_has_no_complete_nonempty_layer_pass",
@@ -716,6 +757,7 @@ def transfer(donor_trace, recipient_traces, pattern_path, out_path=""):
         "donor": {
             "path": os.path.abspath(donor_trace),
             "sha256": _sha256(donor_trace),
+            "scope_source": donor_scope_source,
             "layer_scope_marker_count": len(markers),
             "complete_pass_count": len(donor_passes),
             "buckets": sorted({

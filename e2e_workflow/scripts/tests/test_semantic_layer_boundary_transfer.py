@@ -78,6 +78,69 @@ class SemanticLayerBoundaryTransferTest(unittest.TestCase):
             json.dump({"traceEvents": events}, fh)
         return path
 
+    def _dispatch_donor(self, root, anchors=True):
+        """A cudagraph-off vLLM donor: no markers, one declared dispatch op per layer."""
+        events = [
+            {"cat": "user_annotation", "name": "step[DECODE bs=4]", "pid": 1, "tid": 2,
+             "ts": 5, "dur": 80},
+            # As on a real vLLM trace, the device-side step window also spans the
+            # host-side dispatch ops of that step.
+            {"cat": "gpu_user_annotation", "name": "step[DECODE bs=4]",
+             "ts": 5, "dur": 120},
+        ]
+        correlation = 0
+        for layer_id in (0, 1):
+            base = 10 + layer_id * 30
+            if anchors:
+                events.append({"cat": "cpu_op", "name": "vllm::layer_core",
+                               "pid": 1, "tid": 2, "ts": base, "dur": 5})
+            for offset, name in enumerate(("layer%d_a" % layer_id,
+                                           "layer%d_b" % layer_id)):
+                correlation += 1
+                events.append({
+                    "cat": "hip_runtime", "pid": 1, "tid": 2,
+                    "name": "hipLaunchKernel", "ts": base + 2 + offset,
+                    "dur": 0.1, "args": {"correlation": correlation}})
+                events.append({
+                    "cat": "kernel", "name": name, "ts": 100 + correlation,
+                    "dur": 1, "args": {"correlation": correlation}})
+        path = os.path.join(root, "dispatch_donor.json")
+        with open(path, "w") as fh:
+            json.dump({"traceEvents": events}, fh)
+        return path
+
+    def _dispatch_patterns(self, root):
+        path = self._patterns(root)
+        with open(path) as fh:
+            doc = json.load(fh)
+        doc["patterns"][0]["structural_signature"] = {
+            "runtime_dispatch_branch": "vllm::layer_core"}
+        with open(path, "w") as fh:
+            json.dump(doc, fh)
+        return path
+
+    def test_dispatch_op_donor_transfers_cuts_without_markers(self):
+        # vLLM: module hooks cannot emit GEAK_LAYER_SCOPE inside torch.compile, but a
+        # cudagraph-off capture carries each layer's declared dispatch op.
+        with tempfile.TemporaryDirectory() as tmp:
+            result = transfer.transfer(
+                self._dispatch_donor(tmp), self._recipient(tmp),
+                self._dispatch_patterns(tmp), os.path.join(tmp, "b.json"))
+            self.assertEqual(result["status"], "pass")
+            self.assertEqual(result["donor"]["scope_source"],
+                             "declared_dispatch_op_span")
+            self.assertEqual(
+                result["mapped_groups"][0]["layer_start_positions"], [1, 3])
+
+    def test_donor_without_markers_or_dispatch_ops_fails_explicitly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = transfer.transfer(
+                self._dispatch_donor(tmp, anchors=False), self._recipient(tmp),
+                self._dispatch_patterns(tmp), os.path.join(tmp, "b.json"))
+            self.assertEqual(result["status"], "fail")
+            self.assertIn("donor_has_no_layer_scopes",
+                          [item.get("reason") for item in result["failures"]])
+
     def test_dispatch_anchored_step_counts_as_already_authoritative(self):
         # A vLLM prefill step cut by Pattern-declared dispatch ops is already complete;
         # retrying a transfer on it only produced a bucket-mismatch failure that failed
