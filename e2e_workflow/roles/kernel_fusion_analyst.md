@@ -325,6 +325,27 @@ When `RUNTIME_SETUP_FILE` or `RUNTIME_IMAGE` is available:
 5. If the environment cannot be inspected, you cannot prove a kernel exists, so
    default 现成算子=`no` (treat as author-track until an installed kernel is cited).
 
+**On vLLM (`BACKEND=vllm`)** the same inspection applies with these substitutions:
+
+- Inspect the installed **vLLM and aiter** in the runtime container (`EXEC_PREFIX`), not SGLang.
+  The fused ops vLLM can route to on ROCm are wrapped in `vllm/_aiter_ops.py`; the graph-level
+  fusions are the passes under `vllm/compilation/passes/`; GDN chunk kernels live in
+  `vllm/third_party/flash_linear_attention/`.
+- Flag-routed levers (`flag_routed_signature`) are the env `VLLM_ROCM_USE_AITER` and its
+  `VLLM_ROCM_USE_AITER_*` sub-flags, and `--compilation-config` `pass_config` keys (`fuse_norm_quant`,
+  `fuse_act_quant`, …). Cite the vLLM file:line that reads the flag. `VLLM_ROCM_USE_AITER` switches
+  several backends at once (linear, rmsnorm, MoE, attention), so name the sub-flag that isolates the
+  one a candidate needs.
+- **"Already fused" is decided by the kernel sequence, and only by it.** A boundary is fused when the
+  table has no separate kernel for the op. A `fuse_*` pass being on is not evidence — its pattern may
+  not match this model (measured on Qwen3.5-35B-A3B-FP8: `fuse_norm_quant=True`, yet every add+RMSNorm
+  is followed by its own `per_token_group_quant_8bit_kernel`, because a dtype guard rejects the fp32
+  `(1+w)` Gemma-style norm weight). Nor is an inductor kernel's name: inductor names a fused kernel
+  after every op in its graph node, including ops it could not lower and runs separately
+  (`triton_poi_fused_…_per_token_group_fp8_quant_…` is still followed by the quant kernel).
+- At `TP=1` the table has no `communication` rows; `collective_fused_ar_guard` and `model_dims` may
+  then be omitted (the harness only warns).
+
 ### 4a. Build the deterministic kernel catalog (mandatory — the authority for existence)
 
 Your own recall of "which kernels exist" is not trustworthy and never has been:

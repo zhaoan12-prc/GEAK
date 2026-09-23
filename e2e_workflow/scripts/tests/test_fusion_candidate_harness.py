@@ -675,7 +675,10 @@ class FusionCandidateHarnessTest(unittest.TestCase):
 
     def test_missing_collective_guard_fields_fail(self):
         with tempfile.TemporaryDirectory() as tmp:
-            table = self._write(tmp, "table.json", self._table())
+            # The guard is required only when the table has a collective to guard.
+            doc = self._table()
+            doc["tables"][0]["rows"][0]["stage"] = "communication"
+            table = self._write(tmp, "table.json", doc)
             payload = self._payload()
             env = {
                 "image": "test/image:latest",
@@ -692,6 +695,26 @@ class FusionCandidateHarnessTest(unittest.TestCase):
             self.assertTrue(any(
                 "collective_fused_ar_guard" in error
                 for error in result["errors"]))
+
+    def test_collective_guard_not_required_without_collective_rows(self):
+        # TP=1: nothing to guard, so the guard's absence is a warning, not an error.
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = self._table()
+            for table in doc["tables"]:
+                for row in table["rows"]:
+                    if row.get("stage") == "communication":
+                        row["stage"] = "elementwise"
+            table = self._write(tmp, "table.json", doc)
+            env = {"image": "test/image:latest", "inspection_evidence": ["src"]}
+            payload = self._payload()
+            payload["environment_api_inventory_json"] = self._write(
+                tmp, "environment.json", env)
+            candidates = self._write(tmp, "candidates.json", payload)
+            result = harness.run(
+                table, candidates, os.path.join(tmp, "report.md"),
+                os.path.join(tmp, "validation.json"))
+            self.assertFalse(any("collective_fused_ar_guard" in e or "model_dims" in e
+                                 for e in result["errors"]), result["errors"])
 
     def test_threshold_disagreeing_with_registry_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
