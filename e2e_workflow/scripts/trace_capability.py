@@ -50,7 +50,9 @@ def discover(trace_dir):
     elif os.path.isdir(trace_dir):
         for name in os.listdir(trace_dir):
             path = os.path.join(trace_dir, name)
-            if os.path.isfile(path) and name.endswith(TRACE_SUFFIXES):
+            # Hidden files are tool scratch (e.g. a bench result), never a trace.
+            if (os.path.isfile(path) and not name.startswith(".")
+                    and name.endswith(TRACE_SUFFIXES)):
                 files.append(os.path.abspath(path))
     files.sort(key=lambda p: (_rank(p) is None, _rank(p) or 0, os.path.basename(p)))
     return files

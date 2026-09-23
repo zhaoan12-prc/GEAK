@@ -889,7 +889,10 @@ PY
   # directory directly. Generate it in the capture process so the pipeline does
   # not depend on an agent remembering to run trace_capability.py afterward.
   if [ "$_GEAK_FUSION_CAPTURE" = "1" ]; then
-    _TRACE_CAPABILITY="${SKILL_DIR:-}/scripts/trace_capability.py"
+    # SKILL_DIR is not always in the capture's env (a role running a second, donor capture);
+    # the Director copies trace_capability.py next to this script, so fall back to it.
+    _TRACE_CAPABILITY="${SKILL_DIR:+$SKILL_DIR/scripts/trace_capability.py}"
+    [ -n "$_TRACE_CAPABILITY" ] || _TRACE_CAPABILITY="$HERE/trace_capability.py"
     _TRACE_MANIFEST="$OUT_DIR/profile_trace_manifest.json"
     if [ ! -f "$_TRACE_CAPABILITY" ]; then
       echo "!!! KernelFusion manifest builder missing: $_TRACE_CAPABILITY" >&2

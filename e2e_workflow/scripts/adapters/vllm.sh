@@ -133,7 +133,11 @@ adapter_health() { curl -sf "${BASE_URL}/health" >/dev/null 2>&1; }
 # adapter_bench NUM_PROMPTS MAX_CONC PROFILE_FLAG
 adapter_bench() {
   local NUMP="$1" MAXC="$2" PROF="${3:-0}"
-  local res_json="$PROFILE_DIR/.vllm_bench_$$_${RANDOM}.json"
+  # Not in PROFILE_DIR: a background-load bench can finish after the trace manifest is built
+  # and leave its .json among the traces (trace discovery matches that suffix), and PROFILE_DIR
+  # is empty on unprofiled runs.
+  local res_json
+  res_json="$(mktemp "${TMPDIR:-/tmp}/vllm_bench_XXXXXX.json")"
   local extra=()
   [ "$PROF" = "1" ] && extra=(--profile)
   # Custom-tokenizer models (e.g. Kimi-K2.6) need the bench client to trust remote code to load

@@ -124,14 +124,25 @@ Phase 1.2 additionally receives `STRUCTURAL_PATTERNS_JSON`, `SEMANTIC_TABLE_JSON
 This phase is opt-in and may run from an initial `partial` table. Its final
 result is still subject to the KernelFusion `status=pass` gate above.
 
-**On vLLM, steps 4–6 use a CUDA-graph-off capture as the boundary donor.** The graph-construction
-replay below relies on module hooks that emit `GEAK_LAYER_SCOPE`; on vLLM those hooks sit inside the
-torch.compile region and stop the engine from starting, so they cannot be used. Instead:
+**On vLLM, a CUDA-graph-off capture replaces the graph-construction replay.** The replay below relies
+on module hooks that emit `GEAK_LAYER_SCOPE`; on vLLM those hooks sit inside the torch.compile region
+and stop the engine from starting, so they cannot be used. The numbered steps below map as follows on
+vLLM — this list overrides them:
+
+- Steps 1–3 (capture plan filters, `SHAPE_CAPTURE_SETUP`, operator probe plan): skip. They configure
+  the replay, which does not run; `SHAPE_CAPTURE_SETUP` may be `{}`.
+- Steps 4–6: the donor capture, transfer and rebuild described in the bullets below.
+- Steps 7–9: replaced by donor Shape projection (below). No shape log, operator schema manifest,
+  targeted probe or `semantic_shape_merge.py` run.
+- Step 10: unchanged — verify row identity against the rebuilt table.
+- Return: `semantic_table_json` / `semantic_table_md` are the projection's outputs;
+  `shape_type_verification_json` is its `DONOR_SHAPE_PROJECTION.json`; `shape_log_jsonl`,
+  `op_coverage_manifest` and `kernel_semantic_evidence_jsonl` are empty.
 
 - **Step 4 (donor capture).** Run `EVAL_DIR/bench_e2e.sh` again with the SAME workload, `CONC`, flags,
   env and overlay as the Clean Trace, plus `--compilation-config.cudagraph_mode=NONE` (dotted form —
   a JSON `--compilation-config` replaces the object and drops the platform defaults) and a separate
-  `OUT_DIR`. Graph replay off keeps torch.compile, so the kernel set stays the production one, and the
+  `OUT_DIR`; pass `SKILL_DIR` too so the capture writes its trace manifest. Graph replay off keeps torch.compile, so the kernel set stays the production one, and the
   CPU walks the model on every step, so every decode step carries the Patterns' declared dispatch ops.
   Never use `--enforce-eager`: it also disables torch.compile and describes a different graph. This
   capture supplies layer cuts (and later Shape evidence) only; its timing is never used.

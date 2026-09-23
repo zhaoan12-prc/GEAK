@@ -112,6 +112,12 @@ class DonorShapeProjectionTest(unittest.TestCase):
                 self.assertEqual(row["parent_operator"]["canonical_op"],
                                  "op_%s" % row["raw_name"])
                 self.assertEqual(row["semantic_evidence"]["level"], "P")
+            coverage = doc["phase_coverage"]
+            self.assertTrue(coverage["decode_shapes_covered"])
+            self.assertEqual(
+                coverage["shape_resolution_by_phase"]["decode"]["resolved_fraction"], 1.0)
+            with open(summary["table_md"]) as fh:
+                self.assertIn("layer0_a", fh.read())
 
     def test_donor_passes_that_disagree_do_not_project(self):
         # Same kernel sequence and bucket, different dims (e.g. a KV-length-dependent
