@@ -22,6 +22,7 @@ class FusionCaptureManifestContractTest(unittest.TestCase):
         self.assertIn('--out "$_TRACE_MANIFEST"', source)
         self.assertIn('doc.get("status") != "pass"', source)
         self.assertIn('not doc.get("analysis_rank_trace")', source)
+        self.assertIn('--auto-select-rank', source)
 
     def test_workflow_falls_back_to_deterministic_manifest(self):
         with open(os.path.join(WORKFLOW, "e2e_workflow.js")) as fh:

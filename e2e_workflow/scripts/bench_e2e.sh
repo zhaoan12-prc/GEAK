@@ -877,7 +877,7 @@ PY
     fi
     if ! python3 "$_TRACE_CAPABILITY" \
         --trace-dir "$PROFILE_DIR" \
-        --analysis-rank 0 \
+        --auto-select-rank \
         --out "$_TRACE_MANIFEST"; then
       echo "!!! KernelFusion trace manifest generation failed: $_TRACE_MANIFEST" >&2
       exit 2

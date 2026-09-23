@@ -146,13 +146,108 @@ def inspect_trace(path):
     }
 
 
-def build_manifest(trace_dir, analysis_rank=0):
+def _stage_device_coverage(path):
+    """Return per-step device coverage for each GPU stage annotation."""
+    with _open(path) as fh:
+        data = json.load(fh)
+    events = data.get("traceEvents", data if isinstance(data, list) else [])
+    device = [
+        event for event in events
+        if isinstance(event, dict)
+        and event.get("cat") in ("kernel", "gpu_memcpy", "gpu_memset")
+        and event.get("ts") is not None
+    ]
+    coverage = Counter()
+    duration = Counter()
+    annotation_count = Counter()
+    for event in events:
+        if not isinstance(event, dict) or event.get("cat") != "gpu_user_annotation":
+            continue
+        match = SGLANG_STEP_RE.match(str(event.get("name", "")))
+        if not match or event.get("ts") is None or event.get("dur") is None:
+            continue
+        phase = match.group(1).lower()
+        start = float(event["ts"])
+        end = start + float(event["dur"])
+        # A retry may contain several steps. Use the best single step rather
+        # than summing them, otherwise three truncated steps can look complete.
+        coverage[phase] = max(coverage[phase], sum(
+            1 for item in device if start <= float(item["ts"]) <= end))
+        duration[phase] = max(duration[phase], float(event["dur"]))
+        annotation_count[phase] += 1
+    return {
+        "device_events_by_phase": dict(sorted(coverage.items())),
+        "annotation_duration_us_by_phase": dict(sorted(duration.items())),
+        "annotation_count_by_phase": dict(sorted(annotation_count.items())),
+    }
+
+
+def build_manifest(trace_dir, analysis_rank=0, auto_select_rank=False):
     files = discover(trace_dir)
-    entries = [{"path": path, "rank": _rank(path), "sha256": _sha256(path)}
-               for path in files]
-    selected = next((e for e in entries if e["rank"] == analysis_rank), None)
-    if selected is None and entries:
+    entries = []
+    for path in files:
+        entry = {"path": path, "rank": _rank(path), "sha256": _sha256(path)}
+        if entry["rank"] is not None:
+            entry.update(_stage_device_coverage(path))
+        entries.append(entry)
+    selected = None
+    selection_reason = "requested_rank"
+    rank_candidates = []
+    if auto_select_rank:
+        # EXTEND and DECODE are separate files. Keep the strongest DECODE
+        # trace for each TP rank, then compare rank-local device coverage.
+        by_rank = {}
+        for entry in entries:
+            rank = entry["rank"]
+            if rank is None:
+                continue
+            score = (
+                int(entry.get("device_events_by_phase", {}).get("decode", 0)),
+                float(entry.get("annotation_duration_us_by_phase", {}).get(
+                    "decode", 0.0)),
+            )
+            if score > by_rank.get(rank, ((-1, -1.0), None))[0]:
+                by_rank[rank] = (score, entry)
+        max_decode_events = max(
+            (score[0] for score, _entry in by_rank.values()), default=0)
+        for rank in sorted(by_rank):
+            entry = by_rank[rank][1]
+            device_events, duration_us = by_rank[rank][0]
+            if not duration_us:
+                eligible = False
+                reason = "missing_decode_annotation"
+            elif not device_events:
+                eligible = False
+                reason = "decode_annotation_has_no_device_events"
+            elif device_events < max_decode_events:
+                eligible = False
+                reason = "decode_device_events_below_rank_maximum"
+            else:
+                eligible = True
+                reason = "decode_device_events_match_rank_maximum"
+            rank_candidates.append({
+                "rank": rank,
+                "decode_trace": entry["path"],
+                "decode_device_events": device_events,
+                "decode_duration_us": duration_us,
+                "eligible": eligible,
+                "reason": reason,
+            })
+        eligible_ranks = [item for item in rank_candidates
+                          if item["eligible"] is True]
+        if eligible_ranks:
+            winner = max(eligible_ranks, key=lambda item: (
+                item["decode_device_events"], -item["rank"]))
+            selected = by_rank[winner["rank"]][1]
+            analysis_rank = winner["rank"]
+            selection_reason = "max_decode_step_device_coverage"
+    else:
+        selected = next(
+            (e for e in entries if e["rank"] == analysis_rank), None)
+    if selected is None and entries and not auto_select_rank:
         selected = entries[0]
+        analysis_rank = selected["rank"]
+        selection_reason = "first_available_trace"
     capabilities = inspect_trace(selected["path"]) if selected else {
         "event_count": 0,
         "categories": {},
@@ -167,6 +262,10 @@ def build_manifest(trace_dir, analysis_rank=0):
         "analysis_rank": analysis_rank,
         "analysis_rank_trace": selected["path"] if selected else "",
         "analysis_rank_sha256": selected["sha256"] if selected else "",
+        "analysis_rank_selection_reason": selection_reason,
+        "clean_trace_selection": selection_reason,
+        "selected_analysis_rank": analysis_rank if selected else None,
+        "rank_candidates": rank_candidates,
         "cross_rank_merge": False,
         "capability": capabilities,
         "status": "pass" if selected else "failed",
@@ -177,9 +276,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--trace-dir", required=True)
     parser.add_argument("--analysis-rank", type=int, default=0)
+    parser.add_argument("--auto-select-rank", action="store_true")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
-    doc = build_manifest(args.trace_dir, args.analysis_rank)
+    doc = build_manifest(
+        args.trace_dir, args.analysis_rank,
+        auto_select_rank=args.auto_select_rank)
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as fh:
         json.dump(doc, fh, indent=2)
