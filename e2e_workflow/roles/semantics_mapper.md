@@ -101,6 +101,38 @@ Phase 1.2 additionally receives `STRUCTURAL_PATTERNS_JSON`, `SEMANTIC_TABLE_JSON
 This phase is opt-in and may run from an initial `partial` table. Its final
 result is still subject to the KernelFusion `status=pass` gate above.
 
+### Running and waiting for a replay (mandatory)
+
+Every replay in this phase (the broad replay in step 4 and the targeted retry in step 8) loads the
+full model and runs longer than one Bash call (10-minute cap). You are a non-interactive workflow
+sub-agent: a message **without a tool call ends your task** and forces an immediate StructuredOutput.
+No background notification will ever wake you up again. Run every replay exactly like this:
+
+1. Launch the runner detached and record its PID:
+
+   ```bash
+   nohup python3 "$SKILL_DIR/scripts/run_semantics_1_2.py" <args> \
+     > "$ATTEMPT/run_semantics_1_2.log" 2>&1 &
+   echo $! > "$ATTEMPT/run_semantics_1_2.pid"
+   ```
+
+2. Wait in the **foreground** with a bounded poll (Bash `timeout: 600000`). Repeat the same call
+   until it prints `DONE`:
+
+   ```bash
+   end=$((SECONDS+540))
+   until [ -f "$OUT_DIR/SEMANTICS_1_2_RUN.json" ] || ! kill -0 "$(cat "$ATTEMPT/run_semantics_1_2.pid")" 2>/dev/null; do
+     [ $SECONDS -ge $end ] && { echo STILL_RUNNING; tail -3 "$ATTEMPT/run_semantics_1_2.log"; exit 0; }
+     sleep 20
+   done
+   echo DONE; tail -20 "$ATTEMPT/run_semantics_1_2.log"
+   ```
+
+3. Never use `run_in_background` or `Monitor` to wait, and never send a text-only message while a
+   replay is running.
+4. Call StructuredOutput only after `DONE` and after reading `SEMANTICS_1_2_RUN.json` (pass or
+   fail). If the runner exited without writing it, return `failed` with the log tail in `notes`.
+
 1. Read `SHAPE_CAPTURE_PLAN_JSON`; its representative layers and selected buckets are the only
    allowed layer/bucket filters. Never copy filters from a historical run.
 2. Validate `SHAPE_CAPTURE_SETUP` supplies the current container/image setup, model, official
@@ -115,8 +147,12 @@ result is still subject to the KernelFusion `status=pass` gate above.
    architecture into a claimed operator. Missing a target here must not prevent post-capture
    discovery from the actual trace and registered dispatcher schemas.
 4. Run one graph-construction replay after the initial Clean Trace table exists, with rank 0,
-   metadata-only logging, stdout disabled, and at most one matching forward per selected bucket. Use
-   `run_semantic_shape_capture.py`. It emits two deliberately separate evidence channels:
+   metadata-only logging, stdout disabled, and at most one matching forward per selected bucket.
+   Execute it through `run_semantics_1_2.py --capture-setup <SHAPE_CAPTURE_SETUP>` following
+   "Running and waiting for a replay" above; the runner performs this replay, the step 5 boundary
+   transfer, the step 6 rebuild and the broad Shape merge in one process. Do not launch
+   `run_semantic_shape_capture.py` separately. The replay emits two deliberately separate evidence
+   channels:
    - one lightweight `GEAK_LAYER_SCOPE` range for **every** main decoder layer, containing no Tensor
      metadata; and
    - detailed Shape/op markers only for representative layers.
