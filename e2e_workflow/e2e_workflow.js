@@ -791,10 +791,11 @@ const STRATEGY_SCHEMA = obj({
   drop_list: arrObj, order_of_work: arrStr, strategy_path: { type: 'string' },
 }, ['kernel_candidates']);
 
-// KernelFusion apply-back result. The fusion_integrator loops 单侧-passed tier-A/B
-// candidates (maximal-first + degrade ladder), gates each with interleaved serving
-// A/B + accuracy/engagement checks, and returns accepted flags/overlays. The formal
-// Profile + Strategize phases that follow own the post-fusion Top-N and routing.
+// KernelFusion apply-back result. The orchestrator invokes fusion_integrator once
+// per execution-list entry/degrade ladder, then folds each terminal result into this
+// aggregate. Each call gates its selected entry with interleaved serving A/B plus
+// accuracy/engagement checks. The formal Profile + Strategize phases that follow own
+// the post-fusion Top-N and routing.
 // COVERAGE: `accepted_fusions` alone made a 2-of-12 round render as a success. The
 // Top-K execution_list is the denominator now, so the return also carries the rows that
 // did NOT land — `rejected` (blocked, with a reason) and `deferred` (only rows that are
@@ -1204,12 +1205,12 @@ Return ONLY the structured JSON the role file specifies (a StructuredOutput tool
 // it to 45min so a single hung/slow agent can't blow the wall-clock budget (still ample for the director
 // baseline + the head e2e A/B). Default mode keeps 120min → unchanged.
 const AGENT_TIMEOUT_MS = parseInt(A.agent_timeout_ms != null ? A.agent_timeout_ms : (FAST_MODE ? 2700000 : 7200000), 10);
-// Apply-back can legitimately take several hours because it runs a sequence of
-// serving A/B and accuracy gates.  It must not inherit the generic 120-minute
+// One Apply-back entry/degrade ladder can legitimately take several hours because
+// it runs serving A/B and accuracy gates. It must not inherit the generic 120-minute
 // hung-agent guard: Promise.race cannot cancel the losing agent(), so timing out
 // here would let Profile start on the pre-Fusion stack while apply-back keeps
 // mutating artifacts in the background.  Zero delegates the hard bound to the
-// outer workflow timeout; callers may still set an explicit phase-local bound.
+// outer workflow timeout; callers may still set an explicit per-entry bound.
 const FUSION_APPLY_TIMEOUT_MS = parseInt(
   A.fusion_apply_timeout_ms != null ? A.fusion_apply_timeout_ms : 0, 10);
 // Process-safety rule prepended to EVERY agent prompt. It is injected at this funnel
@@ -2245,6 +2246,7 @@ let KB_REF_INPUTS = {};
 let EVAL_DIR, MODEL_NAME, BASELINE_TPUT, NOISE_BAND, curFlags, curEnv;
 let profile, strategy, kernelQueue = [], headQueue = [], semantics, fusionCapture;
 let fusionSemanticsAttempted = false;
+let fusionExecutionList = [];
 
 // KernelFusion must establish the current stack before the original Profile.
 let curOverlay = ST.overlay || '';
@@ -3042,13 +3044,14 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
   phase('KernelFusion');
   fusionSemanticsAttempted = SEMANTICS_MAPPING_ON;
   const fusionEntryTput = curTput;
-  const fusionEntryState = {
+  const fusionRecoveryState = {
     overlay: curOverlay,
     flags: curFlags,
     env: curEnv,
     throughput: curTput,
     acceptedFusionCount: acceptedFusions.length,
     inputs: { ...FUSION_INPUTS },
+    applyResult: null,
   };
   let fusionFailureStage = 'capture';
   try {
@@ -3154,6 +3157,8 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
           { phase: 'KernelFusion', label: 'fusion-analyst:rank', schema: FUSION_RANK_SCHEMA }, 1);
         if (ranked && ranked.status !== 'failed' && ranked.fusion_topk_json) {
           FUSION_INPUTS.FUSION_TOPK_JSON = ranked.fusion_topk_json;
+          fusionExecutionList = Array.isArray(ranked.execution_list)
+            ? ranked.execution_list.slice() : [];
           fusionFailureStage = 'unit_validation';
           // ---- unit-side scheduling: spend the budget on LADDER TOPS ------
           // The budget is a microbench-run count, and it used to be spent in
@@ -3296,48 +3301,128 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
   }
 
   // Apply-back is best-effort. A discovery/validation failure leaves the inputs
-  // empty and simply falls through to the unconditional formal Profile.
+  // empty and simply falls through to the unconditional formal Profile. Run one
+  // execution-list entry (including its degrade ladder) per agent call so a later
+  // failure cannot erase terminal results already returned by earlier calls.
   let fapply = null;
+  let fusionApplyFailedExec = '';
+  let fusionApplyUnprocessed = [];
   if (FUSION_INPUTS.FUSION_TOPK_JSON && FUSION_INPUTS.FUSION_UNITSIDE_JSON) {
-  fusionFailureStage = 'apply_back';
-  const FUSION_BUDGET = parseInt(A.fusion_budget != null ? A.fusion_budget : 6, 10);
-  log(`KernelFusion apply-back: integrating tier-A/B fusions, budget ${FUSION_BUDGET}.`);
-  fapply = await safeAgent(
-    roleAgent('fusion_integrator', 'apply_back',
-      'Apply back the 单侧-passed tier-A flags/env and tier-B kernel fusions. Read FUSION_TOPK_JSON + the FUSION_UNITSIDE_JSON ' +
-      'gate; take ONLY unit_side_status==pass candidates, in Top-K order, maximal-first per each ' +
-      "candidate's fusion_degrade_ladder. For EACH: author a reversible lazy-load overlay adapter (route the " +
-      'fused kernel to a PREBUILT downstream seam — kernel-availability gate; avoid the unbuilt MoE variant), ' +
-      'prove the ENGAGED banner on all TP ranks, run an interleaved A/B (cand_min>ref_max + >noise band) vs the ' +
-      'CURRENT baseline, and a gsm8k accuracy gate (--max-tokens 4096) for quant fusions. STACK accepted overlays ' +
-      'via a combined-loader; on wire/gate/accuracy failure DEGRADE to the next ladder rung, then move to the next ' +
-      'candidate. For tier-A run the same serving A/B + engagement gate and return accepted_flags/accepted_env. Skip tier-C. COVERAGE: FUSION_TOPK_JSON.execution_list is the ' +
-      'denominator — EVERY exec_id must end applied / blocked+reason (rejected[]) / deferred+reason ' +
-      '(deferred[]); however an in-budget tier-A/B row with unit_side_status pass/equivalent_pass/' +
-      'subsumed_pass MUST complete live apply-back and may not be deferred. A single TP-sized server ' +
-      'set is expected: run baseline and candidate sequentially; no-relaunch-on-hang only forbids ' +
-      'retrying a hung initialization. A row you filtered out (not 单侧-pass, not tier-A/B, past budget) still needs its ' +
-      'one-line reason. Run scripts/fusion_applyback_harness.py --topk --apply --unitside --budget ' +
-      'before returning and fix what it reports; return its report + json paths. ' +
-      'THEN CURATE knowledge/learned/: for each fusion that passed its e2e+accuracy gate, MERGE ' +
-      "the card matching its reuse key or INSERT a new one (>=** only) under INDEX.md's " +
-      '`## kernel fusion` group, with the seam as `apply:` and the ENGAGED proof as `verify:`; a ' +
-      'surprising negative becomes a conditioned `caution:` ("also verify X"), never a blocklist; ' +
-      'NULL/ungated/accuracy-failed fusions write nothing. Keep INDEX.md <=40 card lines. This is ' +
-      'what lets the NEXT run reproduce this one - Phase 2.1 requires a disposition for every card ' +
-      'there. Return learned_cards[]. ' +
-      'Return the accepted set + the final stacked overlay dir + new tok/s.', {
-        EVAL_DIR, MODEL_PATH, SERVING_GPU, TP: SERVING_TP, WORKLOAD,
-        FUSION_TOPK_JSON: FUSION_INPUTS.FUSION_TOPK_JSON,
-        FUSION_CANDIDATES_JSON: FUSION_INPUTS.FUSION_CANDIDATES_JSON,
-        FUSION_UNITSIDE_JSON: FUSION_INPUTS.FUSION_UNITSIDE_JSON,
-        CURRENT_OVERLAY: curOverlay, CURRENT_FLAGS: curFlags, CURRENT_ENV: curEnv, CURRENT_THROUGHPUT: curTput,
-        BASELINE_THROUGHPUT: BASELINE_TPUT, NOISE_BAND_PCT: NOISE_BAND, E2E_REPEATS,
-        FUSION_BUDGET, FUSION_OVERLAYS_DIR: `${EVAL_DIR}/fusion/fusion_overlays`,
-        ...ACCURACY_INPUTS, ...FUSION_RUNTIME_INPUTS, SKILL_DIR: WORKFLOW_DIR,
-      }),
-    { phase: 'KernelFusion', label: 'fusion_integrator:apply_back',
-      schema: FUSION_APPLY_SCHEMA, timeoutMs: FUSION_APPLY_TIMEOUT_MS }, 1);
+    const FUSION_BUDGET = parseInt(A.fusion_budget != null ? A.fusion_budget : 6, 10);
+    const fusionApplyEntries = fusionExecutionList.slice(0, Math.max(0, FUSION_BUDGET));
+    let applyState = {
+      accepted_fusions: [], final_overlay: curOverlay,
+      e2e_throughput_tok_s: curTput, accepted_flags: curFlags, accepted_env: curEnv,
+      rejected: [], deferred: [], deferred_author_count: 0,
+      applyback_gate_json: '', applyback_report_md: '', learned_cards: [], notes: '',
+    };
+    const rowKey = (r) => String((r && (r.exec_id || r.candidate_id || r.fusion)) || '');
+    const mergeRows = (before, after) => {
+      const out = []; const at = new Map();
+      for (const row of (before || []).concat(after || [])) {
+        const key = rowKey(row);
+        if (!key) { out.push(row); continue; }
+        if (at.has(key)) out[at.get(key)] = row;
+        else { at.set(key, out.length); out.push(row); }
+      }
+      return out;
+    };
+    const mergeCards = (before, after) => {
+      const out = []; const at = new Map();
+      for (const card of (before || []).concat(after || [])) {
+        const key = String((card && (card.key || card.card)) || '');
+        if (!key) { out.push(card); continue; }
+        if (at.has(key)) out[at.get(key)] = card;
+        else { at.set(key, out.length); out.push(card); }
+      }
+      return out;
+    };
+    const dispositionIds = () => new Set(
+      (applyState.accepted_fusions || []).concat(applyState.rejected || [], applyState.deferred || [])
+        .map(rowKey).filter(Boolean));
+
+    log(`KernelFusion apply-back: ${fusionApplyEntries.length} execution-list entry/ladder call(s), ` +
+        `budget ${FUSION_BUDGET}; terminal results are committed after each call.`);
+    for (let applyIndex = 0; applyIndex < fusionApplyEntries.length; applyIndex++) {
+      const applyEntry = fusionApplyEntries[applyIndex];
+      if (!applyEntry || !applyEntry.exec_id || dispositionIds().has(String(applyEntry.exec_id))) continue;
+      fusionFailureStage = `apply_back:${applyEntry.exec_id}`;
+      const acceptedBefore = new Set((applyState.accepted_fusions || []).map(rowKey).filter(Boolean));
+      const step = await safeAgent(
+        roleAgent('fusion_integrator', 'apply_one',
+          'Apply exactly TARGET_EXEC_ID and its declared degrade ladder; do not loop unrelated execution-list entries. ' +
+          'Read FUSION_TOPK_JSON and FUSION_UNITSIDE_JSON, and act only when the selected tier-A/B row has ' +
+          'unit_side_status pass/equivalent_pass/subsumed_pass. Start from CURRENT_OVERLAY/FLAGS/ENV/THROUGHPUT, ' +
+          'which already include earlier terminal wins. For the selected ladder, author a reversible lazy-load overlay, ' +
+          'prove ENGAGED on every TP rank, run the interleaved serving A/B and required accuracy gate, and descend its ' +
+          'declared ladder only when the wider rung fails. Preserve PRIOR_APPLY_RESULT dispositions verbatim and merge ' +
+          'only this call\'s terminal result into it. Write the full aggregate apply_result.json, run ' +
+          'fusion_applyback_harness.py with --allow-partial-coverage (later calls still have legitimate unprocessed rows), ' +
+          'and return the full aggregate FUSION_APPLY_SCHEMA. Curate knowledge only for a fusion newly accepted by this call.', {
+            EVAL_DIR, MODEL_PATH, SERVING_GPU, TP: SERVING_TP, WORKLOAD,
+            TARGET_EXEC_ID: applyEntry.exec_id, TARGET_EXECUTION: applyEntry,
+            PRIOR_APPLY_RESULT: applyState,
+            FUSION_TOPK_JSON: FUSION_INPUTS.FUSION_TOPK_JSON,
+            FUSION_CANDIDATES_JSON: FUSION_INPUTS.FUSION_CANDIDATES_JSON,
+            FUSION_UNITSIDE_JSON: FUSION_INPUTS.FUSION_UNITSIDE_JSON,
+            CURRENT_OVERLAY: curOverlay, CURRENT_FLAGS: curFlags, CURRENT_ENV: curEnv,
+            CURRENT_THROUGHPUT: curTput, BASELINE_THROUGHPUT: BASELINE_TPUT,
+            NOISE_BAND_PCT: NOISE_BAND, E2E_REPEATS, FUSION_BUDGET,
+            FUSION_OVERLAYS_DIR: `${EVAL_DIR}/fusion/fusion_overlays`,
+            ...ACCURACY_INPUTS, ...FUSION_RUNTIME_INPUTS, SKILL_DIR: WORKFLOW_DIR,
+          }),
+        { phase: 'KernelFusion', label: `fusion_integrator:apply_one:${applyEntry.exec_id}`,
+          schema: FUSION_APPLY_SCHEMA, timeoutMs: FUSION_APPLY_TIMEOUT_MS }, 1);
+      if (!step) {
+        fusionApplyFailedExec = String(applyEntry.exec_id);
+        fusionApplyUnprocessed = fusionApplyEntries.slice(applyIndex).map((e) => e.exec_id).filter(Boolean);
+        log(`KernelFusion apply-back ${applyEntry.exec_id} failed or returned no terminal result; ` +
+            `stopping the remaining ${Math.max(0, fusionApplyUnprocessed.length - 1)} apply-back call(s) ` +
+            'and continuing to formal Profile with earlier terminal wins preserved.');
+        break;
+      }
+
+      const mergedAccepted = mergeRows(applyState.accepted_fusions, step.accepted_fusions);
+      const acceptedIds = new Set(mergedAccepted.map(rowKey).filter(Boolean));
+      const mergedRejected = mergeRows(applyState.rejected, step.rejected)
+        .filter((r) => !acceptedIds.has(rowKey(r)));
+      const rejectedIds = new Set(mergedRejected.map(rowKey).filter(Boolean));
+      const mergedDeferred = mergeRows(applyState.deferred, step.deferred)
+        .filter((r) => !acceptedIds.has(rowKey(r)) && !rejectedIds.has(rowKey(r)));
+      applyState = {
+        ...applyState, ...step,
+        accepted_fusions: mergedAccepted,
+        rejected: mergedRejected,
+        deferred: mergedDeferred,
+        learned_cards: mergeCards(applyState.learned_cards, step.learned_cards),
+        deferred_author_count: Math.max(
+          Number(applyState.deferred_author_count) || 0,
+          Number(step.deferred_author_count) || 0),
+      };
+      fapply = applyState;
+
+      const newlyAccepted = mergedAccepted.filter((r) => !acceptedBefore.has(rowKey(r)));
+      if (newlyAccepted.length) {
+        curOverlay = step.final_overlay || curOverlay;
+        curFlags = step.accepted_flags || curFlags;
+        curEnv = step.accepted_env || curEnv;
+        if (step.e2e_throughput_tok_s && step.e2e_throughput_tok_s > curTput) {
+          curTput = step.e2e_throughput_tok_s;
+        }
+        for (const accepted of newlyAccepted) acceptedFusions.push(accepted);
+        log(`KernelFusion apply-back ${applyEntry.exec_id}: committed ${newlyAccepted.length} ` +
+            `terminal fusion win(s); e2e now ${curTput} tok/s.`);
+      }
+      // The outer catch restores the latest terminal checkpoint, not the state from
+      // before every Apply-back call. Earlier proven wins survive a later JS exception.
+      fusionRecoveryState.overlay = curOverlay;
+      fusionRecoveryState.flags = curFlags;
+      fusionRecoveryState.env = curEnv;
+      fusionRecoveryState.throughput = curTput;
+      fusionRecoveryState.acceptedFusionCount = acceptedFusions.length;
+      fusionRecoveryState.inputs = { ...FUSION_INPUTS };
+      fusionRecoveryState.applyResult = fapply;
+    }
   // KernelFusion is an optional optimization track. If apply-back fails to return a
   // terminal result, preserve the exact pre-Fusion runtime state and continue with the
   // formal Profile. Record the failure explicitly so reports do not confuse "Fusion
@@ -3349,6 +3434,8 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
       applied: [], blocked: [], deferred: [], dispositioned: 0,
       deferred_author_count: 0,
       applyback_report_md: '', applyback_gate_json: '', learned_cards: [],
+      failed_stage: fusionApplyFailedExec ? `apply_back:${fusionApplyFailedExec}` : 'apply_back',
+      unprocessed_exec_ids: fusionApplyUnprocessed,
       notes: 'KernelFusion apply-back failed before producing a terminal result; ' +
              'the pre-Fusion runtime state was preserved for downstream Profile.',
     };
@@ -3377,7 +3464,13 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
       applyback_report_md: fapply.applyback_report_md || '',
       applyback_gate_json: fapply.applyback_gate_json || '',
       learned_cards: Array.isArray(fapply.learned_cards) ? fapply.learned_cards.slice() : [],
-      notes: fapply.notes || '',
+      ...(fusionApplyFailedExec ? {
+        failed_stage: `apply_back:${fusionApplyFailedExec}`,
+        unprocessed_exec_ids: fusionApplyUnprocessed,
+      } : {}),
+      notes: fusionApplyFailedExec
+        ? `${fapply.notes || ''} Apply-back stopped at ${fusionApplyFailedExec}; earlier terminal wins were preserved.`.trim()
+        : (fapply.notes || ''),
     };
     // The reproducibility half. An apply-back that banks wins but writes no card leaves the
     // next run to rediscover them, and rediscovery is not deterministic — that is exactly how
@@ -3389,11 +3482,6 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
         'Expected only if nothing cleared the ★★ bar this round.');
   }
   if (acc.length) {
-    curOverlay = fapply.final_overlay || curOverlay;
-    curFlags = fapply.accepted_flags || curFlags;
-    curEnv = fapply.accepted_env || curEnv;
-    if (fapply.e2e_throughput_tok_s && fapply.e2e_throughput_tok_s > curTput) curTput = fapply.e2e_throughput_tok_s;
-    for (const f of acc) acceptedFusions.push(f);
     log(`KernelFusion: accepted ${acc.length} fusion(s); e2e now ${curTput} tok/s.`);
   } else {
     log(`KernelFusion: no fusion accepted (${fapply ? (fapply.notes || 'none passed the gate') : 'agent null/degraded'}).`);
@@ -3422,7 +3510,8 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
     const appliedN = (fusionDisposition && Array.isArray(fusionDisposition.applied))
       ? fusionDisposition.applied.length : 0;
     let fusionStatus = 'no_win';
-    if (appliedN > 0) fusionStatus = 'applied';
+    if (fusionApplyFailedExec) fusionStatus = appliedN > 0 ? 'applyback_partial_failure' : 'applyback_failed';
+    else if (appliedN > 0) fusionStatus = 'applied';
     else if (!FUSION_INPUTS.FUSION_TOPK_JSON) fusionStatus = 'discovery_failed';
     else if (!FUSION_INPUTS.FUSION_UNITSIDE_JSON) fusionStatus = 'validation_failed';
     else if (!fapply) fusionStatus = 'applyback_failed';
@@ -3439,24 +3528,33 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
   }
   } catch (e) {
     const message = (e && e.message) ? e.message : String(e);
-    curOverlay = fusionEntryState.overlay;
-    curFlags = fusionEntryState.flags;
-    curEnv = fusionEntryState.env;
-    curTput = fusionEntryState.throughput;
-    acceptedFusions.length = fusionEntryState.acceptedFusionCount;
-    FUSION_INPUTS = { ...fusionEntryState.inputs };
+    const recoveredApply = fusionRecoveryState.applyResult;
+    const recoveredApplied = recoveredApply && Array.isArray(recoveredApply.accepted_fusions)
+      ? recoveredApply.accepted_fusions.slice() : [];
+    const recoveredBlocked = recoveredApply && Array.isArray(recoveredApply.rejected)
+      ? recoveredApply.rejected.slice() : [];
+    const recoveredDeferred = recoveredApply && Array.isArray(recoveredApply.deferred)
+      ? recoveredApply.deferred.slice() : [];
+    curOverlay = fusionRecoveryState.overlay;
+    curFlags = fusionRecoveryState.flags;
+    curEnv = fusionRecoveryState.env;
+    curTput = fusionRecoveryState.throughput;
+    acceptedFusions.length = fusionRecoveryState.acceptedFusionCount;
+    FUSION_INPUTS = { ...fusionRecoveryState.inputs };
     fusionDisposition = {
       status: 'unexpected_exception',
       failed_stage: fusionFailureStage,
-      applied: [], blocked: [], deferred: [],
-      dispositioned: 0,
-      entry_throughput_tok_s: fusionEntryState.throughput,
-      exit_throughput_tok_s: fusionEntryState.throughput,
-      delta_pct: 0,
-      notes: `KernelFusion ${fusionFailureStage} raised an unexpected exception: ${message}`,
+      applied: recoveredApplied, blocked: recoveredBlocked, deferred: recoveredDeferred,
+      dispositioned: recoveredApplied.length + recoveredBlocked.length + recoveredDeferred.length,
+      entry_throughput_tok_s: fusionEntryTput,
+      exit_throughput_tok_s: fusionRecoveryState.throughput,
+      delta_pct: fusionEntryTput > 0
+        ? Number((((fusionRecoveryState.throughput - fusionEntryTput) / fusionEntryTput) * 100).toFixed(3)) : 0,
+      notes: `KernelFusion ${fusionFailureStage} raised an unexpected exception: ${message}. ` +
+        `${recoveredApplied.length} earlier terminal win(s) were preserved.`,
     };
     log(`ERROR: KernelFusion ${fusionFailureStage} raised an unexpected exception: ${message}. ` +
-        'Restored the pre-Fusion runtime state and continuing to formal Profile.');
+        'Restored the latest terminal Fusion checkpoint and continuing to formal Profile.');
   }
 }
 

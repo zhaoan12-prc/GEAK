@@ -74,19 +74,19 @@ class FusionCaptureManifestContractTest(unittest.TestCase):
 
     def test_unexpected_fusion_exception_restores_state_and_continues_profile(self):
         source = self._workflow_source()
-        start = source.index("const fusionEntryState = {")
+        start = source.index("const fusionRecoveryState = {")
         caught = source.index("} catch (e) {", start)
         profile = source.index("phase('Profile');", caught)
         block = source[caught:profile]
-        self.assertIn("curOverlay = fusionEntryState.overlay;", block)
-        self.assertIn("curFlags = fusionEntryState.flags;", block)
-        self.assertIn("curEnv = fusionEntryState.env;", block)
-        self.assertIn("curTput = fusionEntryState.throughput;", block)
+        self.assertIn("curOverlay = fusionRecoveryState.overlay;", block)
+        self.assertIn("curFlags = fusionRecoveryState.flags;", block)
+        self.assertIn("curEnv = fusionRecoveryState.env;", block)
+        self.assertIn("curTput = fusionRecoveryState.throughput;", block)
         self.assertIn(
-            "acceptedFusions.length = fusionEntryState.acceptedFusionCount;",
+            "acceptedFusions.length = fusionRecoveryState.acceptedFusionCount;",
             block,
         )
-        self.assertIn("FUSION_INPUTS = { ...fusionEntryState.inputs };", block)
+        self.assertIn("FUSION_INPUTS = { ...fusionRecoveryState.inputs };", block)
         self.assertIn("status: 'unexpected_exception'", block)
         self.assertIn("failed_stage: fusionFailureStage", block)
         self.assertIn("continuing to formal Profile", block)
@@ -111,6 +111,49 @@ class FusionCaptureManifestContractTest(unittest.TestCase):
             "timeoutMs: FUSION_APPLY_TIMEOUT_MS",
             source,
         )
+
+    def test_applyback_runs_one_execution_entry_per_agent_call(self):
+        source = self._workflow_source()
+        self.assertIn(
+            "const fusionApplyEntries = fusionExecutionList.slice",
+            source,
+        )
+        self.assertIn(
+            "for (let applyIndex = 0; applyIndex < fusionApplyEntries.length; applyIndex++)",
+            source,
+        )
+        self.assertIn("roleAgent('fusion_integrator', 'apply_one'", source)
+        self.assertIn("TARGET_EXEC_ID: applyEntry.exec_id", source)
+        self.assertIn("PRIOR_APPLY_RESULT: applyState", source)
+        self.assertNotIn("roleAgent('fusion_integrator', 'apply_back'", source)
+
+    def test_applyback_commits_each_terminal_win_before_the_next_call(self):
+        source = self._workflow_source()
+        call = source.index("roleAgent('fusion_integrator', 'apply_one'")
+        commit = source.index(
+            "for (const accepted of newlyAccepted) acceptedFusions.push(accepted);",
+            call,
+        )
+        profile = source.index("phase('Profile');", commit)
+        self.assertLess(call, commit)
+        self.assertLess(commit, profile)
+        self.assertIn(
+            "fusionRecoveryState.acceptedFusionCount = acceptedFusions.length;",
+            source[commit:profile],
+        )
+        failure = source.index("if (!step) {", call)
+        stop = source.index("break;", failure)
+        self.assertLess(failure, stop)
+        self.assertLess(stop, profile)
+
+    def test_applyback_role_is_scoped_to_one_entry(self):
+        with open(os.path.join(WORKFLOW, "roles", "fusion_integrator.md")) as fh:
+            source = fh.read()
+        self.assertIn("PHASE=apply_one", source)
+        self.assertIn("Process exactly", source)
+        self.assertIn("`TARGET_EXEC_ID`", source)
+        self.assertIn("`PRIOR_APPLY_RESULT`", source)
+        self.assertIn("--allow-partial-coverage", source)
 
     def test_completed_shape_table_is_the_source_for_candidates_and_topk(self):
         """The eager-merged table, not the pre-probe table, must flow forward."""
@@ -177,10 +220,11 @@ class FusionCaptureManifestContractTest(unittest.TestCase):
             "FUSION_INPUTS.FUSION_UNITSIDE_JSON = aggregate.fusion_unitside_json;",
             aggregate,
         )
-        applyback = source.index("label: 'fusion_integrator:apply_back'", preserve)
+        applyback = source.index("roleAgent('fusion_integrator', 'apply_one'", preserve)
         self.assertLess(aggregate, preserve)
         self.assertLess(preserve, applyback)
-        apply_block = source[preserve:applyback]
+        profile = source.index("phase('Profile');", applyback)
+        apply_block = source[preserve:profile]
         self.assertIn(
             "FUSION_INPUTS.FUSION_TOPK_JSON && FUSION_INPUTS.FUSION_UNITSIDE_JSON",
             apply_block,
@@ -199,7 +243,7 @@ class FusionCaptureManifestContractTest(unittest.TestCase):
         self.assertLess(fallback, profile)
         self.assertIn("pre-Fusion overlay/flags/env/throughput", block)
         self.assertIn("applied: [], blocked: [], deferred: []", block)
-        self.assertIn("else if (!fapply) fusionStatus = 'applyback_failed';", block)
+        self.assertIn("fusionStatus = appliedN > 0 ? 'applyback_partial_failure' : 'applyback_failed';", block)
         self.assertNotIn(
             "KernelFusion apply-back did not reach a terminal state", source)
 

@@ -100,9 +100,10 @@ sibling's e2e result.** Measured counterexamples, both on this model:
 
 So descend the ladder instead of pruning it:
 1. Gate the ladder TOP first (widest removable set).
-2. Top passes the A/B + accuracy gate → accept it, and mark each rung it `subsumes` as
-   `deferred` with reason `subsumed_by:<exec_id> (accepted, occupies the same rows)`.
-   They conflict for the same rows, so only one can land.
+2. Top passes the A/B + accuracy gate → accept it. Do not emit an explicit `deferred`
+   record for a rung that conflicts with it: the apply-back harness derives
+   `blocked_by_exclusion` from the board's real conflict edges. They conflict for the
+   same rows, so only one can land.
 3. Top fails, cannot be wired, or lands INSIDE the noise band → descend ONE rung
    (`subsumes` → the next-widest) and gate that on its own, against the same baseline.
    Repeat down the ladder. A sub-band top is not a verdict on the rungs below it.
@@ -121,14 +122,22 @@ control with 100s of MB of trace/bench. Return StructuredOutput: `{fusion, accep
 engaged (bool), ttft_delta_pct, tpot_delta_pct, throughput_delta_pct, nonoverlap (bool),
 gsm8k_base, gsm8k_cand, reprofile_ok, overlay_path, skipped_branches, notes}`.
 
-## PHASE=apply_back — loop the Top-K fusions and keep wins (called by KernelFusion)
+## PHASE=apply_one — apply one execution-list entry/degrade ladder (called serially by KernelFusion)
 Inputs add `FUSION_TOPK_JSON`, `FUSION_CANDIDATES_JSON`, `FUSION_UNITSIDE_JSON`,
+`TARGET_EXEC_ID`, `TARGET_EXECUTION`, `PRIOR_APPLY_RESULT`,
 `CURRENT_OVERLAY/FLAGS/ENV/THROUGHPUT`, `FUSION_BUDGET`, `FUSION_OVERLAYS_DIR`, `ACCURACY_*`.
 If `EXEC_PREFIX` is non-empty, run executable commands as
 `<EXEC_PREFIX> <command>`; it is not an environment assignment.
-This is the KernelFusion apply-back driver — the orchestrator has no fs access, so YOU loop the candidates
-(one role call keeps the wins, like `config_tuner:sweep`):
-1. Read `FUSION_TOPK_JSON` + `FUSION_UNITSIDE_JSON`; take `unit_side_status` in
+The orchestrator invokes this role serially, once per execution-list entry. Process exactly
+`TARGET_EXEC_ID` and the degrade ladder declared by that entry. Never loop unrelated entries.
+`CURRENT_*` already contains every earlier terminal win. `PRIOR_APPLY_RESULT` is the aggregate
+returned by earlier calls: preserve its dispositions verbatim and merge only this call's result.
+If `TARGET_EXEC_ID` is already covered by an earlier explicit disposition, or conflicts with an
+entry already present in `PRIOR_APPLY_RESULT.accepted_fusions`, do not launch a server for it;
+return the unchanged aggregate after regenerating the report. The harness owns the derived
+`blocked_by_exclusion` classification.
+
+1. Read `FUSION_TOPK_JSON` + `FUSION_UNITSIDE_JSON`; locate `TARGET_EXEC_ID`. It is eligible when its `unit_side_status` is in
    {`pass`, `equivalent_pass`, `subsumed_pass`} **tier-A or tier-B** candidates
    (tier-C is author work; count it into `deferred_author_count`).
    `equivalent_pass` means the same recipe/cohort passed once on this execution
@@ -136,12 +145,12 @@ This is the KernelFusion apply-back driver — the orchestrator has no fs access
    was benched and passed and that microbench covered this rung's rows — it is a pass,
    not a gap. `budget_skipped` / `not_validated` are NOT eligible: they were never
    measured, and they must be returned in `deferred[]` saying exactly that, never as
-   "not a win". Preserve the Top-K `execution_list` order (within a tier it is
-   ranked by the real-workload `workload_forward_pct`), up to `FUSION_BUDGET`.
+   "not a win". The orchestrator preserves Top-K `execution_list` order and applies
+   `FUSION_BUDGET`; do not select a different entry.
    Tier-A belongs here, not ConfigSweep: apply its one flag/env,
    run serving A/B, verify the fused kernel/route engagement, and keep or revert it
-   before moving to the next row.
-2. Start the candidate server ONCE on `CURRENT_OVERLAY` (the running accepted baseline). Walk the
+   before returning.
+2. Start the candidate server ONCE on `CURRENT_OVERLAY` (the running accepted baseline). Walk only the
    exec-level ladders top-down (see **The exec-level ladder** above): gate each `ladder_top`, and
    descend to the rungs it `subsumes` only when the top fails/can't-wire/lands in the noise band —
    except a ★★★-prior rung, which always gets its own marginal leg. For each
@@ -151,10 +160,10 @@ This is the KernelFusion apply-back driver — the orchestrator has no fs access
    >noise band) vs the current accepted baseline + the gsm8k accuracy verification (`--max-tokens
    4096`). **Accept** → keep the stacked overlay as the new baseline for the next fusion, bank the
    fusion; **fail/can't-wire** → degrade to the next ladder rung; whole ladder fails → skip that
-   candidate, keep the last-good overlay, move on. Reuse ONE server where possible (restart only
+   selected ladder, keep the last-good overlay, then return. Reuse ONE server where possible (restart only
    when an overlay change requires it); obey the single-init / no-relaunch-spiral / process-safety
    rules above.
-3. Persist each accepted tier-B fusion under `FUSION_OVERLAYS_DIR/<model>/<fusion>/` and the final stacked
+3. Persist each accepted tier-B fusion under `FUSION_OVERLAYS_DIR/<model>/<fusion>/` and the current stacked
    combined-loader under `.../<model>/combined/`. Return `FUSION_APPLY_SCHEMA`:
    `{accepted_fusions:[{exec_id,fusion,tier,rung,overlay_path,tpot_delta_pct,throughput_delta_pct,
    fusion_only_delta_pct,secondary_effect_delta_pct,nonoverlap,gsm8k_base,gsm8k_cand,engaged}],
@@ -162,7 +171,8 @@ This is the KernelFusion apply-back driver — the orchestrator has no fs access
    accepted_flags, accepted_env, e2e_throughput_tok_s (final),
    rejected:[{exec_id,reason}], deferred:[{exec_id,reason}],
    deferred_author_count, applyback_gate_json, applyback_report_md,
-   learned_cards:[{card,action:merged|inserted|archived,key,confidence}], notes}`. The orchestrator
+   learned_cards:[{card,action:merged|inserted|archived,key,confidence}], notes}`. Return the full
+   aggregate (`PRIOR_APPLY_RESULT` plus this call), not only this call's delta. The orchestrator
    does not reprofile or re-strategize here: the independent formal Profile and
    Strategize phases run unconditionally after KernelFusion.
 
@@ -230,8 +240,9 @@ engagement + A/B + accuracy gates. The only valid terminal states are `applied`,
 after an actual attempt with its evidence. A single TP-sized serving set is normal: run the
 baseline and candidate sequentially on the same GPUs. "No relaunch after hang" forbids retrying
 a server initialization that hung; it does not forbid cleanly stopping a successful baseline
-and launching the candidate configuration. If apply-back itself cannot reach a terminal result,
-let the phase fail so the orchestrator preserves the pre-Fusion state and continues Profile.
+   and launching the candidate configuration. If this selected entry cannot reach a terminal result,
+   let the call fail. The orchestrator stops later apply-back calls, preserves all earlier terminal
+   wins, and continues Profile.
 
 Run the gate yourself before returning, and fix what it reports rather than working around it:
 
@@ -241,25 +252,31 @@ python3 "$SKILL_DIR/scripts/fusion_applyback_harness.py" \
   --apply "$EVAL_DIR/fusion/apply_result.json" \
   --unitside "$FUSION_UNITSIDE_JSON" \
   --budget "$FUSION_BUDGET" \
+  --allow-partial-coverage \
   --out-md "$EVAL_DIR/05_FUSION_APPLYBACK.md" \
   --out-json "$EVAL_DIR/fusion/fusion_applyback.json"
 python3 "$SKILL_DIR/scripts/report_index.py" --eval-dir "$EVAL_DIR"
 ```
 
-`05_FUSION_APPLYBACK.md` is **this whole pipeline's final report**: it carries the
+`05_FUSION_APPLYBACK.md` is the latest aggregate report. Each call rewrites it from
+`PRIOR_APPLY_RESULT` plus this call's terminal result. Once all selected entries have
+returned it is **this whole pipeline's final report**: it carries the
 execution list's per-row disposition, the applied-fusion detail, and the end-to-end
 numbers, so it is the one file a reader can open and see what the fusion work actually
 produced. It goes at the EVAL_DIR root beside `01_SEMANTIC.md` … `04_FUSION_UNITSIDE.md`;
 `fusion_applyback.json` and everything else stays in the working dir.
 
-`--allow-partial-coverage` exists for a knowingly incomplete round; it prints the gap just
-as loudly and it is not a way to make the red go away. Never edit or weaken the harness —
-a red gate is fixed by giving the missing rows a disposition.
+`--allow-partial-coverage` is required during this serial per-entry loop because later
+entries are legitimately unprocessed. It still prints those gaps loudly. Once the final
+entry returns, complete coverage makes the same report green without weakening any
+per-entry gate. Never invent dispositions for entries owned by later calls.
 
 ## CURATE `knowledge/learned/` — make this run's fusions reproducible next time
 
-The last thing you do, after the gate is green (or knowingly red) and the report is
-published. Phase 2.1 is required to dispose of every fusion card in
+The last thing you do for this call, after its selected ladder has a terminal disposition
+and the aggregate report is published. Curate only a fusion newly accepted by this call;
+preserve `PRIOR_APPLY_RESULT.learned_cards` and do not re-curate earlier wins. Phase 2.1
+is required to dispose of every fusion card in
 `knowledge/learned/INDEX.md`'s `## kernel fusion` group — **this step is what puts the
 cards there.** Skip it and the next run rediscovers the same fusion from scratch, which is
 exactly the instability this closes: on DSR1 a fusion measured at **+11.80% e2e output
