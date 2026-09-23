@@ -71,7 +71,8 @@ When `EXEC_PREFIX` is non-empty, run executable commands as
      **Keep CUDA graphs ON for this capture; decode structure comes from a separate donor.**
      This capture is the Clean Trace — the only timing source — so it must run the production
      stack. Under graph replay its decode steps carry no per-layer op, so Phase 1 leaves them
-     `boundary_unresolved` and `decode_requires_graph_capture=true`. The semantics mapper then
+     `boundary_unresolved` (`decode_evidence=decode_steps_present_boundaries_unresolved`,
+     `decode_requires_boundary_donor=true`). The semantics mapper then
      runs a second, CUDA-graph-off capture as the boundary donor (`semantics_mapper.md`,
      PHASE=complete_table). What that donor needs to know:
      - `cudagraph_mode=NONE` disables graph capture but KEEPS torch.compile, so the kernel

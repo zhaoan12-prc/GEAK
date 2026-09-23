@@ -1664,7 +1664,7 @@ _MODEL_PHASES = ("prefill", "decode")
 
 
 def _phase_coverage(instances, tables, trace_paths, adopted_siblings,
-                    table_phases, require_phases):
+                    table_phases, require_phases, step_phases=None):
     """Describe what phase coverage this build actually achieved.
 
     Exists because `table_phases: ["all"]` used to be emitted whenever no
@@ -1678,6 +1678,10 @@ def _phase_coverage(instances, tables, trace_paths, adopted_siblings,
 
     in_tables = sorted({_norm(t.get("phase")) for t in tables if t.get("phase")})
     in_trace = sorted({_norm(i.get("phase")) for i in instances if i.get("phase")})
+    # Phases of the annotated steps themselves, whether or not any layer in them was
+    # resolved. `in_trace` only sees steps that produced layer instances, so a graph-
+    # replayed decode step with no boundary looked like no decode step at all.
+    with_steps = sorted({_norm(p) for p in (step_phases or ()) if p})
     tags = sorted({tag for tag in (_phase_tag(p) for p in trace_paths) if tag})
     required = sorted({_norm(v) for v in (require_phases or []) if v})
     missing = [phase for phase in required if phase not in in_tables]
@@ -1720,6 +1724,12 @@ def _phase_coverage(instances, tables, trace_paths, adopted_siblings,
         # distinction machine-readable instead of leaving it to be inferred from an empty
         # phases_in_trace.
         "phase_annotation_present": bool(in_trace),
+        "phases_with_steps": with_steps,
+        # Decode steps are in the window but none got layer boundaries (on vLLM: graph
+        # replay walks no per-layer op). The remedy is the Phase-1.2 boundary donor,
+        # not a different capture window.
+        "decode_requires_boundary_donor": (
+            "decode" in with_steps and not decode_seq),
         "traces_analysed": [os.path.abspath(p) for p in trace_paths],
         "siblings_auto_adopted": adopted_siblings,
         "filter_requested": sorted(table_phases) if table_phases else None,
@@ -1743,6 +1753,8 @@ def _phase_coverage(instances, tables, trace_paths, adopted_siblings,
             "sequence_and_shapes" if (decode_seq and decode_shapes) else
             "sequence_only_shapes_unresolved" if decode_seq else
             "trace_present_but_no_decode_tables" if "DECODE" in tags else
+            "decode_steps_present_boundaries_unresolved" if (
+                "decode" in with_steps) else
             "no_phase_annotation_in_trace" if (not tags and not in_trace) else
             "mixed_trace_no_decode_steps_in_window" if not tags else
             "no_decode_trace_analysed"),
@@ -1842,6 +1854,12 @@ def _shape_capture_plan(tables, pattern_doc, trace_path,
             "decode_capture_requires": (
                 [] if (coverage and coverage.get("decode_covered")) else
                 ([] if (coverage and coverage.get("decode_sequence_covered"))
+                 else ["run the Phase-1.2 boundary donor (on vLLM a "
+                       "cudagraph_mode=NONE capture), then rebuild with "
+                       "--layer-boundary-map: the trace holds decode steps "
+                       "but none has layer boundaries"]
+                 if (coverage and coverage.get(
+                     "decode_requires_boundary_donor"))
                  else ["analyse the -TP-0-DECODE trace (auto-adopted by "
                        "default; --no-auto-sibling disables)"]) +
                 ([] if (coverage and coverage.get("decode_shapes_covered"))
@@ -1931,7 +1949,8 @@ def build(trace_path, pattern_path, out_dir, table_phases=None,
         partition_diagnostics, tables)
     coverage = _phase_coverage(
         instances, tables, trace_paths, adopted_siblings, table_phases,
-        require_phases)
+        require_phases,
+        step_phases={row.get("phase") for row in rows if row.get("step_id")})
     quality["phase_coverage"] = coverage
     if coverage["missing_required_phases"]:
         # A graph-replayed phase may legitimately need the Phase-1.2 donor
@@ -1944,6 +1963,12 @@ def build(trace_path, pattern_path, out_dir, table_phases=None,
             "traces analysed: %s" % (
                 ", ".join(coverage["missing_required_phases"]),
                 ", ".join(os.path.basename(p) for p in trace_paths)))
+    elif coverage["decode_requires_boundary_donor"]:
+        quality.setdefault("warnings", []).append(
+            "phase coverage: the trace holds decode steps but none has "
+            "authoritative layer boundaries (graph replay walks no per-layer "
+            "op). Run the Phase-1.2 boundary donor; widening the capture "
+            "window will not help.")
     elif coverage["decode_requires_graph_capture"]:
         quality.setdefault("warnings", []).append(
             "phase coverage: decode kernel SEQUENCE is covered but 0/%d decode "
