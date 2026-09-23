@@ -735,6 +735,21 @@ class PhaseCoverageTest(unittest.TestCase):
         self.assertEqual(source, "parent_operator")
         self.assertEqual(rule, "attention.full.parent")
 
+    def test_snake_case_moe_and_fp8_gemm_kernels_are_classified(self):
+        # `\b` treats `_` as a word char; these were `unknown` on sglang and vllm alike.
+        for name, stage in (("fused_moe_kernel", "moe"),
+                            ("moe_sum_vec_kernel", "moe"),
+                            ("_w8a8_triton_block_scaled_mm", "gemm"),
+                            ("triton_mm_0", "gemm")):
+            self.assertEqual(mapping._stage_detail(name, "kernel")[0], stage, name)
+        for name in ("commit_kernel", "ammo_kernel", "immediate_kernel"):
+            self.assertEqual(mapping._stage_detail(name, "kernel")[0], "unknown", name)
+
+    def test_gdn_core_parent_resolves_linear_attention(self):
+        stage, rule, source = mapping._stage_detail(
+            "_fused_post_conv_kernel", "kernel", "vllm::qwen_gdn_attention_core")
+        self.assertEqual((stage, source), ("linear_attn", "parent_operator"))
+
     def test_parent_op_fallback_still_prefers_linear_attention(self):
         stage, _rule, _src = mapping._stage_detail(
             "chunk_fwd_kernel", "kernel", "ChunkGatedDeltaRuleFunction")

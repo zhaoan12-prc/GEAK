@@ -158,7 +158,11 @@ def _cpu_step_at(ts, spans, starts):
     return None
 
 
-STAGE_RULESET_VERSION = "semantic-stage-v3"
+STAGE_RULESET_VERSION = "semantic-stage-v4"
+# Kernel names are snake_case, and `\b` treats `_` as a word character, so `\bmoe\b` never
+# matched fused_moe_kernel and `\bmm\b` never matched _w8a8_triton_block_scaled_mm: the
+# largest expert and FP8 GEMM rows on both sglang and vllm landed as `unknown`. These
+# tokens are bounded by any non-alphanumeric instead.
 STAGE_RULES = (
     ("communication.collective", "communication",
      r"all.?reduce|reduce.?scatter|all.?gather|nccl|rccl|quickreduce|cross_device"),
@@ -170,8 +174,8 @@ STAGE_RULES = (
      r"state_passing|wv_splitk_small"),
     ("attention.full_or_mla", "attn", r"fmha|attention|attn|paged|mla_"),
     ("router.topk", "topk", r"topk|routing|router|gate_kernel"),
-    ("experts.moe", "moe", r"\bmoe\b|expert|sorting|fmoe"),
-    ("linear.gemm", "gemm", r"gemm|cijk|tensile|matmul|\bmm\b"),
+    ("experts.moe", "moe", r"(?<![a-z0-9])moe(?![a-z0-9])|expert|sorting|fmoe"),
+    ("linear.gemm", "gemm", r"gemm|cijk|tensile|matmul|(?<![a-z0-9])mm(?![a-z0-9])"),
     ("cache.kv", "kv_cache", r"cache|index_put"),
     ("activation", "activation", r"silu|gelu|swiglu|act_and_mul"),
     ("quantization", "quant", r"quant|dequant|float8|fp8"),
@@ -187,7 +191,9 @@ def _stage_detail(name, category, parent_name=""):
         if re.search(regex, value):
             return stage, rule_id, "kernel_name"
     parent_value = parent_name.lower()
-    if re.search(r"gated.?delta|linear.?attention|causal.?conv", parent_value):
+    # `gdn`: vLLM registers the whole gated-delta core as vllm::qwen_gdn_attention_core.
+    if re.search(r"gated.?delta|linear.?attention|causal.?conv|(?<![a-z0-9])gdn(?![a-z0-9])",
+                 parent_value):
         return "linear_attn", "attention.linear.parent", "parent_operator"
     # The kernel-name rules key off names like fmha/paged/mla_. A backend whose
     # kernel is generically named slips through: vLLM's TRITON_ATTN launches
