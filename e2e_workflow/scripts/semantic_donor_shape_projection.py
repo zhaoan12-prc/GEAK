@@ -13,8 +13,9 @@ transfer validated -- nothing looser:
 * ``exact_equal_multiplicity_stable_identity_projection``: only identities with
   equal multiplicity on both sides, paired in order, and the pair count must
   equal the transfer's own ``stable_event_count``; plus, inside each transferred
-  layer cut whose donor and recipient identity sequences are byte-equal, the
-  positional pairing (the two rules must agree wherever both apply).
+  layer cut, positional pairing over the longest prefix on which the donor and
+  recipient identity sequences agree (the two rules must agree wherever both
+  apply).
 
 A row is projected only when every donor pass the transfer could have used
 (same sequence hash, same bucket) gives it the same shape and parent operator;
@@ -73,7 +74,7 @@ def _layer_identity(identity):
 
 
 def _layer_identical_pairs(group, donor, recipient_sequence):
-    """Pairs inside every layer whose donor and recipient sequences are identical.
+    """Positional pairs over each layer's identical prefix (donor vs recipient).
 
     The stable projection drops any identity whose step-wide multiplicity differs
     -- typically GEMM/quant kernels that also run outside the layer stack (lm_head,
@@ -90,10 +91,13 @@ def _layer_identical_pairs(group, donor, recipient_sequence):
     for layer, ((r_start, r_stop), d_start) in enumerate(
             zip(recipient_ranges, donor_starts)):
         d_stop = donor_starts[layer + 1] if layer + 1 < len(donor_starts) else donor_end
-        if ([_layer_identity(item) for item in recipient_sequence[r_start:r_stop]]
-                != [_layer_identity(item) for item in donor["sequence"][d_start:d_stop]]):
-            continue
-        for offset in range(r_stop - r_start):
+        # Both sides start at the same validated cut, so while their identities
+        # agree position by position the pairing is forced; stop at the first
+        # divergence (e.g. the last layer's tail runs into different post-model work).
+        for offset in range(min(r_stop - r_start, d_stop - d_start)):
+            if (_layer_identity(recipient_sequence[r_start + offset])
+                    != _layer_identity(donor["sequence"][d_start + offset])):
+                break
             pairs[d_start + offset] = r_start + offset
     return pairs
 

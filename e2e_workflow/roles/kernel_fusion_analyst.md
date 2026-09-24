@@ -79,6 +79,12 @@ make the degradation explicit per candidate.
 
 ### 2. Analyze in execution order
 
+On a dispatch-cut table (`pattern_id` like `P0>P1`, see `core_pattern_id` / `successor_pattern_id`),
+the rows run from the core Pattern's dispatch op through its tail and into the **successor layer's
+head**. Seams across that boundary (MoE tail → residual add+norm+quant → next layer's projection,
+and the successor's qk-norm/RoPE/KV write) are real, analysable regions; weight a table by its own
+`pattern_layer_count`, which counts only the layers of that segment kind.
+
 Process tables in this order:
 
 1. Prefill, then Decode.

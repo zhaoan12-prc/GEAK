@@ -593,6 +593,45 @@ class PhaseCoverageTest(unittest.TestCase):
             self.assertEqual(earlier["end"], later["ts"])
         self.assertTrue(all(s["scope_source"] == "declared_dispatch_op" for s in scopes))
 
+    def test_dispatch_cuts_are_keyed_by_successor_pattern(self):
+        """A dispatch cut holds the NEXT layer's head, so its table key includes it.
+
+        On the hybrid layout (every 4th layer full attention) the full-attention head
+        (qkv/qk-norm/RoPE/KV write) only occurs in segments followed by a full layer.
+        Keyed by core Pattern alone, a P_lin representative followed by another P_lin
+        never contained it.
+        """
+        doc = self._hybrid_pattern_doc()
+        events = self._step_and_anchors(doc)
+        for index, event in enumerate(list(events)):
+            if event.get("cat") == "cpu_op":
+                event["args"] = {"External id": 700 + index}
+                events.append({"cat": "kernel", "name": "k_%d" % index,
+                               "ts": event["ts"] + 2, "dur": 1,
+                               "args": {"External id": 700 + index}})
+        rows, _, _, _, _ = mapping._event_rows(events, doc)
+        mapping._authoritative_layer_partition(rows, doc)
+        segment_doc = mapping._segment_pattern_doc(doc, rows)
+        by_id = {p["pattern_id"]: p for p in segment_doc["patterns"]}
+        self.assertEqual(sorted(by_id), ["P_full>END", "P_full>P_lin",
+                                         "P_lin>P_full", "P_lin>P_lin"])
+        self.assertEqual(by_id["P_lin>P_full"]["layer_ids"], [2, 6])
+        self.assertEqual(by_id["P_lin>P_lin"]["layer_ids"], [0, 1, 4, 5])
+        self.assertEqual(by_id["P_full>END"]["layer_ids"], [7])
+        self.assertEqual(sum(len(p["layer_ids"]) for p in by_id.values()), 8)
+        self.assertEqual(by_id["P_lin>P_full"]["core_pattern_id"], "P_lin")
+        row = next(r for r in rows if r.get("layer_id") == 2
+                   and r.get("assignment") == "layer_body")
+        self.assertEqual((row["pattern_id"], row["core_pattern_id"]),
+                         ("P_lin>P_full", "P_lin"))
+
+    def test_module_span_cuts_keep_their_pattern(self):
+        doc = self._hybrid_pattern_doc()
+        rows = [{"assignment": "layer_body", "layer_id": 0, "pattern_id": "P_lin",
+                 "layer_evidence": "python_module_span_external_id"}]
+        self.assertIs(mapping._segment_pattern_doc(doc, rows), doc)
+        self.assertEqual(rows[0]["pattern_id"], "P_lin")
+
     @staticmethod
     def _dispatch_rows(layers=2, per_layer=3, phase="decode"):
         rows = []
