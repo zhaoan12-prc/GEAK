@@ -294,7 +294,8 @@ This is the KernelFusion apply-back driver — the orchestrator has no fs access
    Strategize phases run unconditionally after KernelFusion.
 
 `accepted_flags` and `accepted_env` are the complete final strings after applying
-accepted tier-A changes. They must retain every incoming `CURRENT_FLAGS` and
+accepted tier-A changes (normally none: the ranker now routes tier-A flag/env levers to the
+config tuner, so they only reach you through an explicit override). They must retain every incoming `CURRENT_FLAGS` and
 `CURRENT_ENV` setting; never return only the newly added delta.
 
 `fusion_only_delta_pct` is the A/B delta attributable to removing/combining the

@@ -79,6 +79,13 @@ accepted KernelFusion changes), `WORKLOAD` (isl/osl/conc → tells you prefill v
 Optional KernelFusion ownership inputs are `FUSION_TOPK_JSON`, `FUSION_UNITSIDE_JSON`,
 `ACCEPTED_FUSIONS`, and `FUSION_DISPOSITION`. Do not schedule an already-applied fusion again;
 an unapplied unit-side result must be routed to a fallback track or explicitly dropped with a reason.
+`FUSION_CONFIG_LEVERS` (list, may be empty) are flag/env switches fusion ranking found (tier A):
+configuration changes, not fusions, so KernelFusion does not apply them. When `CONFIG_TUNE_ENABLED`,
+emit one `config_directions` entry per lever — `axis` = the flag/env name, `swaps` = the lever's
+`handle` value vs. the current setting, `target_kernels` = the rows its `covers` would remove,
+`expected_pct_gpu` = its largest single `covers[].workload_forward_pct` (never the sum: one switch
+often changes several backends at once, e.g. `VLLM_ROCM_USE_AITER`), and cite the `lever_id` in
+`rationale`. Only a measured config A/B credits it.
 OPTIONAL profile-analysis prior (empty string = not provided): `ANALYSIS_SKILL`, `ANALYSIS_SKILL_DIR`
 (+ the Profiler's `profile_roofline_json`) — see step 1c.
 OPTIONAL upstream TraceLens prior (may be empty strings — treat empty/missing as "not provided"):

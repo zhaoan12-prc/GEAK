@@ -777,7 +777,7 @@ const FUSION_DISCOVER_SCHEMA = obj({
 const FUSION_RANK_SCHEMA = obj({
   status: { type: 'string' }, round: { type: ['number', 'string'] },
   fusion_topk_json: { type: 'string' }, fusion_topk_md: { type: 'string' },
-  execution_list: arrObj, notes: { type: 'string' },
+  execution_list: arrObj, config_levers: arrObj, notes: { type: 'string' },
 }, ['fusion_topk_json', 'execution_list']);
 
 const FUSION_UNIT_SCHEMA = obj({
@@ -2258,6 +2258,10 @@ let curOverlay = ST.overlay || '';
 let curTput = ST.throughput || 0;
 const acceptedFusions = (ST.accepted_fusions || []).slice();
 let fusionDisposition = ST.fusion_disposition || null;
+// Flag/env levers found by fusion ranking (tier A). They are configuration changes, not
+// fusions, so they go to the config tuner -- or, when this run may not tune config, back
+// to the caller as config_recommendations.
+let fusionConfigLevers = ST.fusion_config_levers || [];
 
 if (want('setup')) {
   phase('Setup');
@@ -3189,6 +3193,7 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
           { phase: 'KernelFusion', label: 'fusion-analyst:rank', schema: FUSION_RANK_SCHEMA }, 1);
         if (ranked && ranked.status !== 'failed' && ranked.fusion_topk_json) {
           FUSION_INPUTS.FUSION_TOPK_JSON = ranked.fusion_topk_json;
+          if (Array.isArray(ranked.config_levers)) fusionConfigLevers = ranked.config_levers;
           fusionFailureStage = 'unit_validation';
           // ---- unit-side scheduling: spend the budget on LADDER TOPS ------
           // The budget is a microbench-run count, and it used to be spent in
@@ -3523,6 +3528,7 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
       BASELINE_THROUGHPUT: curTput, WORKLOAD, BUDGET, HEAD_THRESHOLD_PCT,
       CONFIG_TUNE_ENABLED, SKILL_DIR: WORKFLOW_DIR,
       FUSION_TOPK_JSON: FUSION_INPUTS.FUSION_TOPK_JSON,
+      FUSION_CONFIG_LEVERS: CONFIG_TUNE_ENABLED ? fusionConfigLevers : [],
       FUSION_UNITSIDE_JSON: FUSION_INPUTS.FUSION_UNITSIDE_JSON,
       ACCEPTED_FUSIONS: acceptedFusions,
       FUSION_DISPOSITION: fusionDisposition,
@@ -5369,6 +5375,7 @@ const carryState = {
   config_directions: (strategy && strategy.config_directions) || [],
   accepted_fusions: acceptedFusions,       // KernelFusion wins banked into curOverlay
   fusion_disposition: fusionDisposition,   // blocked/deferred/coverage — PHASE=report needs these
+  fusion_config_levers: fusionConfigLevers,
   semantics_mapping: semantics || { status: 'unavailable' },
   headQueue, kernelQueue, accepted_heads: acceptedHeads, flagged_heads: flaggedHeads, accepted_kernels: acceptedKernels,
   // Full tuning-phase result, so a phase-by-phase resume does not re-run the tuning loop and the Report
@@ -5473,6 +5480,9 @@ const wfReturn = {
        : (want('final') ? 'unknown' : 'phase_partial')),
   output_parity: validation ? validation.output_parity : 'unknown',
   accepted_config: { flags: curFlags, env: curEnv },
+  // Levers this run was not allowed to measure (config_tune=false): the caller owns
+  // config, so they are handed back untested rather than applied or dropped.
+  config_recommendations: CONFIG_TUNE_ENABLED ? [] : fusionConfigLevers,
   semantics_mapping: semantics || { status: 'unavailable' },
   accepted_fusions: acceptedFusions,
   fusion_disposition: fusionDisposition,

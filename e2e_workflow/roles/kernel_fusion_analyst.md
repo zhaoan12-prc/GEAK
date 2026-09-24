@@ -986,7 +986,9 @@ The ranker is deterministic and encodes these rules — do not hand-rank:
 - **实现难度 tier** — three levels by realization cost (authoritative), keyed by
   `implementation_class` (现成算子 follows: A/B=有, C=无):
   - `A` — **env var / flag only, no code** (`existing_flag_or_env`) →
-    KernelFusion apply-back.
+    **config tuner, not KernelFusion**: the ranker lists it under `config_levers`, off the
+    execution list (one switch often changes several backends, so it cannot be credited
+    per fusion).
   - `B` — **integrate an existing kernel (code)**: an installed fused kernel
     wired in / adapted / re-configured to cover this chain
     (`existing_api_integrated`, `existing_api_needs_adapter`,
@@ -1087,7 +1089,9 @@ For `PHASE=rank_topk`, return the board path and copy the deterministic
 `execution_list` into StructuredOutput **verbatim** so the filesystem-less workflow can
 iterate the concrete candidate ids. Copy every field the ranker emitted, including
 `subsumed_by` / `ladder_top` / `subsumes` / `unit_cost` — dropping them silently
-reverts unit-side scheduling to flat board order:
+reverts unit-side scheduling to flat board order. Also copy the ranker's `config_levers`
+verbatim: tier-A flag/env levers are not on the execution list — the workflow hands them to
+the config tuner, or back to the caller when it may not tune config:
 
 ```json
 {"status":"pass|partial|failed","round":"fusion_capture",
@@ -1096,6 +1100,8 @@ reverts unit-side scheduling to flat board order:
                    "subsumed_by":null,"ladder_top":null,"subsumes":["e04"],"unit_cost":1},
                   {"exec_id":"e04","candidate_ids":["c7"],
                    "subsumed_by":"e01","ladder_top":"e01","subsumes":[],"unit_cost":0}],
+ "config_levers":[{"lever_id":"c01","handle":"env VLLM_ROCM_USE_AITER=1","route":"config_tuner",
+                   "candidate_ids":["c3","c4"],"covers":[{"phase":"decode","workload_forward_pct":4.3}]}],
  "notes":"..."}
 ```
 
