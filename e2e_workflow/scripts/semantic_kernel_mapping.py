@@ -776,6 +776,10 @@ def _apply_boundary_map(rows, map_path, pattern_doc, trace_paths=None,
     """Apply a validated all-layer boundary artifact by step-local positions."""
     with open(map_path) as fh:
         document = json.load(fh)
+    # Cuts from a dispatch-op donor are phase-shifted like direct dispatch cuts
+    # (see _segment_pattern_doc), so the rows they place must say so.
+    dispatch_donor = ((document.get("donor") or {}).get("scope_source")
+                      == "declared_dispatch_op_span")
     if document.get("status") not in ("pass", "partial"):
         raise ValueError(
             "refusing non-passing layer boundary map %s: %s" % (
@@ -889,6 +893,8 @@ def _apply_boundary_map(rows, map_path, pattern_doc, trace_paths=None,
                 row["layer_region"] = "layer_body"
                 row["representative_eligible"] = item[
                     "representative_eligible"]
+                if dispatch_donor:
+                    row["boundary_alignment"] = "dispatch_op_span"
             step_rows[start]["boundary_role"] = "body_start_kernel"
             step_rows[stop - 1]["boundary_role"] = "end_kernel"
         applied.add(step_id)
@@ -1202,6 +1208,81 @@ def _authoritative_layer_partition(rows, pattern_doc):
             "layer_boundaries": cut_events,
         })
     return diagnostics, template_evidence
+
+
+def _dispatch_aligned(row):
+    return (row.get("layer_evidence") == "declared_dispatch_op_span"
+            or row.get("boundary_alignment") == "dispatch_op_span")
+
+
+def _segment_pattern_doc(pattern_doc, rows):
+    """Key dispatch-cut layer bodies by (Pattern, successor Pattern).
+
+    A declared dispatch op sits in the MIDDLE of a layer, so a dispatch cut
+    [anchor_i, anchor_i+1) holds layer i's core and tail plus layer i+1's head.
+    Its content therefore depends on the next layer's Pattern too: on a hybrid
+    model the full-attention head (qkv GEMM, qk-norm, RoPE, KV write) only
+    occurs in segments whose successor is a full-attention layer. Keyed by the
+    core Pattern alone, a representative followed by a same-Pattern layer never
+    contained it, and the highest-value fusion seams were in no table.
+
+    The cut cannot simply be moved to the "real" layer start: in fused-residual
+    models the previous layer's residual add and this layer's input norm are one
+    kernel, so there is no clean boundary, and locating one would need stage
+    inference, which may never define a boundary. Instead each segment kind
+    (`P0>P1`, last layer `Pn>END`) becomes its own table Pattern. Every kernel
+    lands in some table, each table is sequence-consistent, and layer-weighted
+    time is conserved. Rows cut by module spans keep their Pattern.
+    """
+    aligned = [row for row in rows
+               if row.get("assignment") == "layer_body" and _dispatch_aligned(row)]
+    if not aligned:
+        return pattern_doc
+    patterns = _pattern_index(pattern_doc)
+    count = int(pattern_doc.get("num_hidden_layers_main", 0) or 0)
+
+    def kind(layer_id):
+        core = (patterns.get(layer_id) or {}).get("pattern_id")
+        succ = ((patterns.get(layer_id + 1) or {}).get("pattern_id")
+                if layer_id + 1 < count else "END")
+        return "%s>%s" % (core, succ)
+
+    for row in aligned:
+        row["core_pattern_id"] = row.get("pattern_id")
+        row["pattern_id"] = kind(int(row["layer_id"]))
+    used = {row.get("pattern_id") for row in rows
+            if row.get("assignment") == "layer_body"}
+    by_id = {pattern.get("pattern_id"): pattern
+             for pattern in pattern_doc.get("patterns", [])}
+    segments = {}
+    for layer_id in range(count):
+        segments.setdefault(kind(layer_id), []).append(layer_id)
+    out_patterns = [pattern for pattern in pattern_doc.get("patterns", [])
+                    if pattern.get("pattern_id") in used]
+    for segment_id, layer_ids in sorted(segments.items()):
+        if segment_id not in used:
+            continue
+        core_id, succ_id = segment_id.split(">", 1)
+        core = by_id.get(core_id) or {}
+        allowed = set(core.get("representative_candidates",
+                               core.get("layer_ids", [])))
+        candidates = [layer for layer in layer_ids if layer in allowed]
+        out_patterns.append({
+            **{key: value for key, value in core.items()
+               if key not in ("pattern_id", "layer_ids",
+                              "representative_candidates")},
+            "pattern_id": segment_id,
+            "core_pattern_id": core_id,
+            "successor_pattern_id": succ_id,
+            "segment_basis": "dispatch_op_span",
+            "pattern_display_name": "%s -> %s head" % (
+                core.get("pattern_display_name") or core_id,
+                (by_id.get(succ_id) or {}).get("pattern_display_name") or succ_id),
+            "layer_ids": layer_ids,
+            "representative_candidates": candidates or layer_ids,
+        })
+    return {**pattern_doc, "patterns": out_patterns,
+            "segment_patterns_from": "dispatch_op_span"}
 
 
 def _layer_instances(rows):
@@ -1943,6 +2024,7 @@ def build(trace_path, pattern_path, out_dir, table_phases=None,
     # kernels outside a layer only when ownership evidence says so; do not
     # rewrite an authoritative boundary from sequence similarity.
     prefix_demotions = []
+    pattern_doc = _segment_pattern_doc(pattern_doc, rows)
     instances = _layer_instances(rows)
     representative_instances = [
         instance for instance in instances

@@ -111,6 +111,14 @@ Phase 1.2 additionally receives `STRUCTURAL_PATTERNS_JSON`, `SEMANTIC_TABLE_JSON
    normal picture is prefill steps cut by `declared_dispatch_op_span` and DECODE steps
    unresolved until the graph-construction boundary transfer below runs — decode replays
    under a CUDA graph and emits no per-layer CPU op at all.
+   **Dispatch-cut tables are keyed by segment, not by Pattern.** A declared dispatch op sits in the
+   middle of a layer, so a dispatch cut holds layer *i*'s core and tail plus layer *i+1*'s head, and
+   its content depends on the next layer's Pattern. The mapper therefore publishes one table per
+   segment kind — `pattern_id` `P0>P1` (core `P0`, successor head `P1`), last layer `Pn>END` — with
+   `core_pattern_id`, `successor_pattern_id` and `pattern_layer_ids` = the layers of that kind. This
+   is what puts a full-attention head (qkv GEMM, qk-norm, RoPE, KV write) into a table on a hybrid
+   model. Do not "fix" it by re-cutting at the layer's first kernel: in fused-residual models the
+   previous residual add and this layer's input norm are one kernel.
 5. Read `semantic_mapping_quality.json` and return its real status:
    - `pass`: structural coverage and every required phase have authoritative layer boundaries,
      representative integrity, exact layer order, and conservation.

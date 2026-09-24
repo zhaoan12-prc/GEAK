@@ -149,12 +149,13 @@ class DonorShapeProjectionTest(unittest.TestCase):
                  "sequence": ["a", "Memcpy DtoD (Device -> Device)", "b", "c"]}
         pairs = projection._layer_identical_pairs(
             group, donor, ["a", "__amd_rocclr_copyBuffer", "b", "x"])
-        # layer 0 differs only by the copy spelling -> paired; layer 1 differs -> not.
-        self.assertEqual(pairs, {0: 0, 1: 1})
+        # layer 0 differs only by the copy spelling -> paired; layer 1 pairs its
+        # agreeing prefix ("b") and stops at the divergence ("c" vs "x").
+        self.assertEqual(pairs, {0: 0, 1: 1, 2: 2})
 
-    def test_residual_rule_pairs_only_layers_of_equal_width(self):
-        # A residual range carved out of layer 0 makes it narrower than the donor's
-        # layer 0, so only layer 1 may be paired by position.
+    def test_residual_rule_pairs_the_agreeing_prefix_of_each_layer(self):
+        # A residual range carved out of layer 0 makes it narrower than the donor's;
+        # only the prefix both sides share from the cut is paired.
         group = {"match_rule": projection.STABLE_RULE + "_with_residuals",
                  "stable_projection": {"stable_event_count": 4},
                  "layer_ranges": [{"start_position": 0, "end_position": 1},
@@ -162,8 +163,9 @@ class DonorShapeProjectionTest(unittest.TestCase):
         donor = {"layer_starts": [0, 2], "sequence": ["a", "r", "b", "c"]}
         pairs = projection._pairs_for(group, donor, ["a", "r", "b", "c"])
         self.assertEqual(pairs, {0: 0, 1: 1, 2: 2, 3: 3})
+        # layer 0 (recipient width 1) pairs only "a"; layer 1 is identical.
         self.assertEqual(projection._layer_identical_pairs(
-            group, donor, ["a", "r", "b", "c"]), {2: 2, 3: 3})
+            group, donor, ["a", "r", "b", "c"]), {0: 0, 2: 2, 3: 3})
 
 
 if __name__ == "__main__":
