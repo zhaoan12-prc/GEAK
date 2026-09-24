@@ -244,6 +244,64 @@ class FusionCandidateHarnessTest(unittest.TestCase):
                 inventory["available_apis"][0]["source"],
                 "cited_not_inventoried")
 
+    def _falsify(self, existing_apis, rebuttals=None):
+        from unittest import mock
+        hits = [{"name": "fused_dynamic_mx_quant_moe_sort"}, {"name": "mla_topk"}]
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(harness, "_region_op_tags", return_value=["topk"]), \
+                mock.patch.object(harness, "_region_dtype_tags", return_value=[]), \
+                mock.patch.object(harness.fusion_catalog, "load_index",
+                                  return_value=({}, [])), \
+                mock.patch.object(harness.fusion_catalog, "covers", return_value=hits):
+            catalog = self._write(tmp, "catalog.json", {"kernels": []})
+            errors, warnings = [], []
+            matches = harness._catalog_falsify(
+                {"candidates": [{"candidate_id": "c0",
+                                 "implementation_class": "new_helper_kernel",
+                                 "existing_apis": existing_apis,
+                                 "catalog_rebuttals": rebuttals or []}]},
+                catalog, errors, warnings)
+        return matches["c0"], errors, warnings
+
+    def test_catalog_match_answered_in_constraints_is_not_an_error(self):
+        # 'gating' in a GDN kernel name reads as topk; an MX quant+MoE-sort kernel
+        # "covers" it. Answered per kernel, the author-track candidate stands.
+        why = ["MX quant + MoE sort; matched only via the name token 'gating'"]
+        match, errors, warnings = self._falsify([
+            {"name": "fused_dynamic_mx_quant_moe_sort", "coverage": "similar",
+             "constraints": why},
+            {"name": "mla_topk", "coverage": "similar", "constraints": ["MLA only"]}])
+        self.assertEqual(errors, [])
+        self.assertIsNone(match["match"])  # Top-K must not floor the tier at B
+        self.assertEqual(match["rebutted"]["fused_dynamic_mx_quant_moe_sort"], why)
+        self.assertTrue(any("answered as not applicable" in w for w in warnings))
+
+    def test_catalog_match_needs_every_kernel_answered(self):
+        match, errors, _ = self._falsify([
+            {"name": "fused_dynamic_mx_quant_moe_sort", "coverage": "similar",
+             "constraints": ["not applicable"]}])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("'mla_topk'", errors[0])
+        self.assertEqual(match["match"], "fused_dynamic_mx_quant_moe_sort")
+
+    def test_catalog_rebuttal_glob_answers_a_kernel_family(self):
+        match, errors, _ = self._falsify([], [
+            {"kernels": "*mx*_quant_moe_sort", "reason": "MX-format quant + MoE sort"},
+            {"kernels": "mla_*", "reason": "MLA only; this model has no MLA"}])
+        self.assertEqual(errors, [])
+        self.assertIn("via mla_*", match["rebutted"]["mla_topk"])
+
+    def test_catalog_rebuttal_without_reason_does_not_count(self):
+        _, errors, _ = self._falsify([], [{"kernels": "*", "reason": " "}])
+        self.assertEqual(len(errors), 1)
+
+    def test_full_coverage_claim_cannot_rebut_a_match(self):
+        _, errors, _ = self._falsify([
+            {"name": "fused_dynamic_mx_quant_moe_sort", "coverage": "full",
+             "constraints": ["x"]},
+            {"name": "mla_topk", "coverage": "similar", "constraints": ["MLA only"]}])
+        self.assertEqual(len(errors), 1)
+
     def test_cited_api_absent_from_catalog_is_hard_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             env_path = self._write(tmp, "env.json", {})
