@@ -527,6 +527,15 @@ does NOT justify author-track when a dtype-compatible one exists — the catalog
 dtype tags (fp8_blockscale ⇒ fp8) make that a covered region. "No kernel" must
 carry the catalog result that proves it.
 
+The op-tag containment test over-matches: a region whose only tag is `topk` is "covered" by every
+kernel carrying that tag (on vLLM/aiter, all ~77 MX/fp4 MoE-sort variants), and a match set can run to
+hundreds of kernels. When the matches are genuinely not applicable, answer **every** matched kernel —
+one by name in `existing_apis[]` (non-`full` coverage + `constraints`), or a family at once with
+`catalog_rebuttals: [{"kernels": "<glob, e.g. *mxfp4*>", "reason": "<why this family cannot run the
+region>"}]`. The harness names any match still unanswered; answered matches become warnings (kept for
+review) and no longer floor the Top-K tier at B. A rebuttal is a claim a reviewer will read: never
+write a glob broader than the reason actually covers.
+
 Every plan variant must populate an API assessment, even when the answer is
 negative:
 

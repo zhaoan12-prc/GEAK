@@ -2,6 +2,7 @@
 """Validate Fusion 2.1 facts/coverage and render the mandatory total table."""
 import argparse
 import copy
+import fnmatch
 import json
 import math
 import os
@@ -801,12 +802,54 @@ def _catalog_falsify(payload, catalog_path, errors, warnings,
         similar_only = bool(apis) and all(
             api.get("coverage") == "similar" for api in apis)
         if op_tags and hits and (author or similar_only):
-            errors.append(
-                "%s is %s but catalog kernel '%s' covers its op-set %s "
-                "(dtype %s) — reclassify as existing_api (tier B), or record in "
-                "existing_apis[].constraints why '%s' does not apply here"
-                % (cid, "author-track" if author else "similar-only", best,
-                   op_tags, dtype_tags or "-", best))
+            # The op-tag containment test over-matches (an MX/fp4 or MLA kernel, or
+            # a name token like 'gating' read as topk). A match is answered by an
+            # existing_apis entry that names that kernel, does not claim `full`
+            # coverage, and says in `constraints` why it does not apply. Every
+            # matched kernel must be answered; the answers are kept as warnings so
+            # a reviewer can audit them.
+            # Answers come from existing_apis entries naming one kernel, or from
+            # catalog_rebuttals [{kernels: <glob>, reason}] -- a match set can run to
+            # hundreds of kernels (every MX/fp4 MoE-sort variant for one `topk` tag),
+            # so one reason may cover a family, but every hit must be covered.
+            rebutted = {
+                api.get("name"): api.get("constraints") for api in apis
+                if api.get("name") and api.get("coverage") != "full"
+                and api.get("constraints")}
+            rules = [
+                rule for rule in candidate.get("catalog_rebuttals") or []
+                if isinstance(rule, dict) and rule.get("kernels")
+                and str(rule.get("reason") or "").strip()]
+            for hit in hits:
+                if hit["name"] in rebutted:
+                    continue
+                for rule in rules:
+                    if fnmatch.fnmatchcase(hit["name"], rule["kernels"]):
+                        rebutted[hit["name"]] = "%s (via %s)" % (
+                            rule["reason"], rule["kernels"])
+                        break
+            open_hits = [hit["name"] for hit in hits if hit["name"] not in rebutted]
+            if open_hits:
+                errors.append(
+                    "%s is %s but catalog kernel '%s' covers its op-set %s "
+                    "(dtype %s) — reclassify as existing_api (tier B), or say why it "
+                    "does not apply: existing_apis[].constraints for '%s', or "
+                    "catalog_rebuttals [{kernels: <glob>, reason}] for a family"
+                    "%s" % (cid, "author-track" if author else "similar-only",
+                            open_hits[0], op_tags, dtype_tags or "-", open_hits[0],
+                            " (%d more unanswered: %s)" % (
+                                len(open_hits) - 1, ", ".join(open_hits[1:4]))
+                            if len(open_hits) > 1 else ""))
+            else:
+                # Answered: nothing installed covers it, so Top-K must not floor
+                # its tier at B off this match.
+                matches[cid]["rebutted"] = {
+                    hit["name"]: rebutted[hit["name"]] for hit in hits}
+                matches[cid]["match"] = None
+                warnings.append(
+                    "%s: catalog matches %s answered as not applicable in "
+                    "existing_apis[].constraints" % (
+                        cid, ", ".join(hit["name"] for hit in hits)))
         # Prior-fill: the scan found nothing installed, but is this a KNOWN
         # fusion? Record it so an author-track lead carries a reference instead
         # of a blind "no kernel".
