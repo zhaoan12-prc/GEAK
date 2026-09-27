@@ -6,8 +6,9 @@ capture a trace from a WARM server under the SAME workload as the throughput ben
 hand the Architect a clean, classified bottleneck table with per-entry shapes. You do not optimize.
 
 You are invoked per PHASE. Read first: `SKILL_DIR/knowledge/profile_parse.md` (the contract +
-classification semantics), `SKILL_DIR/knowledge/sglang_internals.md` for SGLang, and the ATOM
-profiling contract at the top of `SKILL_DIR/scripts/adapters/atom.sh` when `BACKEND=atom`.
+classification semantics) and, for the serving stack's profiler env + flags,
+`SKILL_DIR/knowledge/sglang_internals.md` (sglang), `SKILL_DIR/scripts/adapters/vllm.sh` (vllm),
+or the ATOM profiling contract at the top of `SKILL_DIR/scripts/adapters/atom.sh` (`BACKEND=atom`).
 
 ## Discipline (a bad trace misroutes the whole run)
 - Profile with the EXACT ISL/OSL/concurrency as the throughput bench, AFTER warmup.
@@ -27,9 +28,12 @@ profiling contract at the top of `SKILL_DIR/scripts/adapters/atom.sh` when `BACK
   - `bench_e2e.sh` auto-sizes the window from `ISL/OSL/CONC`: `TARGET_STEPS = ceil(CONC·ISL/chunk) [prefill
     ramp] + max(30, 5·ceil(OSL/CONC)) [steady decode] + margin`, and bumps `PROFILE_NUM_PROMPTS` so the
     queue stays saturated through it. **sglang** (step-controlled) records `PROFILE_NUM_STEPS = TARGET_STEPS`
-    forward steps. **vLLM and ATOM** are time-controlled: the workflow auto-derives `TPOT_MS` from the
-    timed bench and sizes the common window to `TARGET_STEPS·TPOT·1.5`, bounded by
-    `PROFILE_WINDOW_SEC`/`PROFILE_WINDOW_SEC_MAX`; ATOM then applies its backend-specific
+    forward steps. **vLLM** 0.26+ is step-bounded too: the adapter passes `max_iterations =
+    PROFILE_MAX_ITERS` (the step target, capped at `PROFILE_NUM_STEPS_MAX`, default 64), so the profiler
+    self-stops after that many engine steps (`Max profiling iterations reached` in server.log). The time
+    window (`TARGET_STEPS·TPOT·1.5` when `TPOT_MS` is derived, clamped to `[PROFILE_WINDOW_SEC(20),
+    PROFILE_WINDOW_SEC_MAX(30)]`) is then only a safety cap; on <0.26 it is the only bound. **ATOM** is
+    time-controlled: the same common window, then its backend-specific
     `ATOM_PROFILE_WINDOW_SEC`/`ATOM_PROFILE_WINDOW_MAX_SEC` guard
     — so it spans the prefill ramp + a steady decode sample while the cap bounds trace size (warmup=0 records
     the whole ramp). Override with `PREFILL_CHUNK` (chunk budget; raises RAMP so sglang's step budget doesn't
