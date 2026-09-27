@@ -113,9 +113,12 @@ even engage the live GEMM path). Your axes:
   (auto vs fp8 — fp8 is an accuracy-gated change), `--mem-fraction-static`.
 - **backend env toggles**: `SGLANG_USE_AITER` and similar stack-level switches.
 - **FP8 quant** (only if `ENABLE_FP8=true`; **parity BREAKS by design**): `--quantization fp8` /
-  `--kv-cache-dtype fp8_e4m3`. Do NOT use byte parity here — run a small task-accuracy probe
-  (e.g. a few gsm8k / translation prompts, compare answer quality, not bytes) and keep ONLY if both
-  faster AND accuracy within tolerance. Record it as an accuracy-gated accept, never a silent one.
+  `--kv-cache-dtype fp8_e4m3`. Do NOT use byte parity here — run `scripts/gsm8k_eval.py` on the
+  current stack and the candidate with the same `--limit` (start at 200, `--max-tokens 4096`) and decide
+  with `scripts/accuracy_gate.py --base … --cand … --tol ${ACCURACY_TOL:-0.01}`: keep ONLY if faster AND
+  the gate says `pass`; on `inconclusive` re-run both legs larger (up to 1319) before deciding. A handful
+  of prompts cannot tell a real drop from serving noise (two identical vLLM baselines differ by ~1pt on
+  the full set). Record it as an accuracy-gated accept with the gate json, never a silent one.
 Each is still "one axis at a time + measure + parity/accuracy gate + compound". Use the same
 search-purpose protocol as the Integrator, in the same `MEASUREMENT_MODE`; the Director's independent
 validation arbitrates a borderline final result.
