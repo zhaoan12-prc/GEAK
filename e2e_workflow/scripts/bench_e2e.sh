@@ -53,6 +53,25 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# ---- pin the whole benchmark (server + client) to the serving GPUs' NUMA node ----
+# Done once, first, by re-exec, so the isolated-mode scheduler, every replica's server and the
+# bench client all inherit it. See numa_pin.sh for the measured ~5% bimodal spread it removes.
+# GEAK_NUMA_PIN=0 disables; GPUs spanning nodes, or unknown topology, run unpinned with a note.
+if [ "${GEAK_NUMA_PIN:-1}" = "1" ] && [ -z "${GEAK_NUMA_PINNED:-}" ]; then
+  export GEAK_NUMA_PINNED="none"
+  if [ -f "$HERE/numa_pin.sh" ] && command -v taskset >/dev/null 2>&1; then
+    source "$HERE/numa_pin.sh"
+    if _geak_cpus="$(geak_numa_cpus "${GPU:-0}")" && [ -n "$_geak_cpus" ]; then
+      export GEAK_NUMA_PINNED="$_geak_cpus"
+      echo ">>> NUMA: pinning to CPUs $_geak_cpus (node of GPU ${GPU:-0})"
+      exec taskset -c "$_geak_cpus" bash "$0" "$@"
+    fi
+    echo "!!! NUMA: GPU ${GPU:-0} topology unknown or spans nodes; running unpinned" >&2
+  else
+    echo "!!! NUMA: numa_pin.sh or taskset missing; running unpinned (throughput may be bimodal)" >&2
+  fi
+fi
+
 # ---- isolated-server measurement protocol ----
 # Keep the existing body below as the single-server implementation.  In isolated
 # mode this process is only a scheduler: each attempt runs bench_replica.sh,
