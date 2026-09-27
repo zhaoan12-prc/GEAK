@@ -85,7 +85,9 @@ also requires `text_only`, because it uses only the T row of mRoPE positions. Re
 condition minus the platform check; if a correctness condition is false for this serving config,
 the fusion does not apply there. Say which serving flag would make it true (here
 `--language-model-only`) and measure the A/B with that flag on BOTH legs — it is a serving-config
-change, so the baseline is re-measured under it.
+change, so the baseline is re-measured under it. If you accept, return that flag in
+`accepted_flags`: later phases serve with the accepted flags, and without it the fusion silently
+stops engaging.
 
 **A/B on a noisy baseline.** When one leg is bimodal (fresh-server replicas at two levels), the
 interleaved median delta is inflated by the low replicas. Report the delta against the stored
