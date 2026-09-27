@@ -255,6 +255,12 @@ baseline as well, and cross-check it against the kernel time the trace shows rem
     SE≈1.8pt; an AR-seam fusion's z≈1.0 "drop" once cost a real +1.3% win), and a significance-only
     test passes whatever n cannot see (a bf16 qk-norm+RoPE fusion measured 0.895 → 0.870 at n=200,
     p=0.22). Score the same-harness base-vs-cand DELTA only.
+    **Greedy is not deterministic under concurrent serving.** Measured on vLLM (Qwen3.5-35B-A3B-FP8,
+    full 1319): two runs of the SAME baseline scored 0.8954 and 0.8840 (163 questions flipped), and
+    the e14 candidate that "dropped" 2.5pt at n=200 scored −1.44pt and +0.91pt against the two
+    baselines. A single-run gap of ~1pt is serving noise — a reused `ACCURACY_REFERENCE` is one such
+    run too — which is why the gate tests significance and escalates to the full set instead of
+    trusting one small-n number either way.
 - **Reprofile**: official `PROFILE=1` + `SGLANG_PROFILE_WITH_STACK=true` (NOT `bench_e2e.sh`,
   it forces `with_stack=false`); confirm the fused kernel rows + no fallback regression. On
   vLLM run `bench_e2e.sh` with `PROFILE=1` on both legs and compare kernel-name counts: the fused
