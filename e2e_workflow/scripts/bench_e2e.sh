@@ -98,6 +98,26 @@ if [ -z "$SUMMARIZE" ]; then
   exit 3
 fi
 
+# ---- pin the whole benchmark (server + client) to the serving GPUs' NUMA node ----
+# Done once, first, by re-exec, so the isolated-mode scheduler, every replica's server and the
+# bench client all inherit it. See numa_pin.sh for the measured ~5% bimodal spread it removes.
+# GEAK_NUMA_PIN=0 disables; GPUs spanning nodes, or unknown topology, run unpinned with a note.
+if [ "${GEAK_NUMA_PIN:-1}" = "1" ] && [ -z "${GEAK_NUMA_PINNED:-}" ]; then
+  export GEAK_NUMA_PINNED="none"
+  _geak_numa_lib="$(_stage_lookup numa_pin.sh)" || _geak_numa_lib=""
+  if [ -n "$_geak_numa_lib" ] && command -v taskset >/dev/null 2>&1; then
+    source "$_geak_numa_lib"
+    if _geak_cpus="$(geak_numa_cpus "${GPU:-0}")" && [ -n "$_geak_cpus" ]; then
+      export GEAK_NUMA_PINNED="$_geak_cpus"
+      echo ">>> NUMA: pinning to CPUs $_geak_cpus (node of GPU ${GPU:-0})"
+      exec taskset -c "$_geak_cpus" bash "$0" "$@"
+    fi
+    echo "!!! NUMA: GPU ${GPU:-0} topology unknown or spans nodes; running unpinned" >&2
+  else
+    echo "!!! NUMA: numa_pin.sh or taskset missing; running unpinned (throughput may be bimodal)" >&2
+  fi
+fi
+
 # ---- default lifecycle ----
 # No mode named => the Hyperloom one, since "the caller forgot to forward MEASUREMENT_MODE" is the
 # likeliest way a number ends up measured under a different lifecycle than the rest of the run.
