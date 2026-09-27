@@ -471,7 +471,7 @@ const DEEP_FINAL_ACCURACY_LIMIT = parseInt(A.deep_final_accuracy_limit != null ?
 // (over-strict) byte-parity. Default 'none' => unchanged byte/greedy parity (normal/fast untouched).
 const ACCURACY_GATE = String(A.accuracy_gate || 'none').trim();          // 'none' | 'gsm8k'
 const ACCURACY_LIMIT = parseInt(A.accuracy_limit != null ? A.accuracy_limit : 200, 10); // sampled gsm8k subset size
-const ACCURACY_TOL = parseFloat(A.accuracy_tol != null ? A.accuracy_tol : 0.01);        // allowed absolute exact_match drop vs baseline
+const ACCURACY_TOL = parseFloat(A.accuracy_tol != null ? A.accuracy_tol : 0.01);        // largest exact_match drop that is not material; scripts/accuracy_gate.py fails only a significant drop above it
 const ACCURACY_INPUTS = (ACCURACY_GATE !== 'none')
   ? { ACCURACY_GATE, ACCURACY_LIMIT, ACCURACY_TOL, GSM8K_EVAL_SCRIPT: `${WORKFLOW_DIR}/scripts/gsm8k_eval.py` }
   : {};
@@ -3705,7 +3705,9 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON && BACKEND === 'sglang') {
           'unit_side_status pass/equivalent_pass/subsumed_pass. Start from CURRENT_OVERLAY/FLAGS/ENV/THROUGHPUT, ' +
           'which already include earlier terminal wins. For the selected ladder, author a reversible lazy-load overlay, ' +
           'prove ENGAGED on every TP rank, run the interleaved serving A/B with AB_DECIDE_SCRIPT deciding each pair, then ' +
-          'run the accuracy gate only if the A/B passed (reuse ACCURACY_REFERENCE as the base score when it is set), and descend its ' +
+          'run the accuracy gate only if the A/B passed and the unit-side parity is not bit-exact (gsm8k, then ' +
+          'scripts/accuracy_gate.py with ACCURACY_TOL; reuse ACCURACY_REFERENCE.path as the base leg when it is set; ' +
+          're-run both legs larger on inconclusive), and descend its ' +
           'declared ladder only when the wider rung fails. Preserve PRIOR_APPLY_RESULT dispositions verbatim and merge ' +
           'only this call\'s terminal result into it. Write the full aggregate apply_result.json, run ' +
           'fusion_applyback_harness.py with --allow-partial-coverage (later calls still have legitimate unprocessed rows), ' +

@@ -204,7 +204,8 @@ dir may be passed to STACK on top of.
   invocation per leg. Do not call `bench_replica.sh` directly and do not mix lifecycles: a
   `warm_server` leg and an `isolated_server` leg are not comparable. Record the lifecycle in
   `apply_result.json` next to the A/B numbers.
-- **Accuracy verification (精度验证 — mandatory for any quant fusion, after a passing A/B).**
+- **Accuracy verification (精度验证 — mandatory, after a passing A/B, for any fusion whose
+  unit-side parity is not bit-exact, quant or not).**
   Run `"$GSM8K_EVAL_SCRIPT"` with exactly this harness on both sides:
   `--limit 200 --max-tokens 4096 --seed 0 --concurrency "$GSM8K_CONCURRENCY"`, plus
   `--no-thinking` when `GSM8K_THINKING` is false (the default).
@@ -222,13 +223,22 @@ dir may be passed to STACK on top of.
   - Thinking off is enough for a same-harness base-vs-candidate delta; it is not the model's
     reported accuracy (the Director's Validate measures that). With thinking on, keep
     `--max-tokens` ≥4096 (at 1024 a reasoning model's CoT is cut before `#### N`: ~15pt drop).
-  **🔴 The gate must be NOISE-AWARE, not a fixed `cand ≥ base − 0.01`.** At n=200 one problem
-  ≈0.5pt and SE≈1.8pt, so a fixed 0.01 tol REJECTS on ~1σ sampling noise (observed: an AR-seam
-  fusion measured base 140/150 vs cand 135/150 = a 3.3pt "drop" that is only z≈1.0 — pure noise,
-  yet a fixed tol failed it and a real +1.3% tps win was wrongly dropped). **Reject only when the
-  accuracy drop is STATISTICALLY SIGNIFICANT** — a 2-proportion test at ~2σ (equivalently, drop >
-  ~1.96·SE ≈ 3.5pt at n=200), NOT a flat 0.01. If the drop is within noise (< ~2σ), treat it as
-  no-degradation → PASS. Score the same-harness base-vs-cand DELTA only.
+  - **Verdict: `accuracy_gate.py`, not a threshold you apply by eye.**
+    ```bash
+    python3 "$SKILL_DIR/scripts/accuracy_gate.py" --base <base gsm8k json> --cand <cand gsm8k json> \
+      --tol "$ACCURACY_TOL" --out "$APPLY_DIR/accuracy_gate.json"   # exit 0 pass, 1 fail, 3 inconclusive
+    ```
+    The base leg is `ACCURACY_REFERENCE.path` when the reference is reused (it holds the
+    per-question results; same harness, so the two legs pair question by question). The gate is a
+    one-sided exact McNemar on those pairs: **pass** = drop ≤ `ACCURACY_TOL`; **fail** = drop >
+    `ACCURACY_TOL` AND significant; **inconclusive** = drop > `ACCURACY_TOL` but n cannot resolve it →
+    re-run BOTH legs with a larger `--limit` (up to the full 1319) and gate again; never accept or
+    reject on an inconclusive verdict. A larger-`--limit` base is a different harness: do not return
+    it as `accuracy_reference`.
+    Why neither simpler rule: a fixed `cand ≥ base − tol` rejects on noise (n=200: one question ≈0.5pt,
+    SE≈1.8pt; an AR-seam fusion's z≈1.0 "drop" once cost a real +1.3% win), and a significance-only
+    test passes whatever n cannot see (a bf16 qk-norm+RoPE fusion measured 0.895 → 0.870 at n=200,
+    p=0.22). Score the same-harness base-vs-cand DELTA only.
 - **Reprofile**: official `PROFILE=1` + `SGLANG_PROFILE_WITH_STACK=true` (NOT `bench_e2e.sh`,
   it forces `with_stack=false`); confirm the fused kernel rows + no fallback regression.
 
