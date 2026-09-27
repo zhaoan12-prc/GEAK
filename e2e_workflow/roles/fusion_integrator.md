@@ -188,20 +188,22 @@ dir may be passed to STACK on top of.
   `cand_min > ref_max` (non-overlapping) AND delta > noise band (0.5%). Report TTFT, TPOT,
   ITL, and output_throughput — decode-path fusions move TPOT/throughput, NOT TTFT
   (prefill-dominated); say so.
-- **Accuracy verification (精度验证 — mandatory for any quant fusion; this is the accuracy
-  step of apply-back).** Run `scripts/gsm8k_eval.py` on baseline AND candidate with
+- **Accuracy verification (精度验证 — mandatory for any fusion whose unit-side parity is not
+  bit-exact, quant or not; this is the accuracy step of apply-back).** Run
+  `scripts/gsm8k_eval.py` on baseline AND candidate with the same `--limit` and
   **`--max-tokens 4096`** (≥4096, never the old 1024 — at 1024 a reasoning model's CoT is cut
   before the final `#### N` and the last-number fallback grabs a mid-reasoning number → a
-  spurious ~15pt drop; verified on DSR1: 1024≈0.79 vs 4096=0.94). `gsm8k_eval.py` defaults to
-  4096 now; still pass it. **n=200 is enough — do NOT crank n to 1000 (wasteful).**
-  **🔴 The gate must be NOISE-AWARE, not a fixed `cand ≥ base − 0.01`.** At n=200 one problem
-  ≈0.5pt and SE≈1.8pt, so a fixed 0.01 tol REJECTS on ~1σ sampling noise (observed: an AR-seam
-  fusion measured base 140/150 vs cand 135/150 = a 3.3pt "drop" that is only z≈1.0 — pure noise,
-  yet a fixed tol failed it and a real +1.3% tps win was wrongly dropped). **Reject only when the
-  accuracy drop is STATISTICALLY SIGNIFICANT** — a 2-proportion test at ~2σ (equivalently, drop >
-  ~1.96·SE ≈ 3.5pt at n=200), NOT a flat 0.01. If the drop is within noise (< ~2σ), treat it as
-  no-degradation → PASS. Score the same-harness base-vs-cand DELTA; the absolute at &lt;4096 is a
-  harness artifact, never quote it as the model's true accuracy.
+  spurious ~15pt drop; verified on DSR1: 1024≈0.79 vs 4096=0.94). Start at n=200.
+  Gate with `python3 "$SKILL_DIR/scripts/accuracy_gate.py" --base <gsm8k_base.json> --cand
+  <gsm8k_cand.json> --tol "$ACCURACY_TOL" --out <dir>/accuracy_gate.json` (exit 0 pass, 1 fail,
+  3 inconclusive). It pairs the two legs question by question (one-sided exact McNemar):
+  **pass** = drop ≤ `ACCURACY_TOL`; **fail** = drop > `ACCURACY_TOL` AND significant; **inconclusive**
+  = drop > `ACCURACY_TOL` but n cannot resolve it → re-run BOTH legs with a larger `--limit` (up to the
+  full 1319) and gate again; never accept or reject on an inconclusive verdict.
+  Why neither simpler rule: a fixed `cand ≥ base − tol` rejects on noise (n=200: one question ≈0.5pt,
+  SE≈1.8pt; an AR-seam fusion's z≈1.0 "drop" once cost a real +1.3% win), and a significance-only test
+  passes whatever n cannot see (a bf16 qk-norm+RoPE fusion measured 0.895 → 0.870 at n=200, p=0.22).
+  Score the same-harness base-vs-cand DELTA; the absolute at <4096 is a harness artifact.
 - **Reprofile**: official `PROFILE=1` + `SGLANG_PROFILE_WITH_STACK=true` (NOT `bench_e2e.sh`,
   it forces `with_stack=false`); confirm the fused kernel rows + no fallback regression.
 

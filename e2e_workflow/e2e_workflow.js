@@ -457,7 +457,7 @@ const DEEP_FINAL_ACCURACY_LIMIT = parseInt(A.deep_final_accuracy_limit != null ?
 // (over-strict) byte-parity. Default 'none' => unchanged byte/greedy parity (normal/fast untouched).
 const ACCURACY_GATE = String(A.accuracy_gate || 'none').trim();          // 'none' | 'gsm8k'
 const ACCURACY_LIMIT = parseInt(A.accuracy_limit != null ? A.accuracy_limit : 200, 10); // sampled gsm8k subset size
-const ACCURACY_TOL = parseFloat(A.accuracy_tol != null ? A.accuracy_tol : 0.01);        // allowed absolute exact_match drop vs baseline
+const ACCURACY_TOL = parseFloat(A.accuracy_tol != null ? A.accuracy_tol : 0.01);        // largest exact_match drop that is not material; scripts/accuracy_gate.py fails only a significant drop above it
 const ACCURACY_INPUTS = (ACCURACY_GATE !== 'none')
   ? { ACCURACY_GATE, ACCURACY_LIMIT, ACCURACY_TOL, GSM8K_EVAL_SCRIPT: `${WORKFLOW_DIR}/scripts/gsm8k_eval.py` }
   : {};
@@ -3349,7 +3349,8 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
       "candidate's fusion_degrade_ladder. For EACH: author a reversible lazy-load overlay adapter (route the " +
       'fused kernel to a PREBUILT downstream seam — kernel-availability gate; avoid the unbuilt MoE variant), ' +
       'prove the ENGAGED banner on all TP ranks, run an interleaved A/B (cand_min>ref_max + >noise band) vs the ' +
-      'CURRENT baseline, and a gsm8k accuracy gate (--max-tokens 4096) for quant fusions. STACK accepted overlays ' +
+      'CURRENT baseline, and a gsm8k accuracy gate (--max-tokens 4096, scripts/accuracy_gate.py with ACCURACY_TOL; ' +
+      're-run larger on inconclusive) for any fusion whose unit-side parity is not bit-exact. STACK accepted overlays ' +
       'via a combined-loader; on wire/gate/accuracy failure DEGRADE to the next ladder rung, then move to the next ' +
       'candidate. For tier-A run the same serving A/B + engagement gate and return accepted_flags/accepted_env. Skip tier-C. COVERAGE: FUSION_TOPK_JSON.execution_list is the ' +
       'denominator — EVERY exec_id must end applied / blocked+reason (rejected[]) / deferred+reason ' +
