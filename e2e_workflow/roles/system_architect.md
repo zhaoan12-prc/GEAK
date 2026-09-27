@@ -325,6 +325,31 @@ Return JSON:
 
 ---
 
+### On vLLM (`BACKEND=vllm`)
+
+The steps above name SGLang seams and switches. On vLLM (verified on 0.27.1 / gfx942, FP8 block-scale MoE):
+
+- **Where the live kernels come from — read `server.log`, it says.**
+  - Dense FP8 linear: `Selected TritonFp8BlockScaledMMKernel for Fp8LinearMethod` → the op
+    `torch.ops.vllm.w8a8_triton_block_scaled_mm_func` (opaque to torch.compile), which calls
+    `vllm.model_executor.layers.quantization.utils.fp8_utils:w8a8_triton_block_scaled_mm`. That is imported
+    lazily inside the op body, so a module-attribute overlay reaches it. vLLM ships tuned per-(N,K) configs for
+    MI300X (`Using configuration from …`), so Triton re-tuning has little headroom; the lever is a backend swap.
+  - MoE: `Using TRITON Fp8 MoE backend` → `fused_moe.fused_experts_impl` → `fused_moe_kernel`. Its tuning hook is a
+    config JSON per (E, N, device, dtype, block) read through `VLLM_TUNED_CONFIG_FOLDER`; the log line
+    `Using default MoE config` means none exists for this shape — the cheapest head win (`fused-op-tune-hook`).
+- **aiter is a set of switches, not one.** `VLLM_ROCM_USE_AITER=1` turns on its sub-flags by default
+  (`…_LINEAR`, `…_MOE`, `…_RMSNORM`, `…_MHA`, `…_FUSION_SHARED_EXPERTS`), which swaps several backends at once. Every
+  config direction must name the ONE sub-flag it tests and pin the others (`=0`), or the A/B credits the wrong
+  change. A kernel-engagement prerequisite (e.g. `VLLM_ROCM_USE_AITER_LINEAR=1` for a CK GEMM head) is `apply_env`
+  on that head, not a config direction.
+- **Attention backends** are `--attention-backend ROCM_ATTN | ROCM_AITER_UNIFIED_ATTN | TRITON_ATTN`. With a KV block
+  size that is not a power of two, ROCM_ATTN runs the in-tree Triton `kernel_paged_attention_2d` (editable), not CK.
+- **Serving flags an accepted fusion needs** (e.g. `--language-model-only`) are part of the stack: keep them on every
+  direction's legs and re-check that fusion's engagement after any backend swap.
+- `FUSION_CONFIG_LEVERS[].covers[].workload_forward_pct` is a share of the workload's forward time, not a Top-N
+  `pct_gpu_time`; say which one `expected_pct_gpu` carries.
+
 ## PHASE=plan_milestone  (between milestones, decide what to do next / whether to stop)
 
 Inputs: `EVAL_DIR`, `ROUND`, `BUDGET_REMAINING`, `CURRENT_THROUGHPUT`, `BASELINE_THROUGHPUT`,
