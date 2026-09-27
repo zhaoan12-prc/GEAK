@@ -59,7 +59,8 @@ dir may be passed to STACK on top of.
    `vllm.model_executor.layers.utils` reached `Server up after ~245s` with 11 shadow banners
    (API server + engine + 8 workers), NCCL up and CUDA graphs captured — distributed init did
    NOT hang. Keep the shadow to **ONE submodule** (never a package subtree — that shadows the
-   whole install) and assert the banner count equals **ranks + 2**; a module that pulls the
+   whole install) and assert the banner count equals **ranks + 2** at TP>1 (at TP=1 vLLM V1 runs
+   the worker inside EngineCore: expect 2 — API server + EngineCore); a module that pulls the
    distributed stack in at import could still deadlock, and a short banner count is how you
    would see it.
 
@@ -76,9 +77,24 @@ dir may be passed to STACK on top of.
    single `sitecustomize.py` does `runpy.run_path(...)` on each overlay file, and put only
    that loader dir on PYTHONPATH. Overlays that patch disjoint modules don't collide.
 
+**Bypass a platform gate, never a correctness gate.** A fused path is often switched off by a
+condition in the model file. A platform check (`current_platform.is_cuda()`) says only where it was
+tested; bypassing it is what apply-back is for, and unit-side parity is the evidence. A condition
+that encodes when the kernel is *exact* is different: the qk-norm+RoPE fusion in `qwen3_next.py`
+also requires `text_only`, because it uses only the T row of mRoPE positions. Re-evaluate the stock
+condition minus the platform check; if a correctness condition is false for this serving config,
+the fusion does not apply there. Say which serving flag would make it true (here
+`--language-model-only`) and measure the A/B with that flag on BOTH legs — it is a serving-config
+change, so the baseline is re-measured under it.
+
+**A/B on a noisy baseline.** When one leg is bimodal (fresh-server replicas at two levels), the
+interleaved median delta is inflated by the low replicas. Report the delta against the stored
+baseline as well, and cross-check it against the kernel time the trace shows removed.
+
 ## Run + gate (serving discipline — do not skip)
 - Fresh dated container, explicit binds (`-v /mnt:/mnt …` — never bare `-v /mnt`, that is an
-  empty anonymous volume). Delete it at the end. Process-safe: `source
+  empty anonymous volume). Delete it at the end. When `EXEC_PREFIX` names the runtime container,
+  run inside it instead and create/delete nothing. Process-safe: `source
   scripts/server_teardown.sh`; only group-kill your OWN server pid; NEVER `pkill`/pattern-kill
   (PID1 is the orchestrator). Never touch other teams' containers.
 - **Single server-init attempt** (~10 min). If it hangs at distributed init, tear down and
@@ -205,7 +221,9 @@ dir may be passed to STACK on top of.
   passes whatever n cannot see (a bf16 qk-norm+RoPE fusion measured 0.895 → 0.870 at n=200, p=0.22).
   Score the same-harness base-vs-cand DELTA; the absolute at <4096 is a harness artifact.
 - **Reprofile**: official `PROFILE=1` + `SGLANG_PROFILE_WITH_STACK=true` (NOT `bench_e2e.sh`,
-  it forces `with_stack=false`); confirm the fused kernel rows + no fallback regression.
+  it forces `with_stack=false`); confirm the fused kernel rows + no fallback regression. On
+  vLLM run `bench_e2e.sh` with `PROFILE=1` on both legs and compare kernel-name counts: the fused
+  kernel's count must rise from 0 and each replaced member's must fall to 0.
 
 ## Degrade ladder
 Try the WIDEST fusion first. If it cannot be wired (missing kernel) or fails the A/B or
