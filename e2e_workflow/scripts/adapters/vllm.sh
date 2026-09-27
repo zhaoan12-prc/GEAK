@@ -26,6 +26,16 @@ adapter_default_port() { echo 8000; }
 # (GEAK_FUSION_TRACE=1).  Fusion has a DIFFERENT evidence goal from the native Top-N
 # profiler: it needs Python/module spans and a short window that contains BOTH serving
 # phases, not a long statistical sample.  See bench_e2e.sh's sizing block.
+# A KEY=value the caller put in EXTRA_ENV: that reaches the server process, not this shell,
+# so a setting the adapter itself must read (e.g. VLLM_PROFILE_WITH_STACK) is looked up here.
+_extra_env_value() {
+  local kv
+  for kv in ${EXTRA_ENV:-}; do
+    case "$kv" in "$1="*) echo "${kv#*=}"; return 0 ;; esac
+  done
+  return 1
+}
+
 _geak_fusion_capture() {
   case " ${EXTRA_ENV:-} " in *" GEAK_FUSION_TRACE=1 "*) return 0 ;; esac
   [ "${GEAK_FUSION_TRACE:-0}" = "1" ]
@@ -43,11 +53,12 @@ adapter_launch() {
     # with_stack: off for ordinary Profile rounds (stacks are the biggest per-event cost), on for the
     # KernelFusion capture (semantics needs the nn.Module hierarchy for layer boundaries).
     # Override with VLLM_PROFILE_WITH_STACK=true|false.
-    local _stack="${VLLM_PROFILE_WITH_STACK:-false}"
+    local _stack_override="${VLLM_PROFILE_WITH_STACK:-$(_extra_env_value VLLM_PROFILE_WITH_STACK)}"
+    local _stack="${_stack_override:-false}"
     local _max_iters="${PROFILE_MAX_ITERS:-64}"
     local _delay_iters="${PROFILE_DELAY_ITERS:-0}"
     if _geak_fusion_capture; then
-      _stack="${VLLM_PROFILE_WITH_STACK:-true}"
+      _stack="${_stack_override:-true}"
       # vllm has no profile_by_stage, so ONE window must hold both phases. A saturated server
       # interleaves them, but one iteration (the sglang setting) would capture a single phase.
       # If Phase 1 reports a single phase, raise this.

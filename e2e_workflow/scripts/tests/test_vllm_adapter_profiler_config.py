@@ -145,6 +145,16 @@ class VllmProfilerConfigTest(unittest.TestCase):
                   EXTRA_ENV="GEAK_FUSION_TRACE=1", GEAK_FUSION_DELAY_ITERS="45")
         self.assertNotIn("delay_iterations", self._argv())
 
+    def test_with_stack_can_be_requested_through_extra_env(self):
+        # The orchestrator's formal profile asks for stacks via EXTRA_ENV, which reaches the
+        # server process, not the adapter shell that writes --profiler-config.
+        self._run("adapter_launch", probe_fields=FIELDS_026,
+                  EXTRA_ENV="FOO=1 VLLM_PROFILE_WITH_STACK=true")
+        self.assertIn('"torch_profiler_with_stack":true', self._argv())
+        self._run("adapter_launch", probe_fields=FIELDS_026,
+                  EXTRA_ENV="GEAK_FUSION_TRACE=1 VLLM_PROFILE_WITH_STACK=false")
+        self.assertIn('"torch_profiler_with_stack":false', self._argv())
+
     def test_fusion_capture_without_max_iterations_warns(self):
         proc = self._run("adapter_launch", probe_fields=FIELDS_019,
                          EXTRA_ENV="GEAK_FUSION_TRACE=1")
