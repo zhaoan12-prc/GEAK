@@ -3290,8 +3290,12 @@ if (want('setup')) {
   // BASELINE capture (only) when semantics mapping is enabled, so the shared clean
   // trace carries the module hierarchy semantics needs. Reprofiles keep curEnv
   // (the optimization Top-N does not need stacks, which bloat the trace).
-  const baselineExtraEnv = SEMANTICS_MAPPING_ON
-    ? (curEnv ? curEnv + ' ' : '') + 'SGLANG_PROFILE_WITH_STACK=true'
+  // Each adapter has its own with_stack switch; the sglang one is a no-op env on vllm.
+  const PROFILE_WITH_STACK_ENV = {
+    sglang: 'SGLANG_PROFILE_WITH_STACK=true', vllm: 'VLLM_PROFILE_WITH_STACK=true',
+  }[BACKEND];
+  const baselineExtraEnv = (SEMANTICS_MAPPING_ON && PROFILE_WITH_STACK_ENV)
+    ? (curEnv ? curEnv + ' ' : '') + PROFILE_WITH_STACK_ENV
     : curEnv;
   const profileTraceLensInputs = acceptedFusions.length ? {} : TRACELENS_INPUTS;
   profile = await safeAgent(
