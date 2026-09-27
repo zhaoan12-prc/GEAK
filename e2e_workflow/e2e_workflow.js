@@ -3531,7 +3531,7 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
       EVAL_DIR, PROFILE_TOPN: profile ? profile.profile_topN_json : '',
       // Same field name as native strategize; value is the profiled stack (post-Fusion curTput).
       BASELINE_THROUGHPUT: curTput, WORKLOAD, BUDGET, HEAD_THRESHOLD_PCT,
-      CONFIG_TUNE_ENABLED, SKILL_DIR: WORKFLOW_DIR,
+      CONFIG_TUNE_ENABLED, ENABLE_FP8, SKILL_DIR: WORKFLOW_DIR,
       FUSION_TOPK_JSON: FUSION_INPUTS.FUSION_TOPK_JSON,
       FUSION_CONFIG_LEVERS: CONFIG_TUNE_ENABLED ? fusionConfigLevers : [],
       FUSION_UNITSIDE_JSON: FUSION_INPUTS.FUSION_UNITSIDE_JSON,
@@ -3641,6 +3641,8 @@ if (want('config') && CONFIG_TUNE_ENABLED && strategy && (strategy.config_direct
       // Gate vs the current accepted stack (fused if Fusion won), not Setup's original baseline.
       BASELINE_THROUGHPUT: curTput,
       NOISE_BAND_PCT: NOISE_BAND, E2E_REPEATS, CONFIG_DIRECTIONS: strategy.config_directions,
+      // Gates the lossy FP8 axis (kv-cache / quantization); the role reads it, it was never passed.
+      ENABLE_FP8,
       CURRENT_FLAGS: curFlags, CURRENT_ENV: curEnv, CURRENT_OVERLAY: curOverlay,
       MEASUREMENT_PURPOSE: 'search', REPLICAS: SEARCH_REPLICAS,
       REQUIRED_FUSION_ENGAGEMENT: acceptedFusions,

@@ -345,6 +345,8 @@ The steps above name SGLang seams and switches. On vLLM (verified on 0.27.1 / gf
   on that head, not a config direction.
 - **Attention backends** are `--attention-backend ROCM_ATTN | ROCM_AITER_UNIFIED_ATTN | TRITON_ATTN`. With a KV block
   size that is not a power of two, ROCM_ATTN runs the in-tree Triton `kernel_paged_attention_2d` (editable), not CK.
+- **Lossy directions need `ENABLE_FP8=true`.** `--kv-cache-dtype fp8` and `--quantization fp8` change numerics by
+  design; with `ENABLE_FP8=false` (the default) do not route them.
 - **Serving flags an accepted fusion needs** (e.g. `--language-model-only`) are part of the stack: keep them on every
   direction's legs and re-check that fusion's engagement after any backend swap.
 - `FUSION_CONFIG_LEVERS[].covers[].workload_forward_pct` is a share of the workload's forward time, not a Top-N
