@@ -189,7 +189,10 @@ recipe (single-stream decode, exact rule). On the default config routed and shar
 two streams, so the order inside each MoE layer follows device timing; those steps transfer under
 `equal_multiplicity_stable_identity_per_layer_multiset` (each layer's multiset must match; reordering
 across a layer is still rejected), ~0.78 coverage. Report `stable_projection.order_rule` and
-`reordered_layer_count` alongside the fraction.
+`reordered_layer_count` alongside the fraction. A step no donor pass validates (a batch size the
+donor never ran) leaves the transfer `partial` and the step unresolved; the quality gate excuses it
+only if the transfer declared it unmapped and most steps of its phase are mapped
+(`step_layer_order.excused_transfer_unmapped_steps`). List excused steps in `notes`.
 
 1. Read `SHAPE_CAPTURE_PLAN_JSON`; its representative layers and selected buckets are the only
    allowed layer/bucket filters. Never copy filters from a historical run.

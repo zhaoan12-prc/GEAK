@@ -947,6 +947,35 @@ class PhaseCoverageTest(unittest.TestCase):
             self.assertEqual([e["name"] for e in merged], ["e", "l"])
 
 
+class TransferUnmappedStepTest(unittest.TestCase):
+    """Which unresolved steps a partial boundary transfer may excuse from the gates."""
+
+    @staticmethod
+    def _diag(step_id, phase, status):
+        return {"step_id": step_id, "phase": phase, "status": status}
+
+    def test_a_declared_unmapped_step_in_a_mostly_mapped_phase_is_excused(self):
+        diagnostics = [self._diag("s%d" % i, "decode", "mapped") for i in range(3)]
+        diagnostics.append(self._diag("s9", "decode", "boundary_unresolved"))
+        excused = mapping._excused_transfer_steps(
+            diagnostics, {"s9": {"reason": "no_validated_stable_projection"}})
+        self.assertEqual(excused, {"s9": "no_validated_stable_projection"})
+
+    def test_an_unresolved_step_the_transfer_did_not_declare_still_gates(self):
+        """E.g. a prefill whose module spans were misattributed: not excusable."""
+        diagnostics = [self._diag("s0", "prefill", "mapped"),
+                       self._diag("s1", "prefill", "mapped"),
+                       self._diag("s2", "prefill", "boundary_unresolved")]
+        self.assertEqual(mapping._excused_transfer_steps(diagnostics, {}), {})
+
+    def test_a_phase_that_is_mostly_unmapped_is_not_excused(self):
+        diagnostics = [self._diag("s0", "decode", "mapped"),
+                       self._diag("s1", "decode", "boundary_unresolved"),
+                       self._diag("s2", "decode", "boundary_unresolved")]
+        unmapped = {"s1": {"reason": "x"}, "s2": {"reason": "x"}}
+        self.assertEqual(mapping._excused_transfer_steps(diagnostics, unmapped), {})
+
+
 class DiagnosticStageRecurrenceTest(unittest.TestCase):
     def test_periodic_stage_is_diagnostic_only(self):
         rows = []

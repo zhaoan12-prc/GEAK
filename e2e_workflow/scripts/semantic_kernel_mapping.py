@@ -2,6 +2,7 @@
 """Build Pattern/Phase/Layer ordered device-event tables from one clean trace."""
 import argparse
 import bisect
+import collections
 import difflib
 import gzip
 import hashlib
@@ -1717,9 +1718,48 @@ def _trace_pattern_consistency(instances):
     }
 
 
+def _transfer_unmapped_steps(boundary_map_paths, applied_steps):
+    """{step_id: failure} for steps a boundary transfer declared it could not map."""
+    unmapped = {}
+    for path in boundary_map_paths or []:
+        with open(path) as fh:
+            document = json.load(fh)
+        for failure in document.get("failures") or []:
+            step_id = failure.get("step_id")
+            if step_id and step_id not in applied_steps:
+                unmapped.setdefault(step_id, failure)
+    return unmapped
+
+
+def _excused_transfer_steps(partition_diagnostics, transfer_unmapped):
+    """Transfer-unmapped steps that do not gate: {step_id: reason}.
+
+    A boundary transfer maps only steps some donor pass validates; a batch size
+    the donor never ran stays unresolved (MiniMax-M3 TP8: 12/13 decode steps
+    mapped, the bs=15 step had no donor pass). Such a step is excused only when
+    the transfer itself declared it unmapped AND its phase is mostly mapped, so
+    the table's representatives still come from real cuts. Any other unresolved
+    step keeps gating.
+    """
+    mapped = collections.Counter()
+    unmapped = collections.Counter()
+    for item in partition_diagnostics:
+        if item.get("status") == "mapped":
+            mapped[item.get("phase")] += 1
+        elif item["step_id"] in transfer_unmapped:
+            unmapped[item.get("phase")] += 1
+    return {
+        item["step_id"]: transfer_unmapped[item["step_id"]].get("reason")
+        for item in partition_diagnostics
+        if item.get("status") != "mapped"
+        and item["step_id"] in transfer_unmapped
+        and mapped[item.get("phase")] > unmapped[item.get("phase")]
+    }
+
+
 def _quality(
         pattern_doc, rows, instances, representatives, spans, out_of_scope,
-        partition_diagnostics, tables):
+        partition_diagnostics, tables, transfer_unmapped=None):
     input_count = len(rows)
     assigned_count = sum(1 for row in rows if row["assignment"] in (
         "layer_body", "transition_global", "concurrent_unresolved"))
@@ -1733,6 +1773,8 @@ def _quality(
     instances_by_step = {}
     for instance in instances:
         instances_by_step.setdefault(instance.get("step_id"), []).append(instance)
+    excused = _excused_transfer_steps(
+        partition_diagnostics, transfer_unmapped or {})
     step_audits = []
     for diagnostic in partition_diagnostics:
         step_instances = sorted(
@@ -1752,13 +1794,17 @@ def _quality(
             "layer_order_valid": actual_order == expected_order,
             "non_overlapping": non_overlapping,
             "boundary_source_status": diagnostic.get("status"),
-            "status": "pass" if (
-                diagnostic.get("status") == "mapped"
-                and actual_order == expected_order
-                and non_overlapping) else "fail",
+            "status": (
+                "excused_transfer_unmapped"
+                if diagnostic["step_id"] in excused else
+                "pass" if (
+                    diagnostic.get("status") == "mapped"
+                    and actual_order == expected_order
+                    and non_overlapping) else "fail"),
         })
     mechanical_pass = (not partition_diagnostics or bool(step_audits)) and all(
-        item["status"] == "pass" for item in step_audits)
+        item["status"] in ("pass", "excused_transfer_unmapped")
+        for item in step_audits)
     phase_status = "pass" if spans else "partial"
     representative_integrity = _representative_integrity(
         rows, tables, representatives)
@@ -1803,6 +1849,9 @@ def _quality(
                 "gating": True,
                 "scope": "all_required_steps",
                 "steps": step_audits,
+                "excused_transfer_unmapped_steps": [
+                    {"step_id": step_id, "transfer_reason": reason}
+                    for step_id, reason in sorted(excused.items())],
             },
             "representative_layer_integrity": representative_integrity,
             "trace_pattern_consistency": trace_consistency,
@@ -2097,7 +2146,8 @@ def build(trace_path, pattern_path, out_dir, table_phases=None,
     tables = _table(pattern_doc, rows, representatives, table_phases)
     quality = _quality(
         pattern_doc, rows, instances, representatives, spans, out_of_scope,
-        partition_diagnostics, tables)
+        partition_diagnostics, tables,
+        _transfer_unmapped_steps(boundary_map_paths, applied_boundary_steps))
     coverage = _phase_coverage(
         instances, tables, trace_paths, adopted_siblings, table_phases,
         require_phases,
