@@ -282,6 +282,58 @@ class SemanticLayerBoundaryTransferTest(unittest.TestCase):
                 [row["layer_id"] for row in rows[1:7]],
                 [0, 0, 1, 1, 1, 1])
 
+    def test_reordering_inside_a_layer_passes_on_the_per_layer_multiset(self):
+        """Concurrent streams interleave a layer's work by device timing.
+
+        MiniMax-M3 TP8 (default config): routed experts and the shared expert run
+        on two streams, so no decode step's projection was byte-equal to the
+        donor's while every layer's multiset was.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            donor = self._donor(tmp, names={
+                0: ["layer0_a", "layer0_b", "layer0_c"],
+                1: ["layer1_a", "layer1_b", "layer1_c"],
+            })
+            recipient = self._recipient(tmp, body=[
+                "layer0_b", "layer0_a", "layer0_c",
+                "layer1_a", "layer1_b", "layer1_c",
+            ])
+            result = transfer.transfer(
+                donor, recipient, self._patterns(tmp),
+                os.path.join(tmp, "boundary.json"))
+            self.assertEqual(result["status"], "pass")
+            group = result["mapped_groups"][0]
+            self.assertEqual(group["match_rule"], transfer.STABLE_PER_LAYER_RULE)
+            self.assertEqual(group["layer_start_positions"], [1, 4])
+            stable = group["stable_projection"]
+            self.assertEqual(stable["order_rule"], "per_layer_multiset")
+            self.assertEqual(stable["reordered_layer_count"], 1)
+            self.assertEqual(stable["reordered_event_count"], 2)
+
+    def test_reordering_across_a_layer_boundary_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            donor = self._donor(tmp, names={
+                0: ["layer0_a", "layer0_b", "layer0_c"],
+                1: ["layer1_a", "layer1_b", "layer1_c"],
+            })
+            recipient = self._recipient(tmp, body=[
+                "layer0_a", "layer0_b", "layer1_a",
+                "layer0_c", "layer1_b", "layer1_c",
+            ])
+            result = transfer.transfer(
+                donor, recipient, self._patterns(tmp))
+            self.assertEqual(result["status"], "fail")
+            failure = result["failures"][0]["stable_projection_failures"][0]
+            self.assertEqual(failure["reason"], "stable_identity_projection_mismatch")
+            self.assertEqual(failure["first_mismatch_layer"], 0)
+
+    def test_byte_equal_projection_keeps_the_exact_rule(self):
+        pairs, info = transfer.stable_projection_pairs(
+            ["p", "a", "b", "c", "d"], ["a", "b", "c", "d"], [0, 2])
+        self.assertEqual(info["order_rule"], "exact_sequence")
+        self.assertEqual([(d, r) for _, d, r in pairs],
+                         [(0, 1), (1, 2), (2, 3), (3, 4)])
+
     def test_stable_projection_keeps_ambiguous_two_sided_gap_residual(self):
         with tempfile.TemporaryDirectory() as tmp:
             donor = self._donor(tmp, names={

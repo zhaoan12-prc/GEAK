@@ -12,7 +12,10 @@ transfer validated -- nothing looser:
   ``body_start + i``;
 * ``exact_equal_multiplicity_stable_identity_projection``: only identities with
   equal multiplicity on both sides, paired in order, and the pair count must
-  equal the transfer's own ``stable_event_count``; plus, inside each transferred
+  equal the transfer's own ``stable_event_count``;
+* ``equal_multiplicity_stable_identity_per_layer_multiset``: the same identities,
+  paired within each layer by occurrence (the k-th ``X`` with the k-th ``X``)
+  where concurrent streams reordered the layer; for both stable rules, inside each transferred
   layer cut, positional pairing over the longest prefix on which the donor and
   recipient identity sequences agree (the two rules must agree wherever both
   apply).
@@ -37,27 +40,24 @@ import semantic_shape_merge
 
 SOURCE = "donor_trace_stable_projection"
 EXACT_RULE = "exact_contiguous_normalized_device_sequence"
-STABLE_RULE = "exact_equal_multiplicity_stable_identity_projection"
-STABLE_RULES = (STABLE_RULE, STABLE_RULE + "_with_residuals")
+STABLE_RULE = transfer.STABLE_RULE
+STABLE_RULES = tuple(rule + suffix
+                     for rule in (transfer.STABLE_RULE, transfer.STABLE_PER_LAYER_RULE)
+                     for suffix in ("", "_with_residuals"))
 
 
-def _stable_pairs(recipient_sequence, donor_sequence):
-    """(donor_position, recipient_position) pairs of the stable projection."""
-    donor_counts = collections.Counter(donor_sequence)
-    recipient_counts = collections.Counter(recipient_sequence)
-    stable = {identity for identity, count in donor_counts.items()
-              if count > 0 and recipient_counts.get(identity) == count}
-    donor_projection = [(identity, position)
-                        for position, identity in enumerate(donor_sequence)
-                        if identity in stable]
-    recipient_projection = [(identity, position)
-                            for position, identity in enumerate(recipient_sequence)
-                            if identity in stable]
-    if [item[0] for item in donor_projection] != [
-            item[0] for item in recipient_projection]:
+def _stable_pairs(recipient_sequence, donor_sequence, layer_starts):
+    """(donor_position, recipient_position) pairs of the stable projection.
+
+    The transfer's own pairing, so a per-layer multiset match pairs each row with
+    the donor row of the same identity, never merely the one at the same index.
+    """
+    pairs, _ = transfer.stable_projection_pairs(
+        recipient_sequence, donor_sequence, layer_starts)
+    if pairs is None:
         return None
-    return [(donor[1], recipient[1])
-            for donor, recipient in zip(donor_projection, recipient_projection)]
+    return [(donor_position, recipient_position)
+            for _, donor_position, recipient_position in pairs]
 
 
 # The same device-to-device copy is a gpu_memcpy event when the CPU issues it and a
@@ -111,7 +111,8 @@ def _pairs_for(group, donor, recipient_sequence):
                 for position in range(len(donor["sequence"]))}
     if rule not in STABLE_RULES:
         return None
-    stable = _stable_pairs(recipient_sequence, donor["sequence"])
+    stable = _stable_pairs(recipient_sequence, donor["sequence"],
+                           [int(value) for value in donor["layer_starts"]])
     expected = (group.get("stable_projection") or {}).get("stable_event_count")
     if stable is None or len(stable) != expected:
         return None

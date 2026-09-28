@@ -218,6 +218,12 @@ prefill 3/3 and decode 0/13; the donor transferred all 13 decode steps (stable i
 ~59% event coverage), the rebuilt table passed every gate, and donor projection resolved decode Shape
 and parent operator for 59/59 representative rows. Coverage near the 50% floor is the
 risk to watch on other models — report `stable_projection.donor_event_fraction` in `notes`.
+MiniMax-M3-MXFP8 (v0.30.0, TP8, ISL 8096/OSL 1024/CONC 16): coverage ~0.81 on the recommended
+recipe (single-stream decode, exact rule). On the default config routed and shared experts run on
+two streams, so the order inside each MoE layer follows device timing; those steps transfer under
+`equal_multiplicity_stable_identity_per_layer_multiset` (each layer's multiset must match; reordering
+across a layer is still rejected), ~0.78 coverage. Report `stable_projection.order_rule` and
+`reordered_layer_count` alongside the fraction.
 
 1. Read `SHAPE_CAPTURE_PLAN_JSON`; its representative layers and selected buckets are the only
    allowed layer/bucket filters. Never copy filters from a historical run.
