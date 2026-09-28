@@ -18,7 +18,9 @@ matching consecutive chunk of the recipient projection -- and require multiple
 distinct anchors in every layer plus majority coverage.  A one-sided unmatched internal
 gap follows the marker-proven side.  A two-sided or otherwise unsupported gap
 remains an explicit inter-layer residual while both proven layer cores remain
-eligible as representatives.  Outer prefix/suffix work remains global. Stage
+eligible as representatives.  Outer prefix/suffix work remains global.  A step
+no donor pass validates stays unresolved and makes the map ``partial``; it does
+not void the steps that did transfer.  Stage
 names, model names, attention kinds and recurring subsequences are never used to
 invent a boundary.
 """
@@ -829,9 +831,14 @@ def transfer(donor_trace, recipient_traces, pattern_path, out_path=""):
         })
     has_residuals = any(
         group.get("residual_ranges") for group in groups)
+    # A step no donor pass validates (typically a batch size the donor never ran)
+    # stays unresolved; it does not void the steps that did transfer. Only a
+    # donor-wide failure, or nothing transferred at all, fails the map.
+    unmapped_steps = [item for item in failures if item.get("step_id")]
+    donor_failures = [item for item in failures if not item.get("step_id")]
     status = (
-        "fail" if failures or not groups else
-        "partial" if has_residuals else
+        "fail" if donor_failures or not groups else
+        "partial" if has_residuals or unmapped_steps else
         "pass")
     if skipped_authoritative and not groups and not failures:
         status = "not_needed"
@@ -871,6 +878,7 @@ def transfer(donor_trace, recipient_traces, pattern_path, out_path=""):
             len(group.get("residual_ranges") or []) for group in groups),
         "skipped_authoritative_steps": skipped_authoritative,
         "untransferable_steps": untransferable,
+        "unmapped_step_count": len(unmapped_steps),
         "failures": failures,
     }
     if out_path:

@@ -234,6 +234,30 @@ class SemanticLayerBoundaryTransferTest(unittest.TestCase):
                 item["reason"] == "donor_has_no_complete_nonempty_layer_pass"
                 for item in result["failures"]))
 
+    def test_a_step_without_a_donor_pass_leaves_the_map_partial(self):
+        """A batch size the donor never ran must not void the steps it did validate."""
+        with tempfile.TemporaryDirectory() as tmp:
+            events = []
+            for index, (batch, start) in enumerate(((4, 0), (8, 300))):
+                events.append({"cat": "gpu_user_annotation",
+                               "name": "step[DECODE bs=%d]" % batch,
+                               "ts": start, "dur": 200})
+                names = ["prepare_once", "layer0_a", "layer0_b",
+                         "layer1_a", "layer1_b", "model_epilogue"]
+                events.extend({"cat": "kernel", "name": name,
+                               "ts": start + 10 + offset * 3, "dur": 1, "args": {}}
+                              for offset, name in enumerate(names))
+            recipient = os.path.join(tmp, "two_steps.json")
+            with open(recipient, "w") as fh:
+                json.dump({"traceEvents": events}, fh)
+            result = transfer.transfer(
+                self._donor(tmp), recipient, self._patterns(tmp))
+            self.assertEqual(result["status"], "partial")
+            self.assertEqual(result["mapped_step_count"], 1)
+            self.assertEqual(result["unmapped_step_count"], 1)
+            self.assertEqual(result["failures"][0]["batch_size"], 8)
+            self.assertEqual(result["failures"][0]["compatible_donor_pass_count"], 0)
+
     def test_nonidentical_sequence_is_rejected_instead_of_aligned_by_stage(self):
         with tempfile.TemporaryDirectory() as tmp:
             result = transfer.transfer(

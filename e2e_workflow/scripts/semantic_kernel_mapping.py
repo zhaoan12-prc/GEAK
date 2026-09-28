@@ -2,6 +2,7 @@
 """Build Pattern/Phase/Layer ordered device-event tables from one clean trace."""
 import argparse
 import bisect
+import collections
 import difflib
 import gzip
 import hashlib
