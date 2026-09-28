@@ -1030,5 +1030,73 @@ class GatingStepAuditsTest(unittest.TestCase):
         self.assertEqual([a["step_id"] for a in gating], ["s1", "s2", "s3"])
 
 
+class VllmStepSpanTest(unittest.TestCase):
+    """vLLM execute_* step windows, as measured on MiniMax-M3 TP8 (vLLM 0.30 ROCm)."""
+
+    PREFILL = "execute_32_context_1(sq32sk8096sqsq1024sqsk259072)_generation_0(sq0sk0sqsq0sqsk0)"
+    DECODE = ("execute_16_context_0(sq0sk0sqsq0sqsk0)"
+              "_generation_16(sq16sk129712sqsq16sqsk129712)")
+
+    @staticmethod
+    def _ann(cat, name, ts, dur, tid=4):
+        return {"cat": cat, "name": name, "ts": ts, "dur": dur, "pid": 0, "tid": tid}
+
+    def test_one_step_annotated_on_two_streams_is_one_span(self):
+        """The same step on stream 4 and stream 2 split a prefill into 4 + 56 layers."""
+        events = [
+            self._ann("gpu_user_annotation", self.PREFILL, 1000, 500, tid=4),
+            self._ann("gpu_user_annotation", self.PREFILL, 1020, 450, tid=2),
+            self._ann("gpu_user_annotation", self.DECODE, 1600, 20, tid=4),
+        ]
+        spans = mapping._collect_step_spans(events)
+        self.assertEqual([(s[0], s[1], s[2]) for s in spans],
+                         [(1000, 1500, "P"), (1600, 1620, "D")])
+
+    def test_back_to_back_steps_of_the_same_shape_stay_separate(self):
+        events = [
+            self._ann("gpu_user_annotation", self.DECODE, 1000, 20),
+            self._ann("gpu_user_annotation", self.DECODE, 1020, 20),
+        ]
+        self.assertEqual(len(mapping._collect_step_spans(events)), 2)
+
+    def test_host_window_is_paired_by_name_without_overlap(self):
+        """--async-scheduling: the host runs a whole step ahead of the device."""
+        events = [
+            self._ann("user_annotation", self.PREFILL, 100, 200),
+            self._ann("gpu_user_annotation", self.PREFILL, 900, 500),
+        ]
+        span = mapping._collect_step_spans(events)[0]
+        self.assertEqual((span[7], span[8]), (100, 300))
+
+    def test_host_window_is_not_widened_to_the_device_end(self):
+        """Eager decode: the device trails the host, and the next step's host work
+        starts before this step's device work ends. The host window must stop at its
+        own end, or the last layer swallows the next step's input prep."""
+        events = [
+            self._ann("user_annotation", self.DECODE, 1000, 200),
+            self._ann("gpu_user_annotation", self.DECODE, 1010, 240),
+        ]
+        span = mapping._collect_step_spans(events)[0]
+        self.assertEqual((span[7], span[8]), (1000, 1200))
+
+    def test_flow_owner_comes_from_the_host_launch_not_the_device_endpoint(self):
+        """The device endpoint shares the clock with host spans it is unrelated to."""
+        scopes = [{"ts": 100, "end": 200, "layer_id": 3,
+                   "layer_instance_id": "s:pass-0:layer-3"}]
+        starts = [100]
+        events = [
+            # launched before any layer scope; its device endpoint lands at 150,
+            # inside layer 3's host span
+            {"ph": "s", "id": 1, "ts": 50, "cat": "ac2g"},
+            {"ph": "f", "id": 1, "ts": 150, "cat": "ac2g"},
+            # launched inside layer 3
+            {"ph": "s", "id": 2, "ts": 120, "cat": "ac2g"},
+            {"ph": "f", "id": 2, "ts": 400, "cat": "ac2g"},
+        ]
+        index = mapping._flow_layer_index(events, scopes, starts)
+        self.assertNotIn(150, index)
+        self.assertEqual(index[400]["layer_id"], 3)
+
+
 if __name__ == "__main__":
     unittest.main()
