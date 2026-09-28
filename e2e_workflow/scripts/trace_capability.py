@@ -16,6 +16,9 @@ from collections import Counter
 TRACE_SUFFIXES = (".json", ".json.gz", ".pt.trace.json", ".pt.trace.json.gz")
 SGLANG_STEP_RE = re.compile(
     r"^step\[(EXTEND|DECODE)\s+bs=(\d+)(?:\s+toks=(\d+))?\]$")
+# A decode window longer than this multiple of the shortest rank window is treated as
+# stretched to the profiler stop rather than bounding one step (see build_manifest).
+DECODE_WINDOW_OVERLONG_FACTOR = 5.0
 MODULE_LAYER_RE = re.compile(
     r"^nn\.Module:\s+.*DecoderLayer_(\d+)$", re.IGNORECASE)
 
@@ -208,14 +211,29 @@ def build_manifest(trace_dir, analysis_rank=0, auto_select_rank=False):
             )
             if score > by_rank.get(rank, ((-1, -1.0), None))[0]:
                 by_rank[rank] = (score, entry)
+        # On ROCm some ranks' GPU-side step[DECODE] window can stretch to the
+        # profiler stop (observed ~20 s vs ~8.7 ms for one decode step), pulling in
+        # events from outside the step. Such a window is not a representative step
+        # and must not win the rank selection merely by holding more events.
+        durations = [score[1] for score, _entry in by_rank.values() if score[1] > 0]
+        overlong_cap_us = (
+            min(durations) * DECODE_WINDOW_OVERLONG_FACTOR if durations else None)
+
+        def _overlong(duration_us):
+            return overlong_cap_us is not None and duration_us > overlong_cap_us
+
         max_decode_events = max(
-            (score[0] for score, _entry in by_rank.values()), default=0)
+            (score[0] for score, _entry in by_rank.values()
+             if not _overlong(score[1])), default=0)
         for rank in sorted(by_rank):
             entry = by_rank[rank][1]
             device_events, duration_us = by_rank[rank][0]
             if not duration_us:
                 eligible = False
                 reason = "missing_decode_annotation"
+            elif _overlong(duration_us):
+                eligible = False
+                reason = "decode_window_overlong"
             elif not device_events:
                 eligible = False
                 reason = "decode_annotation_has_no_device_events"

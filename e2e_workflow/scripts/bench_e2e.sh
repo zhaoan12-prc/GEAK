@@ -799,18 +799,28 @@ PY
     [ -n "${TPOT_MS:-}" ] && echo ">>> steady-state sizing: derived TPOT_MS=${TPOT_MS}ms from timed bench (vllm window auto-scale)"
   fi
   # KernelFusion has a different evidence goal from the native Top-N profiler:
-  # it needs Python/module spans and one representative forward per sglang stage,
+  # it needs Python/module spans and a representative forward per sglang stage,
   # not a long statistical sample.  Its caller sets GEAK_FUSION_TRACE=1 and
-  # PROFILE_NUM_STEPS=1. Do not inflate that stack-heavy sglang trace back to
-  # 40/64 steps. Other backends retain their existing adapter behavior.
+  # GEAK_FUSION_PROFILE_STEPS (default 3). Do not inflate that stack-heavy sglang
+  # trace back to 40/64 steps. It must not be 1: on ROCm the profiler keeps the
+  # device kernels of only the LAST (non-first) CUDA-graph replay in the window, so a
+  # 1-step window has no decode kernels and the trace manifest fails on every rank.
+  # Other backends retain their existing adapter behavior.
   _GEAK_FUSION_CAPTURE=0
+  _GEAK_FUSION_STEPS="${GEAK_FUSION_PROFILE_STEPS:-}"
   case " ${EXTRA_ENV:-} " in
     *" GEAK_FUSION_TRACE=1 "*) _GEAK_FUSION_CAPTURE=1 ;;
   esac
+  case " ${EXTRA_ENV:-} " in
+    *" GEAK_FUSION_PROFILE_STEPS="*)
+      _GEAK_FUSION_STEPS="${EXTRA_ENV##*GEAK_FUSION_PROFILE_STEPS=}"; _GEAK_FUSION_STEPS="${_GEAK_FUSION_STEPS%% *}" ;;
+  esac
   [ "${GEAK_FUSION_TRACE:-0}" = "1" ] && _GEAK_FUSION_CAPTURE=1
   if [ "$_GEAK_FUSION_CAPTURE" = "1" ] && [ "$BACKEND" = "sglang" ]; then
-    PROFILE_NUM_STEPS=1
-    echo ">>> Fusion semantic capture: preserving PROFILE_NUM_STEPS=${PROFILE_NUM_STEPS} (steady-state auto-sizing disabled)"
+    case "$_GEAK_FUSION_STEPS" in ''|*[!0-9]*) _GEAK_FUSION_STEPS=3 ;; esac
+    [ "$_GEAK_FUSION_STEPS" -lt 2 ] && _GEAK_FUSION_STEPS=2
+    PROFILE_NUM_STEPS=$_GEAK_FUSION_STEPS
+    echo ">>> Fusion semantic capture: PROFILE_NUM_STEPS=${PROFILE_NUM_STEPS} (steady-state auto-sizing disabled; >=2 so the last decode graph replay is recorded)"
   else
     # Native profiling keeps main's deterministic target computed at launch.
     if [ "${PROFILE_NUM_STEPS:-0}" -lt "$PROFILE_TARGET_STEPS" ]; then

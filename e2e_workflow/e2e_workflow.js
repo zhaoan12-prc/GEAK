@@ -116,6 +116,13 @@ const FUSION_REQUIRED = String(A.fusion_required != null
   ? A.fusion_required
   : (A.fusion_discovery != null ? A.fusion_discovery : 'false')) === 'true';
 const FUSION_TOP_K = parseInt(A.fusion_top_k != null ? A.fusion_top_k : 10, 10);
+// Decode steps in the sglang clean-trace window. On ROCm the torch profiler only records
+// the device kernels (and the GPU-side step[DECODE] annotation) of the LAST CUDA-graph
+// replay in the window, and never of the first; a 1-step window therefore has no decode
+// window at all and the trace manifest fails every rank (missing_decode_annotation).
+// Must be >= 2; the manifest keeps the best single step.
+const FUSION_PROFILE_STEPS = Math.max(2, parseInt(
+  A.fusion_profile_steps != null ? A.fusion_profile_steps : 3, 10) || 3);
 const FUSION_UNITSIDE_BUDGET = parseInt(
   A.fusion_unitside_budget != null ? A.fusion_unitside_budget : FUSION_TOP_K, 10);
 let FUSION_INPUTS = {
@@ -3063,11 +3070,12 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
     const expectedFusionManifest = `${fusionCaptureDir}/profile_trace_manifest.json`;
     // Fusion needs call/module hierarchy, not the long statistical window used by
     // the native Top-N profiler. Keep this mode scoped to the dedicated sglang
-    // Fusion capture: one step per separately captured stage with Python stacks.
+    // Fusion capture: a short window per separately captured stage with Python stacks
+    // (FUSION_PROFILE_STEPS, see above for why it cannot be 1).
     // bench_e2e.sh leaves normal Profile/reprofile sizing unchanged otherwise.
     const captureEnv = BACKEND === 'sglang'
       ? (curEnv ? curEnv + ' ' : '') +
-        'GEAK_FUSION_TRACE=1 PROFILE_NUM_STEPS=1 SGLANG_PROFILE_WITH_STACK=true'
+        `GEAK_FUSION_TRACE=1 GEAK_FUSION_PROFILE_STEPS=${FUSION_PROFILE_STEPS} SGLANG_PROFILE_WITH_STACK=true`
       : curEnv;
     fusionCapture = await safeAgent(
       roleAgent('fusion_trace_collector', 'capture',
