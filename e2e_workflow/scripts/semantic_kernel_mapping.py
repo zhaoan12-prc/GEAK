@@ -48,13 +48,51 @@ def _phase_name(tag):
     return "prefill" if tag == "P" else "decode"
 
 
+def _legacy_step_spans(events):
+    """vLLM execute_* GPU windows, one per step: [(ts, end, tag, tokens, batch, name)].
+
+    vLLM 0.30 emits the step's `gpu_user_annotation` once per GPU stream that ran work in
+    it (MiniMax-M3 TP8: stream 4 every step, stream 2 on some), same name, overlapping
+    windows. Read one per annotation, as parse_profile does, and a single step became two
+    (legacy-0 held 4 of 60 prefill layers, legacy-1 the other 56) and nothing mapped.
+    Same-name windows that overlap are the same step: take their union. Consecutive
+    steps never overlap, so this cannot merge two real steps.
+    """
+    raw = []
+    for event in events:
+        if not isinstance(event, dict) or event.get("cat") != "gpu_user_annotation":
+            continue
+        name = event.get("name")
+        if (not isinstance(name, str) or not name.startswith("execute_")
+                or event.get("ts") is None or event.get("dur") is None):
+            continue
+        kind = parse_profile._classify_step(name)
+        if kind:
+            raw.append((event["ts"], event["ts"] + event["dur"],
+                        "P" if kind[0] else "D", kind[1], kind[2], name))
+    raw.sort()
+    merged = []
+    open_by_name = {}
+    for span in raw:
+        index = open_by_name.get(span[5])
+        if index is not None and span[0] < merged[index][1]:
+            lo, hi = merged[index][0], max(merged[index][1], span[1])
+            merged[index] = (lo, hi) + merged[index][2:]
+            continue
+        open_by_name[span[5]] = len(merged)
+        merged.append(span)
+    merged.sort()
+    return merged
+
+
 def _collect_step_spans(events):
     """Recognize both legacy execute_* and current SGLang step[...] spans."""
     spans = []
-    legacy = parse_profile._collect_step_spans(events)
-    for index, span in enumerate(legacy):
+    legacy_names = {}
+    for index, span in enumerate(_legacy_step_spans(events)):
         spans.append((span[0], span[1], span[2], span[3], span[4],
                       "legacy-%d" % index, "legacy_execute"))
+        legacy_names["legacy-%d" % index] = span[5]
     for raw_index, event in enumerate(events):
         if not isinstance(event, dict) or event.get("cat") != "gpu_user_annotation":
             continue
@@ -85,13 +123,16 @@ def _collect_step_spans(events):
     #
     # Carry the CPU window alongside each span (indices 7,8) so CPU-side
     # containment can use it.  Falls back to the GPU window when a trace has no
-    # CPU-side annotation (older captures).
+    # CPU-side annotation (older captures).  vLLM's execute_* has the same CPU/GPU
+    # pair; an eager vLLM model (MiniMax-M3 on ROCm: no torch.compile) has
+    # `nn.Module:` spans in prefill, which need the CPU window just the same.
     cpu_by_name = {}
     for event in events:
         if not isinstance(event, dict) or event.get("cat") != "user_annotation":
             continue
         name = event.get("name")
-        if (not isinstance(name, str) or not SGLANG_STEP_RE.match(name)
+        if (not isinstance(name, str)
+                or not (SGLANG_STEP_RE.match(name) or name.startswith("execute_"))
                 or event.get("ts") is None or event.get("dur") is None):
             continue
         cpu_by_name.setdefault(name, []).append(
@@ -101,7 +142,22 @@ def _collect_step_spans(events):
     widened = []
     for span in spans:
         cpu_lo, cpu_hi = span[0], span[1]
-        for lo, hi in cpu_by_name.get(_step_span_name(span), ()):
+        name = legacy_names.get(span[5]) or _step_span_name(span)
+        if span[5] in legacy_names:
+            # vLLM: the host annotation alone, paired by name (it carries the step's
+            # cumulative sequence lengths) as the latest one opened before the device
+            # window. Not by overlap: under --async-scheduling the host runs a whole
+            # step ahead (~490ms in MiniMax-M3 prefill), so the pair never overlaps.
+            # Not a union: eager decode's device work trails the host by ~40ms, and
+            # a union reached into the next step's host window, so the last layer's
+            # donor scope swallowed the next step's input prep, embedding and layer-0
+            # head (MiniMax-M3 TP8) and no donor pass matched any decode step.
+            opened = [(lo, hi) for lo, hi in cpu_by_name.get(name, ()) if lo <= span[0]]
+            if opened:
+                cpu_lo, cpu_hi = opened[-1]
+            widened.append(tuple(span) + (cpu_lo, cpu_hi))
+            continue
+        for lo, hi in cpu_by_name.get(name, ()):
             # Pair a CPU window with the GPU window it encloses/overlaps.
             if lo <= span[0] < hi or (span[0] <= lo and hi <= span[1]):
                 cpu_lo, cpu_hi = min(cpu_lo, lo), max(cpu_hi, hi)
@@ -577,17 +633,24 @@ def _scope_at(ts, scopes, starts):
 
 def _flow_layer_index(events, module_scopes, module_starts):
     """Map GPU flow-marker timestamps from CPU-side DecoderLayer spans."""
+    # Only the flow START ("s", the host-side launch) is looked up in the CPU-side
+    # module spans. The other endpoints sit on the GPU timeline, and the two share a
+    # clock: in eager vLLM prefill the host runs ~19ms ahead, so the GPU timestamp of a
+    # step's input-prep kernel landed inside DecoderLayer_3's CPU span and 31 pre-layer
+    # kernels were owned by layer 3 (MiniMax-M3 TP8), breaking the step's layer order.
     flows = {}
     for event in events:
         if not isinstance(event, dict) or event.get("ph") not in ("s", "t", "f"):
             continue
         flow_id = event.get("id", (event.get("args") or {}).get("id"))
         if flow_id is not None and event.get("ts") is not None:
-            flows.setdefault(str(flow_id), []).append(event.get("ts"))
+            flows.setdefault(str(flow_id), []).append(
+                (event.get("ts"), event.get("ph") == "s"))
     result = {}
-    for timestamps in flows.values():
+    for endpoints in flows.values():
+        timestamps = [ts for ts, _ in endpoints]
         sources = [_module_scope_at(ts, module_scopes, module_starts)
-                   for ts in timestamps]
+                   for ts, is_start in endpoints if is_start]
         sources = [source for source in sources if source]
         instance_ids = set(source["layer_instance_id"] for source in sources)
         if len(instance_ids) != 1:
