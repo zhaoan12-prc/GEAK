@@ -153,6 +153,15 @@ class DonorShapeProjectionTest(unittest.TestCase):
         # agreeing prefix ("b") and stops at the divergence ("c" vs "x").
         self.assertEqual(pairs, {0: 0, 1: 1, 2: 2})
 
+    def test_per_layer_rule_pairs_rows_of_the_same_identity(self):
+        """A reordered layer must pair each row with its own kind, not its index."""
+        donor = ["a", "b", "a", "c", "d"]
+        recipient = ["b", "a", "a", "c", "d"]
+        pairs = projection._stable_pairs(recipient, donor, [0, 3])
+        self.assertEqual(sorted(pairs), [(0, 1), (1, 0), (2, 2), (3, 3), (4, 4)])
+        self.assertTrue(all(donor[d] == recipient[r] for d, r in pairs))
+        self.assertIn(transfer.STABLE_PER_LAYER_RULE, projection.STABLE_RULES)
+
     def test_residual_rule_pairs_the_agreeing_prefix_of_each_layer(self):
         # A residual range carved out of layer 0 makes it narrower than the donor's;
         # only the prefix both sides share from the cut is paired.
