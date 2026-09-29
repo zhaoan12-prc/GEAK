@@ -1778,6 +1778,84 @@ def _trace_pattern_consistency(instances):
     }
 
 
+def _step_link_audit(events, spans):
+    """Per step: how intact the host-launch <-> device-record link is.
+
+    {step_id: {"host_launches", "launches_without_device_record",
+    "graph_replay_rows"}}. A launch with no device record means the profiler
+    dropped GPU activity (Kimi-K2.5 TP8, vLLM 0.21: 356-968 of a prefill step's
+    2703 launches lost in contiguous ~310ms holes; every Qwen3.5 / MiniMax-M3
+    step lost 0). A device row carried by a graph launch has no per-kernel host
+    launch, so a host scope cannot own it.
+    """
+    runtime = [event for event in events
+               if isinstance(event, dict)
+               and event.get("cat") in ("cuda_runtime", "hip_runtime")
+               and event.get("ts") is not None]
+    device = [event for event in events
+              if isinstance(event, dict) and event.get("cat") in DEVICE_CATEGORIES
+              and event.get("ts") is not None]
+    recorded = {(event.get("args") or {}).get("correlation") for event in device}
+    graph_launches = {(event.get("args") or {}).get("correlation")
+                      for event in runtime if "GraphLaunch" in str(event.get("name"))}
+    graph_launches.discard(None)
+    audit = {span[5]: {"host_launches": 0, "launches_without_device_record": 0,
+                       "graph_replay_rows": 0} for span in spans}
+    host = sorted((span[7], span[8], span[5]) for span in spans if len(span) >= 9)
+    host_starts = [item[0] for item in host]
+    for event in runtime:
+        name = str(event.get("name"))
+        if "Launch" not in name or "Graph" in name:
+            continue
+        position = bisect.bisect_right(host_starts, event["ts"]) - 1
+        if position < 0 or event["ts"] >= host[position][1]:
+            continue
+        entry = audit[host[position][2]]
+        entry["host_launches"] += 1
+        if (event.get("args") or {}).get("correlation") not in recorded:
+            entry["launches_without_device_record"] += 1
+    device_starts = [span[0] for span in spans]
+    for event in device:
+        index = bisect.bisect_right(device_starts, event["ts"]) - 1
+        if index < 0 or event["ts"] >= spans[index][1]:
+            continue
+        if (event.get("args") or {}).get("correlation") in graph_launches:
+            audit[spans[index][5]]["graph_replay_rows"] += 1
+    return audit
+
+
+def _excused_incomplete_steps(partition_diagnostics, link_audit):
+    """Unresolved steps whose trace evidence cannot support layer ownership.
+
+    {step_id: {"reason", ...counts}}. Excused only while the phase still has a
+    mapped step to draw its representatives from:
+      * device_records_dropped -- the profiler lost some of the step's GPU records,
+        so its layers are missing kernels no mapping can restore;
+      * graph_replay_rows_unowned -- every layer anchor is present, but part of the
+        step replayed from a CUDA graph (a small mixed step under the capture size)
+        and those rows have no host launch to own them. A step with no anchors at
+        all (plain graph decode) is not excused here; it needs the boundary donor.
+    """
+    mapped = collections.Counter(
+        item.get("phase") for item in partition_diagnostics
+        if item.get("status") == "mapped")
+    excused = {}
+    for item in partition_diagnostics:
+        if item.get("status") == "mapped" or not mapped[item.get("phase")]:
+            continue
+        link = link_audit.get(item["step_id"]) or {}
+        if link.get("launches_without_device_record", 0) > 0:
+            reason = "device_records_dropped"
+        elif (link.get("graph_replay_rows", 0) > 0
+              and item.get("module_instance_count")
+              == item.get("configured_layer_count")):
+            reason = "graph_replay_rows_unowned"
+        else:
+            continue
+        excused[item["step_id"]] = dict(link, reason=reason)
+    return excused
+
+
 def _gating_step_audits(step_audits):
     """Mark extra unresolved steps non-gating and return the gating audits.
 
@@ -1802,7 +1880,7 @@ def _gating_step_audits(step_audits):
 
 def _quality(
         pattern_doc, rows, instances, representatives, spans, out_of_scope,
-        partition_diagnostics, tables):
+        partition_diagnostics, tables, link_audit=None):
     input_count = len(rows)
     assigned_count = sum(1 for row in rows if row["assignment"] in (
         "layer_body", "transition_global", "concurrent_unresolved"))
@@ -1816,6 +1894,8 @@ def _quality(
     instances_by_step = {}
     for instance in instances:
         instances_by_step.setdefault(instance.get("step_id"), []).append(instance)
+    incomplete_evidence = _excused_incomplete_steps(
+        partition_diagnostics, link_audit or {})
     step_audits = []
     for diagnostic in partition_diagnostics:
         step_instances = sorted(
@@ -1836,12 +1916,17 @@ def _quality(
             "layer_order_valid": actual_order == expected_order,
             "non_overlapping": non_overlapping,
             "boundary_source_status": diagnostic.get("status"),
-            "status": "pass" if (
-                diagnostic.get("status") == "mapped"
-                and actual_order == expected_order
-                and non_overlapping) else "fail",
+            "status": (
+                "excused_incomplete_evidence"
+                if diagnostic["step_id"] in incomplete_evidence else
+                "pass" if (
+                    diagnostic.get("status") == "mapped"
+                    and actual_order == expected_order
+                    and non_overlapping) else "fail"),
         })
-    gating_audits = _gating_step_audits(step_audits)
+    gating_audits = [
+        item for item in _gating_step_audits(step_audits)
+        if item["status"] != "excused_incomplete_evidence"]
     mechanical_pass = (not partition_diagnostics or bool(gating_audits)) and all(
         item["status"] == "pass" for item in gating_audits)
     phase_status = "pass" if spans else "partial"
@@ -1891,6 +1976,9 @@ def _quality(
                 "non_gating_unresolved_steps": [
                     item["step_id"] for item in step_audits
                     if item["status"] == "not_gating_unresolved_extra_step"],
+                "excused_incomplete_evidence_steps": [
+                    dict(item, step_id=step_id)
+                    for step_id, item in sorted(incomplete_evidence.items())],
             },
             "representative_layer_integrity": representative_integrity,
             "trace_pattern_consistency": trace_consistency,
@@ -2185,7 +2273,7 @@ def build(trace_path, pattern_path, out_dir, table_phases=None,
     tables = _table(pattern_doc, rows, representatives, table_phases)
     quality = _quality(
         pattern_doc, rows, instances, representatives, spans, out_of_scope,
-        partition_diagnostics, tables)
+        partition_diagnostics, tables, _step_link_audit(events, spans))
     coverage = _phase_coverage(
         instances, tables, trace_paths, adopted_siblings, table_phases,
         require_phases,
