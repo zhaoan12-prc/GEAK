@@ -18,6 +18,80 @@ DEVICE_CATEGORIES = ("kernel", "gpu_memcpy", "gpu_memset")
 LAYER_RE = re.compile(r"(?:layers?|h|blocks?)[./_\[](\d+)", re.IGNORECASE)
 MODULE_LAYER_RE = re.compile(
     r"^nn\.Module:\s+.*DecoderLayer_(\d+)$", re.IGNORECASE)
+# The per-layer anchor defaults to the DecoderLayer module span above. A model
+# whose layers are not entered through an `nn.Module` call (e.g. SGLang
+# DeepSeek-V4 runs each layer through a plain python function) names its anchor
+# explicitly: `layer_anchor_regexes` in the pattern document, or --layer-anchor.
+# The anchor only replaces the span matcher; every boundary gate is unchanged.
+LAYER_ANCHOR_KEY = "layer_anchor_regexes"
+
+
+def _layer_anchor_matchers(pattern_doc):
+    """Return (compiled anchor regexes, source label) for this pattern doc."""
+    explicit = [value for value in (pattern_doc.get(LAYER_ANCHOR_KEY) or [])
+                if isinstance(value, str) and value]
+    if explicit:
+        return [re.compile(value) for value in explicit], "explicit"
+    return [MODULE_LAYER_RE], "decoder_layer_module"
+
+
+def _anchor_match(name, matchers):
+    for matcher in matchers:
+        match = matcher.search(name)
+        if match:
+            return match
+    return None
+
+
+def _class_local_id(match):
+    """Numeric suffix of the anchor name, when the regex captures one.
+
+    It is audit evidence only; execution order assigns the layer ordinal.
+    """
+    if match.re.groups < 1 or match.group(1) is None:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _anchor_candidates_for_diagnostics(events, cpu_spans, span_starts,
+                                       expected_count):
+    """Span names that recur a multiple of the layer count per step, disjoint.
+
+    Diagnostic only: this never selects an anchor. It tells the caller (the
+    semantics mapper agent) which spans could be the per-layer entry, to be
+    confirmed against the runtime source and passed back as an explicit anchor.
+    """
+    by_step = {}
+    for event in events:
+        if (not isinstance(event, dict) or event.get("cat") != "python_function"
+                or event.get("ts") is None or event.get("dur") is None):
+            continue
+        step = _cpu_step_at(event["ts"], cpu_spans, span_starts)
+        if step is None:
+            continue
+        by_step.setdefault(step[5], {}).setdefault(
+            str(event.get("name", "")), []).append(event)
+    out = []
+    for step_id, names in sorted(by_step.items()):
+        names_out = []
+        for name, spans in names.items():
+            if len(spans) % expected_count:
+                continue
+            spans.sort(key=lambda item: item["ts"])
+            if any(left["ts"] + left["dur"] > right["ts"]
+                   for left, right in zip(spans, spans[1:])):
+                continue
+            names_out.append({
+                "name": name,
+                "count": len(spans),
+                "total_duration_us": round(sum(item["dur"] for item in spans), 3),
+            })
+        names_out.sort(key=lambda item: -item["total_duration_us"])
+        out.append({"step_id": step_id, "candidates": names_out[:20]})
+    return out
 SGLANG_STEP_RE = re.compile(
     r"^step\[(EXTEND|DECODE)\s+bs=(\d+)(?:\s+toks=(\d+))?\]$")
 
@@ -308,7 +382,10 @@ def _step_at(ts, spans, starts):
 
 
 def _module_layer_scopes(events, spans, pattern_doc):
-    """Resolve outer DecoderLayer python spans to global layer ordinals.
+    """Resolve outer per-layer anchor spans to global layer ordinals.
+
+    The anchor is the DecoderLayer module span unless the pattern document
+    names another one (see `_layer_anchor_matchers`).
 
     Numeric suffixes are class-local for some hybrid model implementations, so
     execution order inside each full N-layer pass is authoritative. The suffix
@@ -322,12 +399,14 @@ def _module_layer_scopes(events, spans, pattern_doc):
     cpu_spans, span_starts = _cpu_step_index(spans)
     if not cpu_spans:
         cpu_spans, span_starts = spans, [span[0] for span in spans]
+    matchers, anchor_source = _layer_anchor_matchers(pattern_doc)
+    anchor_regexes = [matcher.pattern for matcher in matchers]
     candidates = []
     for raw_index, event in enumerate(events):
         if not isinstance(event, dict) or event.get("cat") != "python_function":
             continue
         name = str(event.get("name", ""))
-        match = MODULE_LAYER_RE.match(name)
+        match = _anchor_match(name, matchers)
         if not match or event.get("ts") is None or event.get("dur") is None:
             continue
         step = _cpu_step_at(event["ts"], cpu_spans, span_starts)
@@ -335,7 +414,7 @@ def _module_layer_scopes(events, spans, pattern_doc):
             continue
         candidates.append({
             "name": name,
-            "class_local_id": int(match.group(1)),
+            "class_local_id": _class_local_id(match),
             "ts": event["ts"],
             "end": event["ts"] + event["dur"],
             "event_index": raw_index,
@@ -347,12 +426,22 @@ def _module_layer_scopes(events, spans, pattern_doc):
         by_step.setdefault(candidate["step_id"], []).append(candidate)
     scopes = []
     diagnostics = []
+    if not candidates:
+        diagnostics.append({
+            "status": "no_anchor_match",
+            "anchor_source": anchor_source,
+            "anchor_regexes": anchor_regexes,
+            "diagnostic_only_anchor_candidates": _anchor_candidates_for_diagnostics(
+                events, cpu_spans, span_starts, expected_count),
+        })
     for step_id, values in sorted(by_step.items()):
         values.sort(key=lambda item: (item["ts"], item["end"]))
         full_passes = len(values) // expected_count
         remainder = len(values) % expected_count
         diagnostics.append({
             "step_id": step_id,
+            "anchor_source": anchor_source,
+            "anchor_regexes": anchor_regexes,
             "candidate_count": len(values),
             "expected_layer_count": expected_count,
             "full_passes": full_passes,
@@ -1699,7 +1788,7 @@ def _markdown(tables, quality):
 
 def build(trace_path, pattern_path, out_dir, table_phases=None,
           auto_sibling=True, require_phases=None, boundary_map_paths=None,
-          representative_layer_hints=None):
+          representative_layer_hints=None, layer_anchors=None):
     """Build the semantic layer/kernel tables.
 
     `trace_path` may be a single path or a list of phase traces.  When
@@ -1712,6 +1801,8 @@ def build(trace_path, pattern_path, out_dir, table_phases=None,
     primary_trace = trace_paths[0]
     with open(pattern_path) as fh:
         pattern_doc = json.load(fh)
+    if layer_anchors:
+        pattern_doc[LAYER_ANCHOR_KEY] = list(layer_anchors)
     events = _load_events_multi(trace_paths)
     patterns = _pattern_index(pattern_doc)
     rows, spans, out_of_scope, module_scopes, module_diagnostics = _event_rows(
@@ -1839,6 +1930,11 @@ def main():
                              "trace of the same rank")
     parser.add_argument("--layer-boundary-map", action="append", default=[],
                         help="validated graph-construction boundary artifact")
+    parser.add_argument("--layer-anchor", action="append", default=[],
+                        help="regex for the per-layer python span when layers "
+                             "are not DecoderLayer nn.Module calls; repeatable. "
+                             "Overrides the pattern document's "
+                             + LAYER_ANCHOR_KEY)
     args = parser.parse_args()
     traces = [item.strip() for entry in args.trace
               for item in entry.split(",") if item.strip()]
@@ -1850,7 +1946,8 @@ def main():
     result = build(traces, args.patterns, args.out_dir, table_phases,
                    auto_sibling=not args.no_auto_sibling,
                    require_phases=require_phases,
-                   boundary_map_paths=args.layer_boundary_map)
+                   boundary_map_paths=args.layer_boundary_map,
+                   layer_anchors=args.layer_anchor)
     if args.result_json:
         with open(args.result_json, "w") as fh:
             json.dump(result, fh, indent=2)
