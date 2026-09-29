@@ -1079,6 +1079,26 @@ class VllmStepSpanTest(unittest.TestCase):
         span = mapping._collect_step_spans(events)[0]
         self.assertEqual((span[7], span[8]), (1000, 1200))
 
+    def test_same_name_steps_pair_with_the_host_window_that_launched_them(self):
+        """vLLM 0.21 repeats a chunked-prefill name step after step; with the host more
+        than a step ahead, 'latest same-name window before the device start' is the
+        next step's. The launches decide instead."""
+        name = "execute_context_2(8181)_generation_11(11)"
+        events = []
+        for step, (host_lo, device_lo) in enumerate(((0, 500), (200, 800), (400, 1100))):
+            events.append(self._ann("user_annotation", name, host_lo, 150))
+            events.append(self._ann("gpu_user_annotation", name, device_lo, 250))
+            for index in range(3):
+                correlation = 10 * step + index
+                events.append({"cat": "hip_runtime", "name": "hipLaunchKernel",
+                               "ts": host_lo + 10 + index, "dur": 1,
+                               "args": {"correlation": correlation}})
+                events.append({"cat": "kernel", "name": "k", "ts": device_lo + 10 + index,
+                               "dur": 1, "args": {"correlation": correlation}})
+        spans = mapping._collect_step_spans(events)
+        self.assertEqual([(s[7], s[8]) for s in spans],
+                         [(0, 150), (200, 350), (400, 550)])
+
     def test_flow_owner_comes_from_the_host_launch_not_the_device_endpoint(self):
         """The device endpoint shares the clock with host spans it is unrelated to."""
         scopes = [{"ts": 100, "end": 200, "layer_id": 3,

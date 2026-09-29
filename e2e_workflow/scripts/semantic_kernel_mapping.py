@@ -86,11 +86,67 @@ def _legacy_step_spans(events):
     return merged
 
 
+def _launch_voted_host_windows(events, legacy_spans):
+    """{span index: (lo, hi)}: the execute_* host window that launched a step's kernels.
+
+    Each device event inside the step's device window votes, through its correlation
+    id, for the host annotation its launch fell in; the window with a strict majority
+    wins. Names cannot pair them: vLLM before 0.30 names a step only by its request
+    counts, so a chunked prefill repeats `execute_context_2(8181)_generation_11(11)`
+    step after step, and with the host more than a step ahead the latest same-name
+    window before the device start is the NEXT step's (Kimi-K2.5 TP8: 4 of 17
+    prefill steps shifted, each cutting one host pass across two device steps).
+    """
+    host = sorted(
+        (event["ts"], event["ts"] + event["dur"])
+        for event in events
+        if isinstance(event, dict) and event.get("cat") == "user_annotation"
+        and isinstance(event.get("name"), str)
+        and event["name"].startswith("execute_")
+        and event.get("ts") is not None and event.get("dur") is not None)
+    if not host or not legacy_spans:
+        return {}
+    host_starts = [item[0] for item in host]
+    launch_ts = {}
+    for event in events:
+        if (isinstance(event, dict)
+                and event.get("cat") in ("cuda_runtime", "hip_runtime")
+                and event.get("ts") is not None):
+            correlation = (event.get("args") or {}).get("correlation")
+            if correlation is not None:
+                launch_ts[correlation] = event["ts"]
+    device_starts = [span[0] for span in legacy_spans]
+    votes = [collections.Counter() for _ in legacy_spans]
+    for event in events:
+        if (not isinstance(event, dict) or event.get("cat") not in DEVICE_CATEGORIES
+                or event.get("ts") is None):
+            continue
+        index = bisect.bisect_right(device_starts, event["ts"]) - 1
+        if index < 0 or event["ts"] >= legacy_spans[index][1]:
+            continue
+        launched = launch_ts.get((event.get("args") or {}).get("correlation"))
+        if launched is None:
+            continue
+        position = bisect.bisect_right(host_starts, launched) - 1
+        if position >= 0 and launched < host[position][1]:
+            votes[index][position] += 1
+    paired = {}
+    for index, counter in enumerate(votes):
+        if counter:
+            position, count = counter.most_common(1)[0]
+            if 2 * count > sum(counter.values()):
+                paired[index] = host[position]
+    return paired
+
+
 def _collect_step_spans(events):
     """Recognize both legacy execute_* and current SGLang step[...] spans."""
     spans = []
     legacy_names = {}
-    for index, span in enumerate(_legacy_step_spans(events)):
+    legacy = _legacy_step_spans(events)
+    voted = {"legacy-%d" % index: window for index, window
+             in _launch_voted_host_windows(events, legacy).items()}
+    for index, span in enumerate(legacy):
         spans.append((span[0], span[1], span[2], span[3], span[4],
                       "legacy-%d" % index, "legacy_execute"))
         legacy_names["legacy-%d" % index] = span[5]
@@ -153,8 +209,12 @@ def _collect_step_spans(events):
             # a union reached into the next step's host window, so the last layer's
             # donor scope swallowed the next step's input prep, embedding and layer-0
             # head (MiniMax-M3 TP8) and no donor pass matched any decode step.
+            # The launch vote decides when the trace carries correlations; the name
+            # is the fallback (unique on 0.30, whose names carry sequence lengths).
             opened = [(lo, hi) for lo, hi in cpu_by_name.get(name, ()) if lo <= span[0]]
-            if opened:
+            if span[5] in voted:
+                cpu_lo, cpu_hi = voted[span[5]]
+            elif opened:
                 cpu_lo, cpu_hi = opened[-1]
             widened.append(tuple(span) + (cpu_lo, cpu_hi))
             continue
