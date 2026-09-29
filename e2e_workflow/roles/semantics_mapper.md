@@ -193,6 +193,12 @@ across a layer is still rejected), ~0.78 coverage. Report `stable_projection.ord
 donor never ran) leaves the transfer `partial` and the step unresolved; the quality gate excuses it
 only if the transfer declared it unmapped and most steps of its phase are mapped
 (`step_layer_order.excused_transfer_unmapped_steps`). List excused steps in `notes`.
+An unresolved step whose trace cannot support ownership is excused while its phase has a mapped
+step (`step_layer_order.excused_incomplete_evidence_steps`): `device_records_dropped` (the profiler
+lost GPU records -- launches with no device event; Kimi-K2.5 TP8 on vLLM 0.21 lost 98-968 of a
+prefill step's 2703) or `graph_replay_rows_unowned` (a small mixed step replayed part of its layers
+from a CUDA graph). Representatives come only from mapped steps. If most of a phase is
+`device_records_dropped`, say so in `notes` and suggest a shorter capture (`GEAK_FUSION_MAX_ITERS`).
 
 1. Read `SHAPE_CAPTURE_PLAN_JSON`; its representative layers and selected buckets are the only
    allowed layer/bucket filters. Never copy filters from a historical run.

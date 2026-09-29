@@ -976,6 +976,68 @@ class TransferUnmappedStepTest(unittest.TestCase):
         self.assertEqual(mapping._excused_transfer_steps(diagnostics, unmapped), {})
 
 
+class IncompleteEvidenceStepTest(unittest.TestCase):
+    """Unresolved steps whose trace cannot support ownership (Kimi-K2.5, vLLM 0.21)."""
+
+    @staticmethod
+    def _diag(step_id, status, instances=4, phase="prefill"):
+        return {"step_id": step_id, "phase": phase, "status": status,
+                "module_instance_count": instances, "configured_layer_count": 4}
+
+    @staticmethod
+    def _link(dropped=0, graph_rows=0):
+        return {"host_launches": 100, "launches_without_device_record": dropped,
+                "graph_replay_rows": graph_rows}
+
+    def test_dropped_device_records_and_graph_replayed_mixed_steps_are_excused(self):
+        diagnostics = [self._diag("ok", "mapped"),
+                       self._diag("dropped", "boundary_unresolved", instances=3),
+                       self._diag("mixed", "boundary_unresolved")]
+        links = {"ok": self._link(), "dropped": self._link(dropped=40),
+                 "mixed": self._link(graph_rows=70)}
+        excused = mapping._excused_incomplete_steps(diagnostics, links)
+        self.assertEqual({k: v["reason"] for k, v in excused.items()},
+                         {"dropped": "device_records_dropped",
+                          "mixed": "graph_replay_rows_unowned"})
+
+    def test_an_unresolved_step_with_intact_evidence_still_gates(self):
+        diagnostics = [self._diag("ok", "mapped"),
+                       self._diag("bad", "boundary_unresolved", instances=3)]
+        links = {"ok": self._link(), "bad": self._link()}
+        self.assertEqual(mapping._excused_incomplete_steps(diagnostics, links), {})
+
+    def test_plain_graph_decode_is_left_to_the_boundary_donor(self):
+        diagnostics = [self._diag("ok", "mapped", phase="decode"),
+                       self._diag("graph", "boundary_unresolved", instances=0,
+                                  phase="decode")]
+        links = {"ok": self._link(), "graph": self._link(graph_rows=900)}
+        self.assertEqual(mapping._excused_incomplete_steps(diagnostics, links), {})
+
+    def test_nothing_is_excused_in_a_phase_with_no_mapped_step(self):
+        diagnostics = [self._diag("a", "boundary_unresolved", instances=2),
+                       self._diag("b", "boundary_unresolved", instances=2)]
+        links = {"a": self._link(dropped=5), "b": self._link(dropped=5)}
+        self.assertEqual(mapping._excused_incomplete_steps(diagnostics, links), {})
+
+    def test_link_audit_counts_lost_records_and_graph_replayed_rows(self):
+        spans = [(100, 200, "P", 8, 1, "s0", "legacy_execute", 0, 50)]
+        events = [
+            {"cat": "hip_runtime", "name": "hipLaunchKernel", "ts": 10,
+             "args": {"correlation": 1}},
+            {"cat": "hip_runtime", "name": "hipLaunchKernel", "ts": 11,
+             "args": {"correlation": 2}},
+            {"cat": "hip_runtime", "name": "hipGraphLaunch", "ts": 12,
+             "args": {"correlation": 3}},
+            {"cat": "kernel", "name": "k1", "ts": 110, "args": {"correlation": 1}},
+            # correlation 2 was launched but its device record is missing
+            {"cat": "kernel", "name": "g1", "ts": 120, "args": {"correlation": 3}},
+            {"cat": "kernel", "name": "g2", "ts": 130, "args": {"correlation": 3}},
+        ]
+        self.assertEqual(mapping._step_link_audit(events, spans)["s0"], {
+            "host_launches": 2, "launches_without_device_record": 1,
+            "graph_replay_rows": 2})
+
+
 class DiagnosticStageRecurrenceTest(unittest.TestCase):
     def test_periodic_stage_is_diagnostic_only(self):
         rows = []

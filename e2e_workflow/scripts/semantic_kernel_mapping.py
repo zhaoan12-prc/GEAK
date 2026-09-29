@@ -1778,6 +1778,84 @@ def _trace_pattern_consistency(instances):
     }
 
 
+def _step_link_audit(events, spans):
+    """Per step: how intact the host-launch <-> device-record link is.
+
+    {step_id: {"host_launches", "launches_without_device_record",
+    "graph_replay_rows"}}. A launch with no device record means the profiler
+    dropped GPU activity (Kimi-K2.5 TP8, vLLM 0.21: 356-968 of a prefill step's
+    2703 launches lost in contiguous ~310ms holes; every Qwen3.5 / MiniMax-M3
+    step lost 0). A device row carried by a graph launch has no per-kernel host
+    launch, so a host scope cannot own it.
+    """
+    runtime = [event for event in events
+               if isinstance(event, dict)
+               and event.get("cat") in ("cuda_runtime", "hip_runtime")
+               and event.get("ts") is not None]
+    device = [event for event in events
+              if isinstance(event, dict) and event.get("cat") in DEVICE_CATEGORIES
+              and event.get("ts") is not None]
+    recorded = {(event.get("args") or {}).get("correlation") for event in device}
+    graph_launches = {(event.get("args") or {}).get("correlation")
+                      for event in runtime if "GraphLaunch" in str(event.get("name"))}
+    graph_launches.discard(None)
+    audit = {span[5]: {"host_launches": 0, "launches_without_device_record": 0,
+                       "graph_replay_rows": 0} for span in spans}
+    host = sorted((span[7], span[8], span[5]) for span in spans if len(span) >= 9)
+    host_starts = [item[0] for item in host]
+    for event in runtime:
+        name = str(event.get("name"))
+        if "Launch" not in name or "Graph" in name:
+            continue
+        position = bisect.bisect_right(host_starts, event["ts"]) - 1
+        if position < 0 or event["ts"] >= host[position][1]:
+            continue
+        entry = audit[host[position][2]]
+        entry["host_launches"] += 1
+        if (event.get("args") or {}).get("correlation") not in recorded:
+            entry["launches_without_device_record"] += 1
+    device_starts = [span[0] for span in spans]
+    for event in device:
+        index = bisect.bisect_right(device_starts, event["ts"]) - 1
+        if index < 0 or event["ts"] >= spans[index][1]:
+            continue
+        if (event.get("args") or {}).get("correlation") in graph_launches:
+            audit[spans[index][5]]["graph_replay_rows"] += 1
+    return audit
+
+
+def _excused_incomplete_steps(partition_diagnostics, link_audit):
+    """Unresolved steps whose trace evidence cannot support layer ownership.
+
+    {step_id: {"reason", ...counts}}. Excused only while the phase still has a
+    mapped step to draw its representatives from:
+      * device_records_dropped -- the profiler lost some of the step's GPU records,
+        so its layers are missing kernels no mapping can restore;
+      * graph_replay_rows_unowned -- every layer anchor is present, but part of the
+        step replayed from a CUDA graph (a small mixed step under the capture size)
+        and those rows have no host launch to own them. A step with no anchors at
+        all (plain graph decode) is not excused here; it needs the boundary donor.
+    """
+    mapped = collections.Counter(
+        item.get("phase") for item in partition_diagnostics
+        if item.get("status") == "mapped")
+    excused = {}
+    for item in partition_diagnostics:
+        if item.get("status") == "mapped" or not mapped[item.get("phase")]:
+            continue
+        link = link_audit.get(item["step_id"]) or {}
+        if link.get("launches_without_device_record", 0) > 0:
+            reason = "device_records_dropped"
+        elif (link.get("graph_replay_rows", 0) > 0
+              and item.get("module_instance_count")
+              == item.get("configured_layer_count")):
+            reason = "graph_replay_rows_unowned"
+        else:
+            continue
+        excused[item["step_id"]] = dict(link, reason=reason)
+    return excused
+
+
 def _transfer_unmapped_steps(boundary_map_paths, applied_steps):
     """{step_id: failure} for steps a boundary transfer declared it could not map."""
     unmapped = {}
@@ -1819,7 +1897,7 @@ def _excused_transfer_steps(partition_diagnostics, transfer_unmapped):
 
 def _quality(
         pattern_doc, rows, instances, representatives, spans, out_of_scope,
-        partition_diagnostics, tables, transfer_unmapped=None):
+        partition_diagnostics, tables, transfer_unmapped=None, link_audit=None):
     input_count = len(rows)
     assigned_count = sum(1 for row in rows if row["assignment"] in (
         "layer_body", "transition_global", "concurrent_unresolved"))
@@ -1835,6 +1913,10 @@ def _quality(
         instances_by_step.setdefault(instance.get("step_id"), []).append(instance)
     excused = _excused_transfer_steps(
         partition_diagnostics, transfer_unmapped or {})
+    incomplete_evidence = {
+        step_id: item for step_id, item in _excused_incomplete_steps(
+            partition_diagnostics, link_audit or {}).items()
+        if step_id not in excused}
     step_audits = []
     for diagnostic in partition_diagnostics:
         step_instances = sorted(
@@ -1857,13 +1939,16 @@ def _quality(
             "status": (
                 "excused_transfer_unmapped"
                 if diagnostic["step_id"] in excused else
+                "excused_incomplete_evidence"
+                if diagnostic["step_id"] in incomplete_evidence else
                 "pass" if (
                     diagnostic.get("status") == "mapped"
                     and actual_order == expected_order
                     and non_overlapping) else "fail"),
         })
     mechanical_pass = (not partition_diagnostics or bool(step_audits)) and all(
-        item["status"] in ("pass", "excused_transfer_unmapped")
+        item["status"] in (
+            "pass", "excused_transfer_unmapped", "excused_incomplete_evidence")
         for item in step_audits)
     phase_status = "pass" if spans else "partial"
     representative_integrity = _representative_integrity(
@@ -1912,6 +1997,9 @@ def _quality(
                 "excused_transfer_unmapped_steps": [
                     {"step_id": step_id, "transfer_reason": reason}
                     for step_id, reason in sorted(excused.items())],
+                "excused_incomplete_evidence_steps": [
+                    dict(item, step_id=step_id)
+                    for step_id, item in sorted(incomplete_evidence.items())],
             },
             "representative_layer_integrity": representative_integrity,
             "trace_pattern_consistency": trace_consistency,
@@ -2207,7 +2295,8 @@ def build(trace_path, pattern_path, out_dir, table_phases=None,
     quality = _quality(
         pattern_doc, rows, instances, representatives, spans, out_of_scope,
         partition_diagnostics, tables,
-        _transfer_unmapped_steps(boundary_map_paths, applied_boundary_steps))
+        _transfer_unmapped_steps(boundary_map_paths, applied_boundary_steps),
+        _step_link_audit(events, spans))
     coverage = _phase_coverage(
         instances, tables, trace_paths, adopted_siblings, table_phases,
         require_phases,
