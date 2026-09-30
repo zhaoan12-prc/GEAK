@@ -86,7 +86,7 @@ Phase 1.2 additionally receives `STRUCTURAL_PATTERNS_JSON`, `SEMANTIC_TABLE_JSON
 
    **Layer anchor.** By default a main layer is located by its `nn.Module: ...DecoderLayer_N` span.
    Some runtimes enter each layer through a plain python function instead of an `nn.Module` call,
-   so no such span exists. When `semantics_result.json` → `module_scope_diagnostics` reports
+   so no such span exists. When `layer_instance_audit.json` → `module_scope_diagnostics` reports
    `status=no_anchor_match` (or every required step is `boundary_unresolved` with
    `module_instance_count=0`):
    - Find the per-layer entry in the current imported runtime source: the function or module the
