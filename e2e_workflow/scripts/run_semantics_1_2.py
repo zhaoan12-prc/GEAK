@@ -308,10 +308,22 @@ def run(config_path, trace_path, shape_log_path, out_dir,
         out_dir, "ORDERED_UNIQUE_LAYER_TABLES.md")
     shutil.copyfile(merged["semantic_table_json"], published_json)
     shutil.copyfile(merged["semantic_table_md"], published_md)
+    # Audit only, not a gate. A shape-capture pass records markers only while
+    # graphs are being built, so a phase the runtime serves eagerly (e.g.
+    # --cuda-graph-backend-prefill disabled) can never be covered. Its layer
+    # boundaries and shapes come from the clean trace instead (K evidence).
+    # Rows still unresolved after the probes are U evidence under
+    # `evidence_policy`, not a table failure. The table's own quality and the
+    # boundary evidence below decide the status.
     capture_phase_coverage_complete = all(
         capture.get("runtime_marker_mapping", {}).get(
             "phase_coverage_complete", False)
         for capture in capture_results)
+    capture_uncovered_marker_buckets = sorted({
+        bucket
+        for capture in capture_results
+        for bucket in capture.get("runtime_marker_mapping", {}).get(
+            "missing_marker_buckets", []) or []})
     graph_capture_verified_phases = sorted({
         str(group.get("phase") or "").lower()
         for transfer in boundary_transfers
@@ -377,7 +389,6 @@ def run(config_path, trace_path, shape_log_path, out_dir,
     status = "pass" if (
         semantic["status"] == "pass"
         and merged["status"] == "pass"
-        and capture_phase_coverage_complete
         and not blocking_degraded_phases
     ) else "fail"
     result = {
@@ -396,6 +407,8 @@ def run(config_path, trace_path, shape_log_path, out_dir,
         "status": status,
         "capture_phase_coverage_complete": (
             capture_phase_coverage_complete),
+        "capture_phase_coverage_gating": False,
+        "capture_uncovered_marker_buckets": capture_uncovered_marker_buckets,
         "boundary_evidence": boundary_evidence,
         "phase_boundary_evidence": phase_boundary_evidence,
         "degraded_boundary_phases": degraded_phases,

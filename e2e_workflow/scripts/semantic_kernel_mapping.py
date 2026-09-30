@@ -270,8 +270,12 @@ def _stage(name, category):
     return _stage_detail(name, category)[0]
 
 
+# The phase tag is the last `-`-separated segment before the trace suffix.
+# The stem carries every parallel-rank segment the runtime writes (`-TP-0`,
+# `-TP-0-EP-0`, ...); an identical stem is what pairs a rank's phase siblings,
+# so no parallelism layout is assumed here.
 _PHASE_TAG_RE = re.compile(
-    r"^(?P<stem>.*-TP-\d+)-(?P<phase>EXTEND|DECODE)(?P<suffix>\.trace\.json.*)$")
+    r"^(?P<stem>.+)-(?P<phase>EXTEND|DECODE)(?P<suffix>\.trace\.json.*)$")
 
 
 def _phase_tag(path):
@@ -283,8 +287,10 @@ def _phase_tag(path):
 def _sibling_phase_traces(path):
     """Sibling traces of the same rank and profiler session, by phase tag.
 
-    SGLang's `profile_by_stage` writes `<stem>-TP-<rank>-EXTEND.trace.json.gz`
-    and `<stem>-TP-<rank>-DECODE.trace.json.gz` as separate files.  Analysing
+    SGLang's `profile_by_stage` writes `<stem>-EXTEND.trace.json.gz` and
+    `<stem>-DECODE.trace.json.gz` as separate files, where the stem ends with
+    the rank segments (`-TP-<rank>`, or `-TP-<rank>-EP-<rank>` with expert
+    parallelism).  Analysing
     one and never mentioning the other silently halves phase coverage (B2).
     """
     match = _PHASE_TAG_RE.match(os.path.basename(path))
