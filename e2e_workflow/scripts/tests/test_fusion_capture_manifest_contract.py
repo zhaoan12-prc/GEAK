@@ -98,15 +98,18 @@ class FusionCaptureManifestContractTest(unittest.TestCase):
         self.assertNotIn("const FU =", source)
         self.assertNotIn("(A.fusion && typeof A.fusion === 'object')", source)
         self.assertNotIn("complete fusion prior/state supplied", source)
-        self.assertIn("if (!FAST_MODE && FUSION_DISCOVERY_ON && BACKEND === 'sglang')", source)
+        self.assertIn("if (!FAST_MODE && FUSION_DISCOVERY_ON && FUSION_BACKENDS.has(BACKEND))", source)
         self.assertIn("FUSION_TOPK_JSON: ''", source)
         self.assertIn("FUSION_CANDIDATES_JSON: ''", source)
         self.assertIn("FUSION_UNITSIDE_JSON: ''", source)
 
-    def test_non_sglang_backend_skips_fusion_with_a_recorded_reason(self):
+    def test_unsupported_backend_skips_fusion_with_a_recorded_reason(self):
         source = self._workflow_source()
-        guard = source.index("if (!FAST_MODE && FUSION_DISCOVERY_ON && BACKEND !== 'sglang')")
-        body = source.index("if (!FAST_MODE && FUSION_DISCOVERY_ON && BACKEND === 'sglang')")
+        # vllm has its own capture + semantics path; dropping it from this set
+        # silently skips every vllm KernelFusion run.
+        self.assertIn("const FUSION_BACKENDS = new Set(['sglang', 'vllm']);", source)
+        guard = source.index("if (!FAST_MODE && FUSION_DISCOVERY_ON && !FUSION_BACKENDS.has(BACKEND))")
+        body = source.index("if (!FAST_MODE && FUSION_DISCOVERY_ON && FUSION_BACKENDS.has(BACKEND))")
         self.assertLess(guard, body)
         self.assertIn("status: 'skipped_backend'", source[guard:body])
         # KernelFusion now runs after the formal Profile and before Strategize.

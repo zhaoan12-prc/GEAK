@@ -3315,17 +3315,20 @@ if (want('setup')) {
 // (captured on the same stack, with Python stacks). Failures are non-fatal: when a
 // fusion lands the stack is re-profiled, then Strategize routes on that Top-N.
 // ===========================================================================
-// The clean-trace capture (GEAK_FUSION_TRACE, profile_by_stage) and the Semantic
-// shape replay are implemented for sglang only. On any other backend skip the
-// phase up front and say so, instead of failing somewhere inside it.
-if (!FAST_MODE && FUSION_DISCOVERY_ON && BACKEND !== 'sglang') {
-  log(`KernelFusion skipped: BACKEND=${BACKEND} is not supported (sglang only).`);
+// The clean-trace capture and the Semantic completion exist for sglang
+// (GEAK_FUSION_TRACE, profile_by_stage, graph-construction shape replay) and for
+// vllm (step-bounded capture, dispatch-op anchors, CUDA-graph-off boundary donor).
+// On any other backend skip the phase up front and say so, instead of failing
+// somewhere inside it.
+const FUSION_BACKENDS = new Set(['sglang', 'vllm']);
+if (!FAST_MODE && FUSION_DISCOVERY_ON && !FUSION_BACKENDS.has(BACKEND)) {
+  log(`KernelFusion skipped: BACKEND=${BACKEND} is not supported (sglang, vllm).`);
   fusionDisposition = {
     status: 'skipped_backend', applied: [], blocked: [], deferred: [],
-    notes: `KernelFusion supports BACKEND=sglang only; this run uses ${BACKEND}.`,
+    notes: `KernelFusion supports BACKEND=sglang or vllm; this run uses ${BACKEND}.`,
   };
 }
-if (!FAST_MODE && FUSION_DISCOVERY_ON && BACKEND === 'sglang') {
+if (!FAST_MODE && FUSION_DISCOVERY_ON && FUSION_BACKENDS.has(BACKEND)) {
   phase('KernelFusion');
   fusionSemanticsAttempted = SEMANTICS_MAPPING_ON;
   const fusionEntryTput = curTput;
