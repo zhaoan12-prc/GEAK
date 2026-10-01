@@ -558,7 +558,14 @@ def _patterns_from_config_dialect(cfg, source_evidence):
         if text.get(key) is not None
     }
     if excluded:
-        excluded["reason"] = "excluded unless speculative decoding is active"
+        # The MTP/NEXTN draft stack is never a main layer.  When speculative
+        # decoding is active its steps run as DRAFT_EXTEND*/draft graphs (or
+        # a draft-stack step[EXTEND]); semantic_kernel_mapping recognises them
+        # and keeps them out of main-layer tables.
+        excluded["reason"] = (
+            "speculative draft stack: never a main layer; draft-model steps "
+            "are excluded from main-layer tables when speculative decoding "
+            "is active")
     return count, patterns, excluded, dialect
 
 
