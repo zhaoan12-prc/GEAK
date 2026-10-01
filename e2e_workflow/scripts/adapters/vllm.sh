@@ -120,6 +120,15 @@ PY
       _prof_env=(VLLM_TORCH_PROFILER_DIR="$PROFILE_DIR"
                  VLLM_TORCH_PROFILER_WITH_STACK="$([ "$_stack" = true ] && echo 1 || echo 0)")
     fi
+    # A with_stack window stops and flushes INSIDE a worker RPC. On a large model that can
+    # outlive vLLM's 300s execute_model RPC timeout and kill the engine: Kimi-K2.5 TP8 on
+    # vLLM 0.21, max_iterations=192 with stacks -> "RPC call to sample_tokens timed out"
+    # exactly 300s in, no trace written. Raise the bound for profiling servers only, unless
+    # the caller set it.
+    if [ "$_stack" = true ] && [ -z "${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-}" ] \
+        && [ -z "$(_extra_env_value VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS)" ]; then
+      _prof_env+=(VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${GEAK_PROFILE_STACK_RPC_TIMEOUT_S:-1800}")
+    fi
   fi
   # Launch through $SERVER_LAUNCH_PREFIX (adapter contract): it puts the server in its
   # own session so teardown can prove the process group is ours. Empty when unset.

@@ -58,7 +58,8 @@ class VllmProfilerConfigTest(unittest.TestCase):
         self._write(os.path.join(self.bin, "vllm"),
                     '#!/usr/bin/env bash\n'
                     'printf \'VLLM_ARGV: %s\\n\' "$*"\n'
-                    'printf \'VLLM_ENV: VLLM_TORCH_PROFILER_DIR=%s\\n\' "${VLLM_TORCH_PROFILER_DIR:-}"\n')
+                    'printf \'VLLM_ENV: VLLM_TORCH_PROFILER_DIR=%s\\n\' "${VLLM_TORCH_PROFILER_DIR:-}"\n'
+                    'printf \'VLLM_RPC_TIMEOUT=%s\\n\' "${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-}"\n')
 
     def _write(self, path, body):
         with open(path, "w", encoding="utf-8") as fh:
@@ -161,6 +162,29 @@ class VllmProfilerConfigTest(unittest.TestCase):
         self.assertIn('"torch_profiler_with_stack":true', self._argv())
         self.assertNotIn("max_iterations", self._argv())
         self.assertIn("NOT iteration-bounded", proc.stderr)
+
+    def _rpc_timeout(self):
+        for line in self._log().splitlines():
+            if line.startswith("VLLM_RPC_TIMEOUT="):
+                return line.split("=", 1)[1]
+        self.fail("fake vllm printed no VLLM_RPC_TIMEOUT line")
+
+    def test_with_stack_profile_raises_the_rpc_timeout(self):
+        # Kimi-K2.5 TP8 / vLLM 0.21: a 192-step with_stack window outlived the 300s
+        # execute_model RPC timeout and killed the engine before any trace was written.
+        self._run("adapter_launch", probe_fields=FIELDS_026,
+                  EXTRA_ENV="VLLM_PROFILE_WITH_STACK=true")
+        self.assertEqual(self._rpc_timeout(), "1800")
+        self._run("adapter_launch", probe_fields=FIELDS_026,
+                  EXTRA_ENV="GEAK_FUSION_TRACE=1")
+        self.assertEqual(self._rpc_timeout(), "1800")
+
+    def test_stackless_profile_and_caller_setting_leave_the_timeout_alone(self):
+        self._run("adapter_launch", probe_fields=FIELDS_026)
+        self.assertEqual(self._rpc_timeout(), "")
+        self._run("adapter_launch", probe_fields=FIELDS_026,
+                  EXTRA_ENV="VLLM_PROFILE_WITH_STACK=true VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=600")
+        self.assertEqual(self._rpc_timeout(), "600")
 
     def test_019_probe_omits_026_only_fields(self):
         self._run("adapter_launch", probe_fields=FIELDS_019)
