@@ -90,9 +90,13 @@ Phase 1.2 additionally receives `STRUCTURAL_PATTERNS_JSON`, `SEMANTIC_TABLE_JSON
      --trace "<analysis_rank_trace>" \
      --patterns "$EVAL_DIR/profile/round_${ROUND}/semantics/STRUCTURAL_LAYER_PATTERNS.json" \
      --out-dir "$EVAL_DIR/profile/round_${ROUND}/semantics" \
-     --table-phases all \
+     --table-phases all --require-phases prefill,decode \
      --result-json "$EVAL_DIR/profile/round_${ROUND}/semantics/semantics_result.json"
    ```
+
+   `--require-phases prefill,decode` makes a missing phase a `partial` table with
+   `phase_coverage.missing_required_phases` set, never a quiet single-phase `pass`: Fusion
+   Discovery works from these tables, and a phase they lack is a phase no candidate exists for.
 
    Never call `structural_pattern_mapping.py` from this role. There is no fixed-dialect or
    config-only fallback.
@@ -283,7 +287,9 @@ from a CUDA graph). Representatives come only from mapped steps. If most of a ph
    copied. If neither exact full matching nor the strict projection yields one unique result, keep the
    phase unresolved. Never fall back to LCS/edit-distance similarity, stage recurrence,
    attention/GEMM/MoE anchors, proportional cuts, or best-effort sequence alignment.
-6. Re-run `semantic_kernel_mapping.py --layer-boundary-map <map>` on the original Clean Trace, then
+6. Re-run `semantic_kernel_mapping.py --layer-boundary-map <map> --require-phases prefill,decode`
+   on the original Clean Trace (the requirement `run_semantics_1_2.py` applies by default; on vLLM,
+   where this step is run by hand, it must be passed explicitly), then
    regenerate `SHAPE_CAPTURE_PLAN.json`. Only this rebuilt authoritative table may receive Shape
    evidence. Filter detailed logging at the source to representative layers and unresolved/candidate
    OPs plus their necessary parent wrappers. Do not record Tensor values or synchronize the device.

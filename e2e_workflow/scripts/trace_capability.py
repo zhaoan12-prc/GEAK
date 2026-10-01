@@ -196,7 +196,29 @@ def _stage_device_coverage(path):
     }
 
 
-def build_manifest(trace_dir, analysis_rank=0, auto_select_rank=False):
+# Manifest phase names follow sglang's step dialect; callers may say "prefill".
+_PHASE_ALIASES = {"prefill": "extend", "prompt": "extend", "generation": "decode"}
+
+
+def _phase_coverage(entries, analysis_rank, require_phases):
+    """Phases the selected rank's traces hold device work for, and which required ones are missing.
+
+    All files of the rank count: sglang writes EXTEND and DECODE as separate traces,
+    vLLM writes one mixed trace. A phase is present when some annotated step of it
+    carried device events.
+    """
+    present = sorted({
+        phase
+        for entry in entries if entry.get("rank") == analysis_rank
+        for phase, count in (entry.get("device_events_by_phase") or {}).items()
+        if count})
+    required = sorted({_PHASE_ALIASES.get(p, p)
+                       for p in (require_phases or []) if p})
+    return present, required, [p for p in required if p not in present]
+
+
+def build_manifest(trace_dir, analysis_rank=0, auto_select_rank=False,
+                   require_phases=None):
     files = discover(trace_dir)
     entries = []
     for path in files:
@@ -269,6 +291,15 @@ def build_manifest(trace_dir, analysis_rank=0, auto_select_rank=False):
         "capabilities": {},
         "error": "no top-level torch trace found",
     }
+    present, required, missing = _phase_coverage(
+        entries, analysis_rank, require_phases)
+    status = "pass" if selected else "failed"
+    if selected and missing:
+        # KernelFusion reuses the formal Profile trace, and a Profile shaped for
+        # steady-state decode skips the prefill ramp: Kimi-K2.5 TP8 came back
+        # decode-only and every fusion table, candidate and Top-K row was
+        # decode-only, reported as "prefill ~ 0 us". Refuse instead.
+        status = "failed"
     return {
         "schema_version": 1,
         "trace_dir": os.path.abspath(trace_dir),
@@ -282,7 +313,10 @@ def build_manifest(trace_dir, analysis_rank=0, auto_select_rank=False):
         "rank_candidates": rank_candidates,
         "cross_rank_merge": False,
         "capability": capabilities,
-        "status": "pass" if selected else "failed",
+        "phases_present": present,
+        "required_phases": required,
+        "missing_required_phases": missing,
+        "status": status,
     }
 
 
@@ -292,10 +326,16 @@ def main():
     parser.add_argument("--analysis-rank", type=int, default=0)
     parser.add_argument("--auto-select-rank", action="store_true")
     parser.add_argument("--out", required=True)
+    parser.add_argument(
+        "--require-phases", default="",
+        help="comma list (prefill,decode); the manifest fails when the selected "
+             "rank has no device work in one of them")
     args = parser.parse_args()
     doc = build_manifest(
         args.trace_dir, args.analysis_rank,
-        auto_select_rank=args.auto_select_rank)
+        auto_select_rank=args.auto_select_rank,
+        require_phases=[p.strip() for p in args.require_phases.split(",")
+                        if p.strip()])
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as fh:
         json.dump(doc, fh, indent=2)

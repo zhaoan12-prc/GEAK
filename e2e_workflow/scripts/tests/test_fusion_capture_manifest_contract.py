@@ -134,6 +134,22 @@ class FusionCaptureManifestContractTest(unittest.TestCase):
         self.assertLess(role.index("PROFILE_TRACE_DIR"), role.index("TRACELENS_TRACE_FILE` only when"))
         self.assertIn("--auto-select-rank", role)
 
+    def test_a_reused_or_captured_trace_must_hold_both_phases(self):
+        # The Profile may skip the prefill ramp to reach steady decode; reusing that
+        # trace made every Kimi-K2.5 fusion table decode-only, reported as a pass.
+        with open(os.path.join(ROLES, "fusion_trace_collector.md")) as fh:
+            collector = fh.read()
+        reuse = collector[collector.index("Reuse the formal Profile trace first"):
+                          collector.index("TRACELENS_TRACE_FILE` only when")]
+        self.assertIn("--require-phases prefill,decode", reuse)
+        validate = collector[collector.index("5. Require the completed capture"):]
+        self.assertIn("--require-phases prefill,decode", validate)
+        with open(os.path.join(ROLES, "semantics_mapper.md")) as fh:
+            mapper = fh.read()
+        build = mapper[mapper.index("## PHASE=build_table"):mapper.index("## PHASE=complete_table")]
+        self.assertIn("--require-phases prefill,decode", build)
+        self.assertIn("--layer-boundary-map <map> --require-phases prefill,decode", mapper)
+
     def test_applyback_cannot_time_out_into_a_stale_profile(self):
         source = self._workflow_source()
         self.assertIn("const FUSION_APPLY_TIMEOUT_MS", source)

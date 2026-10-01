@@ -12,6 +12,51 @@ import trace_capability
 
 
 class TraceCapabilityTest(unittest.TestCase):
+    @staticmethod
+    def _steps(tmp, name, steps):
+        """One rank trace whose gpu steps each hold one kernel."""
+        events = []
+        for index, step in enumerate(steps):
+            start = index * 100
+            events.append({"cat": "gpu_user_annotation", "name": step,
+                           "ts": start, "dur": 50})
+            events.append({"cat": "kernel", "name": "k", "ts": start + 10, "dur": 5})
+        with gzip.open(os.path.join(tmp, name), "wt") as fh:
+            json.dump({"traceEvents": events}, fh)
+
+    PREFILL = "execute_context_1(8)_generation_0(0)"
+    DECODE = "execute_context_0(0)_generation_4(4)"
+
+    def test_a_decode_only_trace_fails_a_two_phase_requirement(self):
+        """A Profile shaped for steady decode can skip the prefill ramp entirely."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._steps(tmp, "rank_0.pt.trace.json.gz", [self.DECODE, self.DECODE])
+            plain = trace_capability.build_manifest(tmp, auto_select_rank=True)
+            self.assertEqual(plain["status"], "pass")
+            required = trace_capability.build_manifest(
+                tmp, auto_select_rank=True, require_phases=["prefill", "decode"])
+            self.assertEqual(required["status"], "failed")
+            self.assertEqual(required["phases_present"], ["decode"])
+            self.assertEqual(required["missing_required_phases"], ["extend"])
+
+    def test_both_phases_in_one_mixed_trace_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._steps(tmp, "rank_0.pt.trace.json.gz", [self.PREFILL, self.DECODE])
+            result = trace_capability.build_manifest(
+                tmp, auto_select_rank=True, require_phases=["prefill", "decode"])
+            self.assertEqual(result["status"], "pass")
+            self.assertEqual(result["missing_required_phases"], [])
+
+    def test_phases_split_across_a_ranks_files_count_together(self):
+        """sglang writes EXTEND and DECODE as two traces of the same rank."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._steps(tmp, "rank_0-EXTEND.pt.trace.json.gz", [self.PREFILL])
+            self._steps(tmp, "rank_0-DECODE.pt.trace.json.gz", [self.DECODE])
+            result = trace_capability.build_manifest(
+                tmp, auto_select_rank=True, require_phases=["prefill", "decode"])
+            self.assertEqual(result["status"], "pass")
+            self.assertEqual(result["phases_present"], ["decode", "extend"])
+
     def test_rank_sorted_manifest_and_capabilities(self):
         with tempfile.TemporaryDirectory() as tmp:
             events = [
