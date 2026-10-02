@@ -62,11 +62,11 @@ class SemanticLayerBoundaryTransferTest(unittest.TestCase):
             json.dump({"traceEvents": events}, fh)
         return path
 
-    def _recipient(self, root, body=None):
+    def _recipient(self, root, body=None, bs=4):
         body = body or ["layer0_a", "layer0_b", "layer1_a", "layer1_b"]
         names = ["prepare_once"] + body + ["model_epilogue"]
         events = [{
-            "cat": "gpu_user_annotation", "name": "step[DECODE bs=4]",
+            "cat": "gpu_user_annotation", "name": "step[DECODE bs=%d]" % bs,
             "ts": 0, "dur": 200,
         }]
         events.extend({
@@ -224,6 +224,30 @@ class SemanticLayerBoundaryTransferTest(unittest.TestCase):
             self.assertEqual(result["status"], "fail")
             self.assertEqual(result["untransferable_steps"], [])
 
+    def test_eager_decode_above_graph_bs_uses_other_decode_donor(self):
+        # Graph markers exist only for captured sizes (bs<=4); an eager bs=8 decode
+        # step with the same per-layer kernel order still gets validated cuts.
+        with tempfile.TemporaryDirectory() as tmp:
+            result = transfer.transfer(
+                self._donor(tmp), self._recipient(tmp, bs=8), self._patterns(tmp))
+            self.assertEqual(result["status"], "pass")
+            group = result["mapped_groups"][0]
+            self.assertEqual(group["batch_size"], 8)
+            self.assertEqual(group["donor"]["batch_size"], 4)
+            self.assertTrue(group["donor_batch_size_fallback"])
+            self.assertEqual(group["layer_start_positions"], [1, 3])
+
+    def test_decode_donor_fallback_still_requires_identical_sequence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = transfer.transfer(
+                self._donor(tmp),
+                self._recipient(tmp, body=["x", "y", "x", "y"], bs=8),
+                self._patterns(tmp))
+            self.assertEqual(result["status"], "fail")
+            failure = result["failures"][0]
+            self.assertEqual(failure["reason"], "no_validated_stable_projection")
+            self.assertTrue(failure["donor_batch_size_fallback"])
+
     def test_partial_donor_pass_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             result = transfer.transfer(
@@ -236,14 +260,16 @@ class SemanticLayerBoundaryTransferTest(unittest.TestCase):
 
     def test_a_step_without_a_donor_pass_leaves_the_map_partial(self):
         """A batch size the donor never ran must not void the steps it did validate."""
+        # The bs=8 body differs, so the other-decode-donor fallback cannot validate it.
         with tempfile.TemporaryDirectory() as tmp:
             events = []
             for index, (batch, start) in enumerate(((4, 0), (8, 300))):
                 events.append({"cat": "gpu_user_annotation",
                                "name": "step[DECODE bs=%d]" % batch,
                                "ts": start, "dur": 200})
-                names = ["prepare_once", "layer0_a", "layer0_b",
-                         "layer1_a", "layer1_b", "model_epilogue"]
+                body = (["layer0_a", "layer0_b", "layer1_a", "layer1_b"]
+                        if batch == 4 else ["x", "y", "x", "y"])
+                names = ["prepare_once"] + body + ["model_epilogue"]
                 events.extend({"cat": "kernel", "name": name,
                                "ts": start + 10 + offset * 3, "dur": 1, "args": {}}
                               for offset, name in enumerate(names))
@@ -256,7 +282,7 @@ class SemanticLayerBoundaryTransferTest(unittest.TestCase):
             self.assertEqual(result["mapped_step_count"], 1)
             self.assertEqual(result["unmapped_step_count"], 1)
             self.assertEqual(result["failures"][0]["batch_size"], 8)
-            self.assertEqual(result["failures"][0]["compatible_donor_pass_count"], 0)
+            self.assertTrue(result["failures"][0]["donor_batch_size_fallback"])
 
     def test_nonidentical_sequence_is_rejected_instead_of_aligned_by_stage(self):
         with tempfile.TemporaryDirectory() as tmp:

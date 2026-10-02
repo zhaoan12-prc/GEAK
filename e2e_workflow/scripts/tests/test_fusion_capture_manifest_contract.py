@@ -160,11 +160,8 @@ class FusionCaptureManifestContractTest(unittest.TestCase):
 
     def test_applyback_runs_one_execution_entry_per_agent_call(self):
         source = self._workflow_source()
-        self.assertIn(
-            "const fusionApplyEntries = fusionApplyBudgetEntries(\n"
-            "      fusionExecutionList, fusionUnitEligibleIds, FUSION_BUDGET);",
-            source,
-        )
+        # Every final Top-K entry from fusion_screen is applied; there is no budget cut.
+        self.assertIn("const fusionApplyEntries = fusionExecutionList.slice();", source)
         self.assertIn(
             "for (let applyIndex = 0; applyIndex < fusionApplyEntries.length; applyIndex++)",
             source,
@@ -173,28 +170,23 @@ class FusionCaptureManifestContractTest(unittest.TestCase):
         self.assertIn("TARGET_EXEC_ID: applyEntry.exec_id", source)
         self.assertIn("PRIOR_APPLY_RESULT: applyState", source)
         self.assertNotIn("roleAgent('fusion_integrator', 'apply_back'", source)
-
     def test_applyback_commits_each_terminal_win_before_the_next_call(self):
         source = self._workflow_source()
-        # The commit lives in commitStep(), shared with combined mode; the serial loop
-        # calls it after every apply_one call, before the next one.
-        helper = source.index("const commitStep = (step, accuracyKey, label) => {")
-        helper_body = source[helper:source.index("\n    };\n", helper)]
-        self.assertIn("for (const accepted of newlyAccepted) acceptedFusions.push(accepted);",
-                      helper_body)
-        self.assertIn("fusionRecoveryState.acceptedFusionCount = acceptedFusions.length;",
-                      helper_body)
         call = source.index("roleAgent('fusion_integrator', 'apply_one'")
-        commit = source.index("commitStep(step, accuracyKey, applyEntry.exec_id);", call)
-        profile = source.index("phase('Strategize');", commit)
-        self.assertLess(helper, call)
-        self.assertLess(call, commit)
-        self.assertLess(commit, profile)
         failure = source.index("if (!step) {", call)
         stop = source.index("break;", failure)
+        commit = source.index(
+            "for (const accepted of newlyAccepted) acceptedFusions.push(accepted);", stop)
+        checkpoint = source.index(
+            "fusionRecoveryState.acceptedFusionCount = acceptedFusions.length;", commit)
+        stack = source.index("roleAgent('fusion_integrator', 'apply_stack'", checkpoint)
+        strategize = source.index("phase('Strategize');", stack)
+        self.assertLess(call, failure)
         self.assertLess(failure, stop)
-        self.assertLess(stop, profile)
-
+        self.assertLess(stop, commit)
+        self.assertLess(commit, checkpoint)
+        self.assertLess(checkpoint, stack)
+        self.assertLess(stack, strategize)
     def test_applyback_role_is_scoped_to_one_entry(self):
         with open(os.path.join(WORKFLOW, "roles", "fusion_integrator.md")) as fh:
             source = fh.read()
@@ -205,84 +197,50 @@ class FusionCaptureManifestContractTest(unittest.TestCase):
         self.assertIn("--allow-partial-coverage", source)
 
     def test_completed_shape_table_is_the_source_for_candidates_and_topk(self):
-        """The eager-merged table, not the pre-probe table, must flow forward."""
+        """The eager-merged table, not the pre-probe table, must flow into the screen."""
         source = self._workflow_source()
         complete = source.index("if (completed) semantics = completed;")
-        generate = source.index(
-            "label: 'fusion-analyst:generate'", complete)
-        rank = source.index("label: 'fusion-analyst:rank'", generate)
-        self.assertLess(complete, generate)
-        self.assertLess(generate, rank)
-        generate_block = source[complete:generate]
-        rank_block = source[generate:rank]
-        self.assertIn(
-            "SEMANTIC_TABLE_JSON: semantics.semantic_table_json",
-            generate_block,
-        )
-        self.assertIn(
-            "SEMANTIC_TABLE_JSON: semantics.semantic_table_json",
-            rank_block,
-        )
-        self.assertIn(
-            "FUSION_CANDIDATES_JSON: discover.fusion_candidates_json",
-            rank_block,
-        )
-        self.assertIn(
-            "FUSION_VALIDATION_JSON: discover.validation_json",
-            rank_block,
-        )
-        self.assertIn("WORKLOAD_ISL: ISL", rank_block)
-        self.assertIn("WORKLOAD_OSL: OSL", rank_block)
-        self.assertIn("WORKLOAD_CONC: CONC", rank_block)
-
-    def test_partial_semantics_cannot_enter_fusion_discovery(self):
+        screen = source.index("label: 'fusion-screen'", complete)
+        screen_block = source[complete:screen]
+        self.assertIn("roleAgent('kernel_fusion_analyst', 'screen'", screen_block)
+        self.assertIn("SEMANTIC_TABLE_JSON: semantics.semantic_table_json", screen_block)
+        self.assertIn("WORKLOAD_ISL: ISL", screen_block)
+        self.assertIn("WORKLOAD_OSL: OSL", screen_block)
+        self.assertIn("WORKLOAD_CONC: CONC", screen_block)
+        self.assertIn("TOP_K: FUSION_TOP_K", screen_block)
+        self.assertIn("PASSES: FUSION_SCREEN_PASSES", screen_block)
+    def test_partial_semantics_screens_only_resolved_phases(self):
+        # A partial table (e.g. decode boundaries missing) still screens the phases
+        # it resolved and logs the blind ones; a failed or table-less result does not.
         source = self._workflow_source()
         self.assertIn(
-            "if (semantics && semantics.status === 'pass' && semantics.semantic_table_json)",
+            "const semanticsUsable = semantics && semantics.semantic_table_json &&\n"
+            "      (semantics.status === 'pass' || semantics.status === 'partial');",
             source,
         )
+        self.assertIn("if (semanticsUsable) {", source)
+        self.assertIn("semantic table is partial; screening the phases it resolved", source)
 
-    def test_topk_execution_list_drives_exact_unitside_candidates(self):
-        """Every unit-side call must be named by Top-K exec/candidate ids."""
+    def test_screen_execution_list_drives_applyback(self):
+        """Apply-back takes exactly the execution_list fusion_screen returned."""
         source = self._workflow_source()
-        start = source.index("const execById = new Map();")
-        aggregate = source.index(
-            "label: 'fusion-unit:aggregate'", start)
-        block = source[start:aggregate]
-        self.assertIn("ranked.execution_list || []", block)
-        self.assertIn("unit_representative_candidate_id", block)
-        self.assertIn("unit_equivalent_candidate_ids", block)
-        self.assertIn("equivalentCovered", block)
-        self.assertIn("EXEC_ID: item.exec_id", block)
-        self.assertIn("CANDIDATE_ID: item.candidate_id", block)
-        self.assertIn(
-            "FUSION_CANDIDATES_JSON: discover.fusion_candidates_json",
-            block,
-        )
-        self.assertIn("FUSION_TOPK_JSON: ranked.fusion_topk_json", block)
-
-    def test_unitside_aggregate_is_the_only_applyback_gate(self):
-        """Apply-back must consume the aggregate produced for this Top-K."""
+        screen = source.index("label: 'fusion-screen'")
+        applyback = source.index("roleAgent('fusion_integrator', 'apply_one'", screen)
+        block = source[screen:applyback]
+        self.assertIn("FUSION_INPUTS.FUSION_TOPK_JSON = screened.fusion_topk_json;", block)
+        self.assertIn("fusionExecutionList = Array.isArray(screened.execution_list)", block)
+        self.assertNotIn("fusion_unit_validator", source)
+    def test_screen_board_is_the_only_applyback_gate(self):
+        """Apply-back is gated on the screen's Top-K, not on a unit-side aggregate."""
         source = self._workflow_source()
-        aggregate = source.index("label: 'fusion-unit:aggregate'")
-        preserve = source.index(
-            "FUSION_INPUTS.FUSION_UNITSIDE_JSON = aggregate.fusion_unitside_json;",
-            aggregate,
-        )
-        applyback = source.index("roleAgent('fusion_integrator', 'apply_one'", preserve)
-        self.assertLess(aggregate, preserve)
-        self.assertLess(preserve, applyback)
-        profile = source.index("phase('Strategize');", applyback)
-        apply_block = source[preserve:profile]
+        screen = source.index("label: 'fusion-screen'")
+        applyback = source.index("roleAgent('fusion_integrator', 'apply_one'", screen)
+        apply_block = source[screen:applyback]
         self.assertIn(
-            "FUSION_INPUTS.FUSION_TOPK_JSON && FUSION_INPUTS.FUSION_UNITSIDE_JSON",
+            "if (FUSION_INPUTS.FUSION_TOPK_JSON && fusionExecutionList.length) {",
             apply_block,
         )
-        self.assertIn(
-            "FUSION_UNITSIDE_JSON: FUSION_INPUTS.FUSION_UNITSIDE_JSON",
-            apply_block,
-        )
-
+        self.assertNotIn("FUSION_INPUTS.FUSION_UNITSIDE_JSON = ", source)
     def test_applyback_failure_preserves_prefusion_state_and_continues_profile(self):
         source = self._workflow_source()
         fallback = source.index(

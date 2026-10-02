@@ -775,14 +775,37 @@ def _capture_subsequence_map(sequence, donor, expected_layers):
 
 
 def _map_step(step_rows, donor_passes, expected_layers):
+    """Map one Clean Trace step, preferring donors from the same workload bucket.
+
+    Decode fallback: graph-construction markers exist only for captured CUDA-graph
+    batch sizes (<= --cuda-graph-max-bs), while a Clean Trace decode step above
+    that size runs eager. With no exact or padded-bucket donor, other donors of
+    the same generation phase are tried; the per-layer kernel order does not
+    depend on batch size, and the exact or stable-projection check below still
+    has to pass, so the rule stays fail-closed.
+    """
+    phase = _phase(step_rows[0].get("phase"))
+    batch_size = _integer(step_rows[0].get("step_batch_size"))
+    input_tokens = _integer(step_rows[0].get("step_input_tokens"))
+    candidates = _compatible_donors(
+        donor_passes, phase, batch_size, input_tokens)
+    if candidates or not sglang_step_modes.is_generation_phase(phase):
+        return _map_step_with(step_rows, candidates, expected_layers)
+    candidates = [donor for donor in donor_passes if donor["phase"] == phase]
+    mapping, failure = _map_step_with(step_rows, candidates, expected_layers)
+    for item in (mapping, failure):
+        if item is not None:
+            item["donor_batch_size_fallback"] = True
+    return mapping, failure
+
+
+def _map_step_with(step_rows, candidates, expected_layers):
     sequence = [
         _kernel_identity(row.get("raw_name"), row.get("event_type"))
         for row in step_rows]
     phase = _phase(step_rows[0].get("phase"))
     batch_size = _integer(step_rows[0].get("step_batch_size"))
     input_tokens = _integer(step_rows[0].get("step_input_tokens"))
-    candidates = _compatible_donors(
-        donor_passes, phase, batch_size, input_tokens)
     capture_failures = []
     for donor in candidates:
         if donor.get("source") != "capture":

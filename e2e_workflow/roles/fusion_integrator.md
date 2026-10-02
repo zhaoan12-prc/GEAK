@@ -6,10 +6,7 @@ engages, and gate it with a tight A/B + accuracy. This codifies the pattern that
 DSR1's AR+norm+quant (+1.56% TPOT-driven) and norm+quant (+1.49%) — so it is repeatable,
 not re-discovered each time.
 
-In combined mode (the default) you are invoked once per fusion to author its overlay
-(PHASE=author_one) and once to gate the whole stack with one A/B (PHASE=combined_ab); a
-rejected stack falls back to serial mode, where you are invoked once per fusion
-(PHASE=apply_one, maximal-first per the degrade ladder). Inputs:
+You are invoked once per fusion (maximal-first per the degrade ladder). Inputs:
 `FUSION_TOPK_JSON`, `FUSION_UNITSIDE_JSON` (only integrate `unit_side_status==pass`),
 `FUSION_CANDIDATES_JSON` (seam/API/covers_ops/removable rows), `IMAGE`, `MODEL_PATH`,
 `TP`, `EVAL_DIR`, `BASELINE_TPS` (+baseline gsm8k), `SKILL_DIR`. A prior accepted overlay
@@ -321,65 +318,35 @@ control with 100s of MB of trace/bench. Return StructuredOutput: `{fusion, accep
 engaged (bool), ttft_delta_pct, tpot_delta_pct, throughput_delta_pct, nonoverlap (bool),
 gsm8k_base, gsm8k_cand, reprofile_ok, overlay_path, skipped_branches, notes}`.
 
-## PHASE=author_one — author one overlay, no server (combined mode)
-Inputs: `TARGET_EXEC_ID`, `TARGET_EXECUTION`, `GPU_ID`, `FUSION_TOPK_JSON`,
-`FUSION_CANDIDATES_JSON`, `FUSION_UNITSIDE_JSON`, `CURRENT_OVERLAY/FLAGS/ENV`,
-`FUSION_OVERLAYS_DIR`. Several entries are authored at once, one GPU each.
+## PHASE=apply_one — apply one execution-list entry (called serially by KernelFusion)
 
-1. Locate `TARGET_EXEC_ID`. Author only this entry: its ladder rungs are separate
-   execution-list entries and are authored by their own calls.
-2. Follow **The adapter pattern** above (seam from installed source, kernel-availability
-   gate, lazy-load overlay with an `[overlay-<tag>] ENGAGED` banner, stderr-only logging).
-   Write it to `FUSION_OVERLAYS_DIR/<model>/<tag>/<tag>_overlay.py`.
-3. Check parity on `GPU_ID` only (`HIP_VISIBLE_DEVICES=$GPU_ID`): call the patched seam and
-   the split path on the candidate's captured member shape and compare. Do NOT launch a
-   serving server and do NOT touch the other GPUs.
-4. Return `{exec_id, status: "authored", fusion, overlay_dir, banner_tag, candidate_ids,
-   parity}`, or `{exec_id, status: "blocked", reason}` stating what was attempted (missing
-   kernel, no seam, parity failure with the measured error).
+The board is `fusion_screen.py`, not the old unit-side ladder. There is no `FUSION_UNITSIDE_JSON` gate. The workflow applies every entry of the final Top-K, one call per entry; this call handles only `TARGET_EXEC_ID`.
 
-## PHASE=combined_ab — one A/B for every authored overlay (combined mode)
-Inputs add `AUTHORED` (the author_one results), `PRIOR_APPLY_RESULT`, `COMBINED_AB_SCRIPT`,
-`AB_REPEATS`, `GSM8K_*`, `CURRENT_*`, `NOISE_BAND_PCT`, `FUSION_BUDGET`.
+Always author a fused kernel for the chain. When `TARGET_EXECUTION.compare_existing` is true, also wire the existing fusion kernel, measure both against `TARGET_EXECUTION.estimated_speedup`, and keep whichever is better. When it is false, the self-authored kernel is the only side.
 
-1. Take every `AUTHORED` row with `status: "authored"`. When two conflict (the Top-K
-   `conflict_edges`, or a ladder top and its rung), keep the ladder top, else the better
-   rank. Write ONE combined-loader dir `FUSION_OVERLAYS_DIR/<model>/combined/` whose
-   `sitecustomize.py` runs `CURRENT_OVERLAY`'s overlays (if any) and then every kept
-   overlay (see **Stacking**).
-2. Run the A/B once, with the run's serving env (`BACKEND TP GPU MODEL ISL OSL CONC
-   EXTRA_SERVER_ARGS=CURRENT_FLAGS EXTRA_ENV=CURRENT_ENV EVAL_DIR`, bench protocol):
-   ```bash
-   OUT_DIR="$EVAL_DIR/fusion/combined_ab" BASE_OVERLAY="$CURRENT_OVERLAY" \
-   CAND_OVERLAY="<combined dir>" EXPECT_BANNERS="<kept banner tags>" \
-   AB_REPEATS="$AB_REPEATS" NOISE_BAND_PCT="$NOISE_BAND_PCT" \
-   GSM8K_EVAL_SCRIPT="$GSM8K_EVAL_SCRIPT" GSM8K_CONCURRENCY="$GSM8K_CONCURRENCY" \
-   GSM8K_THINKING="$GSM8K_THINKING" bash "$COMBINED_AB_SCRIPT"
-   ```
-   It runs one base server and one stacked server (each: warm-up round, `AB_REPEATS` timed
-   rounds, gsm8k on the same server) and writes `combined_ab/combined_decision.json`. Do not
-   re-run it to chase a different answer.
-3. **accept** → every kept overlay that is not in `not_engaged` goes into
-   `accepted_fusions` (`throughput_delta_pct`/`tpot_delta_pct`: null — only the stack was
-   measured; the post-fusion re-profile attributes it). Overlays in `not_engaged`, and
-   `blocked` author rows, go into `rejected` with their reason. Return `final_overlay` (the
-   combined dir), `e2e_throughput_tok_s` = cand median, `accepted_accuracy` = cand gsm8k,
-   `combined_decision: "accept"`, `combined_ab` = the decision JSON. Write
-   `apply_result.json` and run the harness below WITHOUT `--allow-partial-coverage`.
-4. **reject** → return `combined_decision: "reject"`, `combined_ab`, and
-   `PRIOR_APPLY_RESULT` unchanged. The orchestrator falls back to `apply_one` per entry.
+Existing kernel first. `TARGET_EXECUTION.matched_existing_kernels` lists the catalog kernels that cover the chain (aiter first, tightest first). Wire and unit-test the first one that fits the captured shapes and dtypes before authoring; move down the list only when one cannot be wired, and record why. A server flag that gates the same fusion to another platform or model family (for example a CUDA-only or MoE-only `--enable-fused-qk-norm-rope`) is not evidence that no kernel exists: call the catalog kernel at the seam directly. If the list is non-empty, a disposition of "no existing kernel applies" must name each listed kernel and the concrete reason it does not fit.
 
-Knowledge cards: a fusion accepted only through the combined A/B has no single-fusion
-A/B, so it can be curated at ★ at most.
+Both phases. When `TARGET_EXECUTION.phases` has prefill and decode, the entry is one seam that runs in both (`row_ids` in one phase, `partner_row_ids` in the other). Wire it once at the seam; the unit test covers both captured shapes; the serving A/B measures both.
 
-## PHASE=apply_one — apply one execution-list entry/degrade ladder (called serially by KernelFusion)
+Stack pending. When a side passes both unit checks, is ENGAGED in serving, does not regress throughput or accuracy, but its A/B stays inside the noise band, return it in `rejected` with `stack_pending: true`, its `overlay_path`, `throughput_delta_pct`, `tpot_delta_pct` and the unit results. Do not leave it in `deferred`. The workflow gates all stack-pending entries together after the last `apply_one` (PHASE=apply_stack).
+
+Every implementation, existing or self-authored, needs its own unit test against the unfused reference chain at the captured shapes and dtypes:
+
+- Unit accuracy: output matches the reference within the dtype tolerance.
+- Unit performance: the fused kernel is faster than the reference chain. Record the measured unit speedup.
+
+A side that fails either unit check does not go to e2e. The surviving side(s) then go through the serving A/B:
+
+- E2E performance: interleaved A/B clears the noise band (`cand_min > ref_max`).
+- E2E accuracy: the gsm8k accuracy check passes.
+
+Accept only when both e2e checks pass. If both sides pass, keep the one with the higher e2e throughput. Record the unit test path, unit accuracy, unit speedup, e2e throughput delta and e2e accuracy for each side in the entry's notes.
+
 Inputs add `FUSION_TOPK_JSON`, `FUSION_CANDIDATES_JSON`, `FUSION_UNITSIDE_JSON`,
 `TARGET_EXEC_ID`, `TARGET_EXECUTION`, `PRIOR_APPLY_RESULT`,
 `CURRENT_OVERLAY/FLAGS/ENV/THROUGHPUT`, `FUSION_BUDGET`, `FUSION_OVERLAYS_DIR`, `ACCURACY_*`,
 `AB_DECIDE_SCRIPT`, `AB_MAX_PAIRS`, `GSM8K_EVAL_SCRIPT`, `GSM8K_CONCURRENCY`, `GSM8K_THINKING`,
-`ACCURACY_STACK_KEY`, `ACCURACY_REFERENCE` (null unless a base score for this exact stack exists),
-`AUTHORED_OVERLAY` (set when a rejected combined A/B already authored this entry's overlay:
-reuse it instead of authoring again).
+`ACCURACY_STACK_KEY`, `ACCURACY_REFERENCE` (null unless a base score for this exact stack exists).
 If `EXEC_PREFIX` is non-empty, run executable commands as
 `<EXEC_PREFIX> <command>`; it is not an environment assignment.
 The orchestrator invokes this role serially, once per execution-list entry. Process exactly
@@ -391,16 +358,7 @@ entry already present in `PRIOR_APPLY_RESULT.accepted_fusions`, do not launch a 
 return the unchanged aggregate after regenerating the report. The harness owns the derived
 `blocked_by_exclusion` classification.
 
-1. Read `FUSION_TOPK_JSON` + `FUSION_UNITSIDE_JSON`; locate `TARGET_EXEC_ID`. It is eligible when its `unit_side_status` is in
-   {`pass`, `equivalent_pass`, `subsumed_pass`} **tier-A or tier-B** candidates
-   (tier-C is author work; count it into `deferred_author_count`).
-   `equivalent_pass` means the same recipe/cohort passed once on this execution
-   row's declared representative. `subsumed_pass` means the rung's ladder top
-   was benched and passed and that microbench covered this rung's rows — it is a pass,
-   not a gap. `budget_skipped` / `not_validated` are NOT eligible: they were never
-   measured, and they must be returned in `deferred[]` saying exactly that, never as
-   "not a win". The orchestrator preserves Top-K `execution_list` order and applies
-   `FUSION_BUDGET`; do not select a different entry.
+1. Read `FUSION_TOPK_JSON` and locate `TARGET_EXEC_ID` in `execution_list`. It is eligible because it already passed `fusion_screen.py`. Do not drop it for a missing unit-side status. `FUSION_UNITSIDE_JSON` may be empty. Apply only `TARGET_EXEC_ID`; do not select a different entry.
    Tier-A belongs here, not ConfigSweep: apply its one flag/env,
    run serving A/B, verify the fused kernel/route engagement, and keep or revert it
    before returning.
@@ -440,6 +398,26 @@ config tuner, so they only reach you through an explicit override). They must re
 target chain under the same dtype/backend/config. Put dtype changes, backend swaps,
 different kernel selection, batching, or unrelated memory-pressure effects in
 `secondary_effect_delta_pct`; never credit the full mixed delta to fusion.
+
+## PHASE=apply_stack — gate the in-noise fusions together (called once, after the last apply_one)
+
+Inputs are the apply_one inputs plus `STACK_ENTRIES`: the `rejected` rows that carry
+`stack_pending: true`. Each already passed unit accuracy and unit speedup and was
+ENGAGED in serving; only its single A/B sat inside the noise band.
+
+1. Stack every entry's `overlay_path` onto `CURRENT_OVERLAY` with one combined-loader and
+   verify every entry's `[overlay-…] ENGAGED` banner on all ranks.
+2. Gate the stack exactly like apply_one: interleaved A/B against `CURRENT_OVERLAY`
+   (`cand_min > ref_max` and above `NOISE_BAND_PCT`), then the gsm8k accuracy check.
+3. On failure, drop the entry with the smallest single-entry `throughput_delta_pct` and
+   re-gate. Stop at two entries; one entry alone was already measured.
+4. Accepted entries go to `accepted_fusions` with `stacked_with` listing the other exec_ids,
+   `throughput_delta_pct` for the whole stack, and each entry's single-entry delta kept in
+   `single_delta_pct`. Entries that never pass stay in `rejected`: keep `stack_pending`
+   and add `stack_result` with the stacked A/B numbers.
+
+Return the full aggregate (`PRIOR_APPLY_RESULT` plus this call) in `FUSION_APPLY_SCHEMA`,
+with `final_overlay` pointing at the accepted combined-loader.
 
 ## 🔴 Coverage — the execution list is your denominator (mandatory, harness-enforced)
 
