@@ -4,7 +4,7 @@ export const meta = {
   whenToUse: 'Optimize the serving throughput of an LLM on AMD Instinct MI GPUs. Pass args.model_path (required) + optional args.backend (sglang|vllm, default sglang) + args.launch_script (optional). For a single kernel, pass args.kernel_path instead and it delegates straight to the kernel layer.',
   phases: [
     { title: 'Setup', detail: 'e2e Director builds the isolated eval dir + records baseline throughput' },
-    { title: 'KernelFusion', detail: 'capture clean baseline trace -> semantics -> discover/rank/validate Top-K -> integrate tier-A/B with reversible A/B gates' },
+    { title: 'KernelFusion', detail: 'capture clean baseline trace -> screen chains -> initial benefit rank -> two Score passes merged into Top-K (K=8) -> fuse every Top-K chain (existing kernel vs self-authored, unit test + e2e accuracy/perf)' },
     { title: 'Profile', detail: 'Profiler captures a warm trace -> standardized Top-N' },
     { title: 'Strategize', detail: 'System Architect routes kernels by Amdahl (config vs kernel vs host)' },
     { title: 'ConfigSweep', detail: 'Config Tuner sweeps flags/env/backends FIRST (default ON)' },
@@ -115,9 +115,8 @@ const FUSION_DISCOVERY_ON =
 const FUSION_REQUIRED = String(A.fusion_required != null
   ? A.fusion_required
   : (A.fusion_discovery != null ? A.fusion_discovery : 'false')) === 'true';
-const FUSION_TOP_K = parseInt(A.fusion_top_k != null ? A.fusion_top_k : 10, 10);
-const FUSION_UNITSIDE_BUDGET = parseInt(
-  A.fusion_unitside_budget != null ? A.fusion_unitside_budget : FUSION_TOP_K, 10);
+const FUSION_TOP_K = parseInt(A.fusion_top_k != null ? A.fusion_top_k : 8, 10);
+const FUSION_SCREEN_PASSES = 2;
 let FUSION_INPUTS = {
   FUSION_TOPK_JSON: '',
   FUSION_CANDIDATES_JSON: '',
@@ -3069,19 +3068,41 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
       ? (curEnv ? curEnv + ' ' : '') +
         'GEAK_FUSION_TRACE=1 PROFILE_NUM_STEPS=1 SGLANG_PROFILE_WITH_STACK=true'
       : curEnv;
+    const fusionCaptureInputs = {
+      EVAL_DIR, MODEL_PATH, GPU_ID: GPU_LIST[0], WORKLOAD, ROUND: fusionRound,
+      CAPTURE_DIR: fusionCaptureDir,
+      TRACE_MANIFEST_JSON: expectedFusionManifest,
+      CAPTURE_REPEATS: 1,
+      CAPTURE_NUM_PROMPTS: Math.max(CONC * 5, CONC),
+      OVERLAY_PYTHONPATH: curOverlay, EXTRA_SERVER_ARGS: curFlags,
+      EXTRA_ENV: captureEnv, SKILL_DIR: WORKFLOW_DIR,
+      ...FUSION_RUNTIME_INPUTS, ...TRACELENS_INPUTS,
+    };
     fusionCapture = await safeAgent(
       roleAgent('fusion_trace_collector', 'capture',
-        'Capture only the clean production graph trace and manifest for fusion discovery; do not build Top-N.', {
-          EVAL_DIR, MODEL_PATH, GPU_ID: GPU_LIST[0], WORKLOAD, ROUND: fusionRound,
-          CAPTURE_DIR: fusionCaptureDir,
-          TRACE_MANIFEST_JSON: expectedFusionManifest,
-          CAPTURE_REPEATS: 1,
-          CAPTURE_NUM_PROMPTS: Math.max(CONC * 5, CONC),
-          OVERLAY_PYTHONPATH: curOverlay, EXTRA_SERVER_ARGS: curFlags,
-          EXTRA_ENV: captureEnv, SKILL_DIR: WORKFLOW_DIR,
-          ...FUSION_RUNTIME_INPUTS, ...TRACELENS_INPUTS,
-        }),
+        'Capture only the clean production graph trace and manifest for fusion discovery; do not build Top-N.',
+        fusionCaptureInputs),
       { phase: 'KernelFusion', label: 'fusion-trace-collector:capture', schema: CAPTURE_SCHEMA }, 1);
+    // An agent can "succeed" with a placeholder (e.g. trace_manifest_json="PENDING")
+    // without ever launching the capture. Such a return is not a capture: re-run the
+    // collector with an explicit do-the-work instruction instead of letting the whole
+    // KernelFusion stage silently degrade to "no manifest".
+    const fusionCaptureLooksReal = (c) => !!(c && typeof c.trace_manifest_json === 'string' &&
+      /^\/.+\.json$/.test(c.trace_manifest_json.trim()));
+    for (let retry = 1; retry <= 2 && !fusionCaptureLooksReal(fusionCapture); retry++) {
+      log(`KernelFusion capture attempt returned no real manifest ` +
+        `(${JSON.stringify((fusionCapture && fusionCapture.trace_manifest_json) || null)}); retry ${retry}/2.`);
+      fusionCapture = await safeAgent(
+        roleAgent('fusion_trace_collector', 'capture',
+          'Capture only the clean production graph trace and manifest for fusion discovery; do not build Top-N. ' +
+          `RETRY ${retry}: a previous attempt returned a placeholder manifest path without running the capture. ` +
+          'You MUST actually execute the capture (launch the server via bench_e2e.sh inside the container, drive the ' +
+          'profiled load, tear the server down), then verify with `test -s` that TRACE_MANIFEST_JSON exists and is ' +
+          'non-empty before returning. Return its absolute path; never return a placeholder such as PENDING. If the ' +
+          'capture genuinely fails, return trace_manifest_json="" and put the failing command and log tail in notes.',
+          fusionCaptureInputs),
+        { phase: 'KernelFusion', label: `fusion-trace-collector:capture-retry${retry}`, schema: CAPTURE_SCHEMA }, 1);
+    }
     // A fresh capture deterministically writes this artifact from bench_e2e.sh.
     // Keep the agent return as the preferred path, but do not discard a valid
     // capture merely because the agent timed out or omitted the path field.
@@ -3122,196 +3143,50 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
       semantics = { status: 'failed', notes: 'fusion capture produced no usable trace manifest' };
     }
 
-    if (semantics && semantics.status === 'pass' && semantics.semantic_table_json) {
-      fusionFailureStage = 'discovery';
-      const discover = await safeAgent(
-        roleAgent('kernel_fusion_analyst', 'generate_plans',
-          'Generate and deterministically validate the complete run-local fusion inventory. If EXEC_PREFIX is set, use it as the literal command prefix.', {
+    // A partial table still carries every phase it resolved (e.g. prefill complete,
+    // decode boundaries missing). Screen what exists and say which phases are blind,
+    // instead of dropping the whole fusion track.
+    const semanticsUsable = semantics && semantics.semantic_table_json &&
+      (semantics.status === 'pass' || semantics.status === 'partial');
+    if (semanticsUsable && semantics.status === 'partial') {
+      log('KernelFusion: semantic table is partial; screening the phases it resolved. ' +
+          'Chains in unresolved phases cannot be discovered this round (see 01_SEMANTIC.md).');
+    }
+    if (semanticsUsable) {
+      // Policy after the captured trace has been turned into a kernel table:
+      // screen chains, rank by estimated time saved, then two Score passes
+      // merged into the final Top-K.
+      fusionFailureStage = 'screen';
+      const screened = await safeAgent(
+        roleAgent('kernel_fusion_analyst', 'screen',
+          'Run scripts/fusion_screen.py and return its JSON unchanged. Do not invent or rerank candidates. If EXEC_PREFIX is set, use it as the literal command prefix.', {
             EVAL_DIR, MODEL_NAME, MODEL_PATH, ROUND: fusionRound,
             SEMANTIC_TABLE_JSON: semantics.semantic_table_json,
-            STRUCTURAL_PATTERNS_JSON: semantics.structural_patterns_json || '',
-            SEMANTIC_QUALITY_JSON: semantics.quality_json || '',
-            SEMANTICS_RUN_JSON: semantics.semantic_report_json || '',
-            PROFILE_ROOFLINE_JSON: `${EVAL_DIR}/profile/round_0/profile_roofline.json`,
-            RUNTIME_IMAGE, TP: SERVING_TP,
-            PERF_KNOWLEDGE_DIR: KERNEL_KNOWLEDGE_DIR, SKILL_DIR: WORKFLOW_DIR,
+            WORKLOAD_ISL: ISL, WORKLOAD_OSL: OSL, WORKLOAD_CONC: CONC,
+            TOP_K: FUSION_TOP_K,
+            PASSES: FUSION_SCREEN_PASSES,
+            GFX: String(A.gfx || 'gfx942'),
+            SKILL_DIR: WORKFLOW_DIR,
             ...FUSION_RUNTIME_INPUTS,
           }),
-        { phase: 'KernelFusion', label: 'fusion-analyst:generate', schema: FUSION_DISCOVER_SCHEMA }, 1);
-      if (discover && discover.status !== 'failed' &&
-          discover.fusion_candidates_json && discover.validation_json) {
-        FUSION_INPUTS.FUSION_CANDIDATES_JSON = discover.fusion_candidates_json;
-        FUSION_INPUTS.FUSION_VALIDATION_JSON = discover.validation_json;
-        fusionFailureStage = 'rank';
-        const ranked = await safeAgent(
-          roleAgent('kernel_fusion_analyst', 'rank_topk',
-            'Run the deterministic Top-K ranker and return both the board path and concrete execution_list. If EXEC_PREFIX is set, use it as the literal command prefix.', {
-              EVAL_DIR, ROUND: fusionRound,
-              FUSION_DIR: discover.fusion_candidates_json.replace(/\/[^/]+$/, ''),
-              FUSION_CANDIDATES_JSON: discover.fusion_candidates_json,
-              FUSION_VALIDATION_JSON: discover.validation_json,
-              SEMANTIC_TABLE_JSON: semantics.semantic_table_json,
-              TOP_K: FUSION_TOP_K,
-              WORKLOAD_ISL: ISL, WORKLOAD_OSL: OSL, WORKLOAD_CONC: CONC,
-              SKILL_DIR: WORKFLOW_DIR,
-              ...FUSION_RUNTIME_INPUTS,
-            }),
-          { phase: 'KernelFusion', label: 'fusion-analyst:rank', schema: FUSION_RANK_SCHEMA }, 1);
-        if (ranked && ranked.status !== 'failed' && ranked.fusion_topk_json) {
-          FUSION_INPUTS.FUSION_TOPK_JSON = ranked.fusion_topk_json;
-          fusionExecutionList = Array.isArray(ranked.execution_list)
-            ? ranked.execution_list.slice() : [];
-          fusionFailureStage = 'unit_validation';
-          // ---- unit-side scheduling: spend the budget on LADDER TOPS ------
-          // The budget is a microbench-run count, and it used to be spent in
-          // flat board order. On DSR1 2026-09-03 that meant e01 (AR+norm, 4
-          // candidates) and e02 (AR+norm+quant, 4 candidates) consumed 8 of
-          // the 10 slots proving overlapping halves of ONE ladder, and e04 --
-          // the oproj flatten-quant fusion carrying a ★★★ prior with two
-          // previously MEASURED e2e confirms -- never got a slot. The ranker
-          // now marks each row's ladder position, so a row whose removable
-          // rows are a strict subset of another surviving row waits: the top's
-          // microbench already exercises every row the subset would remove.
-          // A subsumed rung is released back into the queue if its top FAILS
-          // unit-side -- the top's PASS is what covers it, not its existence.
-          const execById = new Map();
-          for (const entry of (ranked.execution_list || [])) execById.set(entry.exec_id, entry);
-          const heldByTop = new Map();   // ladder_top exec_id -> [subsumed entries]
-          const tops = [];
-          for (const entry of (ranked.execution_list || [])) {
-            const top = entry.ladder_top || entry.subsumed_by || null;
-            if (top && execById.has(top)) {
-              if (!heldByTop.has(top)) heldByTop.set(top, []);
-              heldByTop.get(top).push(entry);
-            } else {
-              tops.push(entry);
-            }
-          }
-          const seenUnitCandidates = new Set();
-          // One recipe/cohort is one unit-side combination.  Measure its
-          // deterministic representative once; sibling occurrences are kept in
-          // the denominator and inherit that representative's auditable result.
-          const expand = (entry) => {
-            const cid = entry.unit_representative_candidate_id ||
-              (entry.candidate_ids || [])[0];
-            return cid && !seenUnitCandidates.has(cid)
-              ? [{ exec_id: entry.exec_id, candidate_id: cid }]
-              : [];
-          };
-          const queue = [];
-          for (const entry of tops) queue.push(entry);
-          const subsumedCovered = [];
-          const equivalentCovered = [];
-          const budgetSkipped = [];
-          let spent = 0;
-          // Advisory pass test, for ROUTING only: the authoritative pass/fail
-          // is the harness gate below. A missing or failed agent result counts
-          // as not-passed, which releases the held rungs -- the safe direction.
-          const unitPassed = (r) => !!(r && r.status !== 'failed' &&
-            String(r.parity || '').toLowerCase() === 'pass' &&
-            Number(r.isolated_speedup) > 1);
-          while (queue.length) {
-            const entry = queue.shift();
-            let anyPass = false;
-            let representativeBudgetSkipped = false;
-            for (const item of expand(entry)) {
-              if (spent >= FUSION_UNITSIDE_BUDGET) {
-                seenUnitCandidates.add(item.candidate_id);
-                representativeBudgetSkipped = true;
-                budgetSkipped.push({ ...item,
-                  reason: `unit-side budget ${FUSION_UNITSIDE_BUDGET} exhausted; NEVER MEASURED (not a waiver)` });
-                continue;
-              }
-              seenUnitCandidates.add(item.candidate_id);
-              spent += 1;
-              const r = await safeAgent(
-                roleAgent('fusion_unit_validator', 'validate_one',
-                  'Validate exactly this one concrete Top-K candidate; never substitute another candidate.', {
-                    EVAL_DIR, MODEL_PATH, GPU_IDS, TP: SERVING_TP,
-                    FUSION_CANDIDATES_JSON: discover.fusion_candidates_json,
-                    FUSION_TOPK_JSON: ranked.fusion_topk_json,
-                    EXEC_ID: item.exec_id, CANDIDATE_ID: item.candidate_id,
-                    IMAGE: RUNTIME_IMAGE, SKILL_DIR: WORKFLOW_DIR,
-                    ...FUSION_RUNTIME_INPUTS,
-                  }),
-                { phase: 'KernelFusion', label: `fusion-unit:${item.candidate_id}`, schema: FUSION_UNIT_SCHEMA }, 1);
-              if (unitPassed(r)) anyPass = true;
-            }
-            if (representativeBudgetSkipped) {
-              for (const cid of (entry.unit_equivalent_candidate_ids || [])) {
-                if (seenUnitCandidates.has(cid)) continue;
-                seenUnitCandidates.add(cid);
-                budgetSkipped.push({ exec_id: entry.exec_id, candidate_id: cid,
-                  reason: `representative unit-side test was skipped after budget ${FUSION_UNITSIDE_BUDGET} was exhausted` });
-              }
-            }
-            const held = heldByTop.get(entry.exec_id) || [];
-            if (!representativeBudgetSkipped) {
-              const representative = entry.unit_representative_candidate_id ||
-                (entry.candidate_ids || [])[0];
-              for (const cid of (entry.unit_equivalent_candidate_ids || [])) {
-                if (seenUnitCandidates.has(cid)) continue;
-                seenUnitCandidates.add(cid);
-                equivalentCovered.push({ exec_id: entry.exec_id,
-                  candidate_id: cid, representative_candidate_id: representative });
-              }
-            }
-            if (anyPass) {
-              for (const child of held) {
-                for (const cid of (child.candidate_ids || [])) {
-                  if (seenUnitCandidates.has(cid)) continue;
-                  seenUnitCandidates.add(cid);
-                  subsumedCovered.push({ exec_id: child.exec_id, candidate_id: cid,
-                    ladder_top: entry.exec_id });
-                }
-              }
-              if (held.length) {
-                log(`KernelFusion unit-side: ${entry.exec_id} passed; ${held.length} subsumed rung(s) covered without their own slot.`);
-              }
-            } else if (held.length) {
-              log(`KernelFusion unit-side: ${entry.exec_id} did NOT pass; releasing ${held.length} subsumed rung(s) to their own slot.`);
-              for (const child of held) queue.unshift(child);
-            }
-          }
-          const deferred = budgetSkipped.map(item => ({ ...item, disposition: 'budget_skipped' }));
-          fusionFailureStage = 'unit_aggregate';
-          const aggregate = await safeAgent(
-            roleAgent('fusion_unit_validator', 'aggregate',
-              'Aggregate only the Top-K execution_list candidate ids. Pass EQUIVALENT_COVERED rows as ' +
-              '--equivalent <id>=<representative_candidate_id> and SUBSUMED_COVERED rows as ' +
-              '--subsumed <id>=<ladder_top> (covered: their ladder top was benched and passed) and BUDGET_SKIPPED rows as ' +
-              '--budget-skipped <id>=<reason> (NOT covered — never measured). Do NOT launder a budget skip through --waive.', {
-                EVAL_DIR, FUSION_CANDIDATES_JSON: discover.fusion_candidates_json,
-                FUSION_TOPK_JSON: ranked.fusion_topk_json,
-                FUSION_DIR: discover.fusion_candidates_json.replace(/\/[^/]+$/, ''),
-                FUSION_UNITSIDE_BUDGET, DEFERRED_EXECUTIONS: deferred,
-                EQUIVALENT_COVERED: equivalentCovered,
-                SUBSUMED_COVERED: subsumedCovered, BUDGET_SKIPPED: budgetSkipped,
-                SKILL_DIR: WORKFLOW_DIR, ...FUSION_RUNTIME_INPUTS,
-              }),
-            { phase: 'KernelFusion', label: 'fusion-unit:aggregate', schema: FUSION_UNIT_AGG_SCHEMA }, 1);
-          // Preserve partial/failed aggregate artifacts too. Individual verdicts
-          // retain their own pass/fail status; apply-back applies only proven
-          // passes and explicitly disposes the rest. Dropping this path discarded
-          // valid wins and silently skipped the entire apply-back phase.
-          if (aggregate && aggregate.fusion_unitside_json) {
-            FUSION_INPUTS.FUSION_UNITSIDE_JSON = aggregate.fusion_unitside_json;
-          }
-        }
+        { phase: 'KernelFusion', label: 'fusion-screen', schema: FUSION_RANK_SCHEMA }, 1);
+      if (screened && screened.status !== 'failed' && screened.fusion_topk_json) {
+        FUSION_INPUTS.FUSION_CANDIDATES_JSON = screened.fusion_candidates_json || '';
+        FUSION_INPUTS.FUSION_TOPK_JSON = screened.fusion_topk_json;
+        fusionExecutionList = Array.isArray(screened.execution_list)
+          ? screened.execution_list.slice() : [];
+        log(`KernelFusion screen: ${fusionExecutionList.length} final candidate(s); applying all of them.`);
       }
     }
   }
 
-  // Apply-back is best-effort. A discovery/validation failure leaves the inputs
-  // empty and simply falls through to the unconditional formal Profile. Run one
-  // execution-list entry (including its degrade ladder) per agent call so a later
-  // failure cannot erase terminal results already returned by earlier calls.
+  // Apply-back is best-effort. A screen failure leaves the inputs empty and
+  // falls through to the formal Profile.
   let fapply = null;
   let fusionApplyFailedExec = '';
   let fusionApplyUnprocessed = [];
-  if (FUSION_INPUTS.FUSION_TOPK_JSON && FUSION_INPUTS.FUSION_UNITSIDE_JSON) {
-    const FUSION_BUDGET = parseInt(A.fusion_budget != null ? A.fusion_budget : 6, 10);
-    const fusionApplyEntries = fusionExecutionList.slice(0, Math.max(0, FUSION_BUDGET));
+  if (FUSION_INPUTS.FUSION_TOPK_JSON && fusionExecutionList.length) {
+    const fusionApplyEntries = fusionExecutionList.slice();
     let applyState = {
       accepted_fusions: [], final_overlay: curOverlay,
       e2e_throughput_tok_s: curTput, accepted_flags: curFlags, accepted_env: curEnv,
@@ -3343,8 +3218,8 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
       (applyState.accepted_fusions || []).concat(applyState.rejected || [], applyState.deferred || [])
         .map(rowKey).filter(Boolean));
 
-    log(`KernelFusion apply-back: ${fusionApplyEntries.length} execution-list entry/ladder call(s), ` +
-        `budget ${FUSION_BUDGET}; terminal results are committed after each call.`);
+    log(`KernelFusion apply-back: ${fusionApplyEntries.length} chain(s); ` +
+        'terminal results are committed after each call, then Profile re-measures.');
     for (let applyIndex = 0; applyIndex < fusionApplyEntries.length; applyIndex++) {
       const applyEntry = fusionApplyEntries[applyIndex];
       if (!applyEntry || !applyEntry.exec_id || dispositionIds().has(String(applyEntry.exec_id))) continue;
@@ -3352,15 +3227,14 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
       const acceptedBefore = new Set((applyState.accepted_fusions || []).map(rowKey).filter(Boolean));
       const step = await safeAgent(
         roleAgent('fusion_integrator', 'apply_one',
-          'Apply exactly TARGET_EXEC_ID and its declared degrade ladder; do not loop unrelated execution-list entries. ' +
-          'Read FUSION_TOPK_JSON and FUSION_UNITSIDE_JSON, and act only when the selected tier-A/B row has ' +
-          'unit_side_status pass/equivalent_pass/subsumed_pass. Start from CURRENT_OVERLAY/FLAGS/ENV/THROUGHPUT, ' +
-          'which already include earlier terminal wins. For the selected ladder, author a reversible lazy-load overlay, ' +
-          'prove ENGAGED on every TP rank, run the interleaved serving A/B and required accuracy gate, and descend its ' +
-          'declared ladder only when the wider rung fails. Preserve PRIOR_APPLY_RESULT dispositions verbatim and merge ' +
-          'only this call\'s terminal result into it. Write the full aggregate apply_result.json, run ' +
-          'fusion_applyback_harness.py with --allow-partial-coverage (later calls still have legitimate unprocessed rows), ' +
-          'and return the full aggregate FUSION_APPLY_SCHEMA. Curate knowledge only for a fusion newly accepted by this call.', {
+          'Apply exactly TARGET_EXEC_ID from the fusion_screen board. ' +
+          'Always author a fused kernel for this chain. If TARGET_EXECUTION.compare_existing, also wire the ' +
+          'existing fusion kernel, compare both, and keep whichever is better. ' +
+          'Every implementation needs its own unit test against the unfused reference: it must pass accuracy ' +
+          'and show a unit-side speedup before e2e. Then gate on the interleaved serving A/B (performance) ' +
+          'and the accuracy check (e2e accuracy); both must pass to accept. ' +
+          'Start from CURRENT_OVERLAY/FLAGS/ENV/THROUGHPUT. Only work on this chain; the workflow calls you once per Top-K entry. ' +
+          'Preserve PRIOR_APPLY_RESULT and return FUSION_APPLY_SCHEMA.', {
             EVAL_DIR, MODEL_PATH, SERVING_GPU, TP: SERVING_TP, WORKLOAD,
             TARGET_EXEC_ID: applyEntry.exec_id, TARGET_EXECUTION: applyEntry,
             PRIOR_APPLY_RESULT: applyState,
@@ -3369,7 +3243,7 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
             FUSION_UNITSIDE_JSON: FUSION_INPUTS.FUSION_UNITSIDE_JSON,
             CURRENT_OVERLAY: curOverlay, CURRENT_FLAGS: curFlags, CURRENT_ENV: curEnv,
             CURRENT_THROUGHPUT: curTput, BASELINE_THROUGHPUT: BASELINE_TPUT,
-            NOISE_BAND_PCT: NOISE_BAND, E2E_REPEATS, FUSION_BUDGET,
+            NOISE_BAND_PCT: NOISE_BAND, E2E_REPEATS, FUSION_BUDGET: fusionApplyEntries.length,
             FUSION_OVERLAYS_DIR: `${EVAL_DIR}/fusion/fusion_overlays`,
             ...ACCURACY_INPUTS, ...FUSION_RUNTIME_INPUTS, SKILL_DIR: WORKFLOW_DIR,
           }),
@@ -3424,6 +3298,69 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
       fusionRecoveryState.acceptedFusionCount = acceptedFusions.length;
       fusionRecoveryState.inputs = { ...FUSION_INPUTS };
       fusionRecoveryState.applyResult = fapply;
+    }
+
+    // Stacked re-gate. A fusion that passed its unit gates and engaged in serving but
+    // whose single A/B sat inside the noise band comes back rejected with
+    // stack_pending. Alone it cannot clear cand_min > ref_max; together they may.
+    // One call gates the stack and returns the aggregate like apply_one.
+    const stackPending = fapply && !fusionApplyFailedExec
+      ? (applyState.rejected || []).filter((r) => r && r.stack_pending && r.overlay_path) : [];
+    if (stackPending.length >= 2) {
+      fusionFailureStage = 'apply_stack';
+      log(`KernelFusion stacked re-gate: ${stackPending.length} in-noise fusion(s) ` +
+          `[${stackPending.map(rowKey).join(', ')}] gated together.`);
+      const stacked = await safeAgent(
+        roleAgent('fusion_integrator', 'apply_stack',
+          'Stack every STACK_ENTRIES overlay onto CURRENT_OVERLAY and gate the stack once with the same ' +
+          'interleaved serving A/B and e2e accuracy check. On failure drop the smallest-delta entry and ' +
+          're-gate, down to two entries. Preserve PRIOR_APPLY_RESULT and return FUSION_APPLY_SCHEMA.', {
+            EVAL_DIR, MODEL_PATH, SERVING_GPU, TP: SERVING_TP, WORKLOAD,
+            STACK_ENTRIES: stackPending, PRIOR_APPLY_RESULT: applyState,
+            FUSION_TOPK_JSON: FUSION_INPUTS.FUSION_TOPK_JSON,
+            CURRENT_OVERLAY: curOverlay, CURRENT_FLAGS: curFlags, CURRENT_ENV: curEnv,
+            CURRENT_THROUGHPUT: curTput, BASELINE_THROUGHPUT: BASELINE_TPUT,
+            NOISE_BAND_PCT: NOISE_BAND, E2E_REPEATS,
+            FUSION_OVERLAYS_DIR: `${EVAL_DIR}/fusion/fusion_overlays`,
+            ...ACCURACY_INPUTS, ...FUSION_RUNTIME_INPUTS, SKILL_DIR: WORKFLOW_DIR,
+          }),
+        { phase: 'KernelFusion', label: 'fusion_integrator:apply_stack',
+          schema: FUSION_APPLY_SCHEMA, timeoutMs: FUSION_APPLY_TIMEOUT_MS }, 1);
+      if (stacked) {
+        const acceptedBefore = new Set((applyState.accepted_fusions || []).map(rowKey).filter(Boolean));
+        const mergedAccepted = mergeRows(applyState.accepted_fusions, stacked.accepted_fusions);
+        const acceptedIds = new Set(mergedAccepted.map(rowKey).filter(Boolean));
+        applyState = {
+          ...applyState, ...stacked,
+          accepted_fusions: mergedAccepted,
+          rejected: mergeRows(applyState.rejected, stacked.rejected)
+            .filter((r) => !acceptedIds.has(rowKey(r))),
+          deferred: mergeRows(applyState.deferred, stacked.deferred)
+            .filter((r) => !acceptedIds.has(rowKey(r))),
+          learned_cards: mergeCards(applyState.learned_cards, stacked.learned_cards),
+        };
+        fapply = applyState;
+        const newlyAccepted = mergedAccepted.filter((r) => !acceptedBefore.has(rowKey(r)));
+        if (newlyAccepted.length) {
+          curOverlay = stacked.final_overlay || curOverlay;
+          curFlags = stacked.accepted_flags || curFlags;
+          curEnv = stacked.accepted_env || curEnv;
+          if (stacked.e2e_throughput_tok_s && stacked.e2e_throughput_tok_s > curTput) {
+            curTput = stacked.e2e_throughput_tok_s;
+          }
+          for (const accepted of newlyAccepted) acceptedFusions.push(accepted);
+          log(`KernelFusion stacked re-gate: committed ${newlyAccepted.length} fusion(s); ` +
+              `e2e now ${curTput} tok/s.`);
+        }
+        fusionRecoveryState.overlay = curOverlay;
+        fusionRecoveryState.flags = curFlags;
+        fusionRecoveryState.env = curEnv;
+        fusionRecoveryState.throughput = curTput;
+        fusionRecoveryState.acceptedFusionCount = acceptedFusions.length;
+        fusionRecoveryState.applyResult = fapply;
+      } else {
+        log('KernelFusion stacked re-gate returned no terminal result; single-entry dispositions stand.');
+      }
     }
   // KernelFusion is an optional optimization track. If apply-back fails to return a
   // terminal result, preserve the exact pre-Fusion runtime state and continue with the
@@ -3489,11 +3426,11 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
     log(`KernelFusion: no fusion accepted (${fapply ? (fapply.notes || 'none passed the gate') : 'agent null/degraded'}).`);
   }
   } else {
-    log('KernelFusion discovery/validation produced no apply-back-ready Top-K; degrading to formal Profile.');
+    log('KernelFusion screen produced no apply-back-ready Top-K; degrading to formal Profile.');
     if (FUSION_REQUIRED) {
       const requiredFailureStage = (!semantics || semantics.status !== 'pass')
         ? 'semantic'
-        : (!FUSION_INPUTS.FUSION_TOPK_JSON ? 'discovery' : 'unit_validation');
+        : 'screen';
       const requiredFailure =
         'KernelFusion was explicitly required but produced no apply-back-ready Top-K. ' +
         `Expected deterministic capture manifest: ${EVAL_DIR}/fusion_capture/profile_trace_manifest.json`;
@@ -3515,7 +3452,6 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON) {
     if (fusionApplyFailedExec) fusionStatus = appliedN > 0 ? 'applyback_partial_failure' : 'applyback_failed';
     else if (appliedN > 0) fusionStatus = 'applied';
     else if (!FUSION_INPUTS.FUSION_TOPK_JSON) fusionStatus = 'discovery_failed';
-    else if (!FUSION_INPUTS.FUSION_UNITSIDE_JSON) fusionStatus = 'validation_failed';
     else if (!fapply) fusionStatus = 'applyback_failed';
     const fusionDeltaPct = fusionEntryTput > 0
       ? Number((((curTput - fusionEntryTput) / fusionEntryTput) * 100).toFixed(3)) : 0;

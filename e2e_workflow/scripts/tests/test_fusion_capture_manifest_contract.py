@@ -184,12 +184,17 @@ class FusionCaptureManifestContractTest(unittest.TestCase):
         self.assertIn("WORKLOAD_OSL: OSL", rank_block)
         self.assertIn("WORKLOAD_CONC: CONC", rank_block)
 
-    def test_partial_semantics_cannot_enter_fusion_discovery(self):
+    def test_partial_semantics_screens_only_resolved_phases(self):
+        # A partial table (e.g. decode boundaries missing) still screens the phases
+        # it resolved and logs the blind ones; a failed or table-less result does not.
         source = self._workflow_source()
         self.assertIn(
-            "if (semantics && semantics.status === 'pass' && semantics.semantic_table_json)",
+            "const semanticsUsable = semantics && semantics.semantic_table_json &&\n"
+            "      (semantics.status === 'pass' || semantics.status === 'partial');",
             source,
         )
+        self.assertIn("if (semanticsUsable) {", source)
+        self.assertIn("semantic table is partial; screening the phases it resolved", source)
 
     def test_topk_execution_list_drives_exact_unitside_candidates(self):
         """Every unit-side call must be named by Top-K exec/candidate ids."""

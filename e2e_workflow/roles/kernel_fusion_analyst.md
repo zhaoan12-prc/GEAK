@@ -48,6 +48,36 @@ If a required artifact is absent or unreadable, return `status=failed`. If
 Semantics quality is useful but degraded, continue with `status=partial` and
 make the degradation explicit per candidate.
 
+## PHASE=screen
+
+Run the deterministic screen. Do not invent chains, ranks, or speedups.
+
+```bash
+mkdir -p "$EVAL_DIR/fusion_capture/fusion"
+python3 "$SKILL_DIR/scripts/fusion_catalog.py" \
+  --out "$EVAL_DIR/fusion_capture/fusion/available_fusion_kernels.json" || true
+python3 "$SKILL_DIR/scripts/fusion_screen.py" \
+  --semantic-table "$SEMANTIC_TABLE_JSON" \
+  --catalog "$EVAL_DIR/fusion_capture/fusion/available_fusion_kernels.json" \
+  --out-dir "$EVAL_DIR/fusion_capture/fusion" \
+  --gfx "${GFX:-gfx942}" \
+  --top-k "$TOP_K" \
+  --passes "${PASSES:-2}" \
+  --isl "${WORKLOAD_ISL:-}" --osl "${WORKLOAD_OSL:-}" --conc "${WORKLOAD_CONC:-}" \
+  --md "$EVAL_DIR/03_FUSION_TOPK.md"
+```
+
+Return the script's JSON as StructuredOutput: `status`, `fusion_candidates_json`, `fusion_topk_json`, `fusion_topk_md`, `execution_list`, `candidate_count`. Copy `execution_list` from the printed JSON. Do not rerank it.
+
+`fusion_candidates.json` is the initial board (every chain that passed the gates, ordered by estimated time saved). `fusion_topk.json` is the final board, K=8. Each pass ranks by Score = time saved / difficulty (decode time saved for a decode chain, otherwise the chain's own saving). The passes are merged: chains in both passes come first, then smaller rank sum, with a missing pass counted as K+1; overlapping chains keep the better merged rank, and every shorter sub-chain is its own candidate. Difficulty is 1.0 for a chain with an existing fusion kernel, otherwise the hardest compute member: elementwise/quant/cast/RoPE/act_and_mul 1.3, norm 1.5, layout/KV-cache write 1.8, topk/sort/gather 2.2, collective/large GEMM/attention 5. Every entry in `execution_list` is optimized.
+
+What the screen enforces (read `03_FUSION_TOPK.md` to explain a board, never to override it):
+
+- Barriers. Attention, collectives and GEMMs never sit inside a chain; at a chain end only when a catalog kernel covers the whole chain (e.g. quant→GEMM prologue). Pure copies (`direct_copy`, contiguous) are timed but not classified or counted.
+- Existing kernel. Chain members are tagged with `fusion_catalog.py`'s op vocabulary (norm, add_residual, quant, rope, kv_cache, activation, ...) and matched against the catalog's `op_tags`/`dtype_tags`. `matched_existing_kernels` lists every covering kernel (aiter first, tightest first); a covered chain may grow to 5 compute kernels so it can reach the kernel's boundary (q_norm+k_norm+RoPE → +KV write).
+- Time gate. ≥3% of the step, ≥1% with an existing kernel. With the workload, the same seam in prefill and decode is gated on its combined request-level share and returned as one entry (`phases`, `partner_row_ids`).
+- Report sections. "Already fused in the baseline" lists trace kernels that already are a catalog fused kernel; `still in candidates` means a separate kernel still follows it (e.g. add_rmsnorm_quant followed by its own group quant). "Below the time gate" lists near misses with the threshold they missed.
+
 ## PHASE=generate_plans
 
 ### 1. Establish the evidence boundary

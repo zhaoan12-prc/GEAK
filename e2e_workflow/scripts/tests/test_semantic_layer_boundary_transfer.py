@@ -62,11 +62,11 @@ class SemanticLayerBoundaryTransferTest(unittest.TestCase):
             json.dump({"traceEvents": events}, fh)
         return path
 
-    def _recipient(self, root, body=None):
+    def _recipient(self, root, body=None, bs=4):
         body = body or ["layer0_a", "layer0_b", "layer1_a", "layer1_b"]
         names = ["prepare_once"] + body + ["model_epilogue"]
         events = [{
-            "cat": "gpu_user_annotation", "name": "step[DECODE bs=4]",
+            "cat": "gpu_user_annotation", "name": "step[DECODE bs=%d]" % bs,
             "ts": 0, "dur": 200,
         }]
         events.extend({
@@ -107,6 +107,30 @@ class SemanticLayerBoundaryTransferTest(unittest.TestCase):
                 row["layer_evidence"].startswith(
                     "validated_graph_capture_layer_scope")
                 for row in rows[1:5]))
+
+    def test_eager_decode_above_graph_bs_uses_other_decode_donor(self):
+        # Graph markers exist only for captured sizes (bs<=4); an eager bs=8 decode
+        # step with the same per-layer kernel order still gets validated cuts.
+        with tempfile.TemporaryDirectory() as tmp:
+            result = transfer.transfer(
+                self._donor(tmp), self._recipient(tmp, bs=8), self._patterns(tmp))
+            self.assertEqual(result["status"], "pass")
+            group = result["mapped_groups"][0]
+            self.assertEqual(group["batch_size"], 8)
+            self.assertEqual(group["donor"]["batch_size"], 4)
+            self.assertTrue(group["donor_batch_size_fallback"])
+            self.assertEqual(group["layer_start_positions"], [1, 3])
+
+    def test_decode_donor_fallback_still_requires_identical_sequence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = transfer.transfer(
+                self._donor(tmp),
+                self._recipient(tmp, body=["x", "y", "x", "y"], bs=8),
+                self._patterns(tmp))
+            self.assertEqual(result["status"], "fail")
+            failure = result["failures"][0]
+            self.assertEqual(failure["reason"], "no_validated_stable_projection")
+            self.assertTrue(failure["donor_batch_size_fallback"])
 
     def test_partial_donor_pass_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

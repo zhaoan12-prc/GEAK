@@ -519,6 +519,31 @@ def _stable_projection_map(sequence, donor, expected_layers):
 
 
 def _map_step(step_rows, donor_passes, expected_layers):
+    """Map one Clean Trace step, preferring donors from the same workload bucket.
+
+    Decode fallback: graph-construction markers exist only for captured CUDA-graph
+    batch sizes (<= --cuda-graph-max-bs), while a Clean Trace decode step above
+    that size runs eager. With no same-size donor, other decode donors are tried;
+    the per-layer kernel order does not depend on batch size, and the exact or
+    stable-projection check below still has to pass, so the rule stays fail-closed.
+    """
+    phase = _phase(step_rows[0].get("phase"))
+    batch_size = _integer(step_rows[0].get("step_batch_size"))
+    input_tokens = _integer(step_rows[0].get("step_input_tokens"))
+    same_bucket = any(
+        _bucket_matches(donor, phase, batch_size, input_tokens) for donor in donor_passes)
+    if same_bucket or phase != "decode":
+        return _map_step_with(step_rows, donor_passes, expected_layers, _bucket_matches)
+    mapping, failure = _map_step_with(
+        step_rows, donor_passes, expected_layers,
+        lambda donor, step_phase, *_: donor["phase"] == step_phase)
+    for item in (mapping, failure):
+        if item is not None:
+            item["donor_batch_size_fallback"] = True
+    return mapping, failure
+
+
+def _map_step_with(step_rows, donor_passes, expected_layers, bucket_matches):
     sequence = [
         _kernel_identity(row.get("raw_name"), row.get("event_type"))
         for row in step_rows]
@@ -529,7 +554,7 @@ def _map_step(step_rows, donor_passes, expected_layers):
     compatible_donors = []
     considered = 0
     for donor in donor_passes:
-        if not _bucket_matches(
+        if not bucket_matches(
                 donor, phase, batch_size, input_tokens):
             continue
         considered += 1

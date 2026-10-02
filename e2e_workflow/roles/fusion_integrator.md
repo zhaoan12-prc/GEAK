@@ -122,7 +122,30 @@ control with 100s of MB of trace/bench. Return StructuredOutput: `{fusion, accep
 engaged (bool), ttft_delta_pct, tpot_delta_pct, throughput_delta_pct, nonoverlap (bool),
 gsm8k_base, gsm8k_cand, reprofile_ok, overlay_path, skipped_branches, notes}`.
 
-## PHASE=apply_one — apply one execution-list entry/degrade ladder (called serially by KernelFusion)
+## PHASE=apply_one — apply one execution-list entry (called serially by KernelFusion)
+
+The board is `fusion_screen.py`, not the old unit-side ladder. There is no `FUSION_UNITSIDE_JSON` gate. The workflow applies every entry of the final Top-K, one call per entry; this call handles only `TARGET_EXEC_ID`.
+
+Always author a fused kernel for the chain. When `TARGET_EXECUTION.compare_existing` is true, also wire the existing fusion kernel, measure both against `TARGET_EXECUTION.estimated_speedup`, and keep whichever is better. When it is false, the self-authored kernel is the only side.
+
+Existing kernel first. `TARGET_EXECUTION.matched_existing_kernels` lists the catalog kernels that cover the chain (aiter first, tightest first). Wire and unit-test the first one that fits the captured shapes and dtypes before authoring; move down the list only when one cannot be wired, and record why. A server flag that gates the same fusion to another platform or model family (for example a CUDA-only or MoE-only `--enable-fused-qk-norm-rope`) is not evidence that no kernel exists: call the catalog kernel at the seam directly. If the list is non-empty, a disposition of "no existing kernel applies" must name each listed kernel and the concrete reason it does not fit.
+
+Both phases. When `TARGET_EXECUTION.phases` has prefill and decode, the entry is one seam that runs in both (`row_ids` in one phase, `partner_row_ids` in the other). Wire it once at the seam; the unit test covers both captured shapes; the serving A/B measures both.
+
+Stack pending. When a side passes both unit checks, is ENGAGED in serving, does not regress throughput or accuracy, but its A/B stays inside the noise band, return it in `rejected` with `stack_pending: true`, its `overlay_path`, `throughput_delta_pct`, `tpot_delta_pct` and the unit results. Do not leave it in `deferred`. The workflow gates all stack-pending entries together after the last `apply_one` (PHASE=apply_stack).
+
+Every implementation, existing or self-authored, needs its own unit test against the unfused reference chain at the captured shapes and dtypes:
+
+- Unit accuracy: output matches the reference within the dtype tolerance.
+- Unit performance: the fused kernel is faster than the reference chain. Record the measured unit speedup.
+
+A side that fails either unit check does not go to e2e. The surviving side(s) then go through the serving A/B:
+
+- E2E performance: interleaved A/B clears the noise band (`cand_min > ref_max`).
+- E2E accuracy: the gsm8k accuracy check passes.
+
+Accept only when both e2e checks pass. If both sides pass, keep the one with the higher e2e throughput. Record the unit test path, unit accuracy, unit speedup, e2e throughput delta and e2e accuracy for each side in the entry's notes.
+
 Inputs add `FUSION_TOPK_JSON`, `FUSION_CANDIDATES_JSON`, `FUSION_UNITSIDE_JSON`,
 `TARGET_EXEC_ID`, `TARGET_EXECUTION`, `PRIOR_APPLY_RESULT`,
 `CURRENT_OVERLAY/FLAGS/ENV/THROUGHPUT`, `FUSION_BUDGET`, `FUSION_OVERLAYS_DIR`, `ACCURACY_*`.
@@ -137,16 +160,7 @@ entry already present in `PRIOR_APPLY_RESULT.accepted_fusions`, do not launch a 
 return the unchanged aggregate after regenerating the report. The harness owns the derived
 `blocked_by_exclusion` classification.
 
-1. Read `FUSION_TOPK_JSON` + `FUSION_UNITSIDE_JSON`; locate `TARGET_EXEC_ID`. It is eligible when its `unit_side_status` is in
-   {`pass`, `equivalent_pass`, `subsumed_pass`} **tier-A or tier-B** candidates
-   (tier-C is author work; count it into `deferred_author_count`).
-   `equivalent_pass` means the same recipe/cohort passed once on this execution
-   row's declared representative. `subsumed_pass` means the rung's ladder top
-   was benched and passed and that microbench covered this rung's rows — it is a pass,
-   not a gap. `budget_skipped` / `not_validated` are NOT eligible: they were never
-   measured, and they must be returned in `deferred[]` saying exactly that, never as
-   "not a win". The orchestrator preserves Top-K `execution_list` order and applies
-   `FUSION_BUDGET`; do not select a different entry.
+1. Read `FUSION_TOPK_JSON` and locate `TARGET_EXEC_ID` in `execution_list`. It is eligible because it already passed `fusion_screen.py`. Do not drop it for a missing unit-side status. `FUSION_UNITSIDE_JSON` may be empty. Apply only `TARGET_EXEC_ID`; do not select a different entry.
    Tier-A belongs here, not ConfigSweep: apply its one flag/env,
    run serving A/B, verify the fused kernel/route engagement, and keep or revert it
    before returning.
@@ -184,6 +198,26 @@ accepted tier-A changes. They must retain every incoming `CURRENT_FLAGS` and
 target chain under the same dtype/backend/config. Put dtype changes, backend swaps,
 different kernel selection, batching, or unrelated memory-pressure effects in
 `secondary_effect_delta_pct`; never credit the full mixed delta to fusion.
+
+## PHASE=apply_stack — gate the in-noise fusions together (called once, after the last apply_one)
+
+Inputs are the apply_one inputs plus `STACK_ENTRIES`: the `rejected` rows that carry
+`stack_pending: true`. Each already passed unit accuracy and unit speedup and was
+ENGAGED in serving; only its single A/B sat inside the noise band.
+
+1. Stack every entry's `overlay_path` onto `CURRENT_OVERLAY` with one combined-loader and
+   verify every entry's `[overlay-…] ENGAGED` banner on all ranks.
+2. Gate the stack exactly like apply_one: interleaved A/B against `CURRENT_OVERLAY`
+   (`cand_min > ref_max` and above `NOISE_BAND_PCT`), then the gsm8k accuracy check.
+3. On failure, drop the entry with the smallest single-entry `throughput_delta_pct` and
+   re-gate. Stop at two entries; one entry alone was already measured.
+4. Accepted entries go to `accepted_fusions` with `stacked_with` listing the other exec_ids,
+   `throughput_delta_pct` for the whole stack, and each entry's single-entry delta kept in
+   `single_delta_pct`. Entries that never pass stay in `rejected`: keep `stack_pending`
+   and add `stack_result` with the stacked A/B numbers.
+
+Return the full aggregate (`PRIOR_APPLY_RESULT` plus this call) in `FUSION_APPLY_SCHEMA`,
+with `final_overlay` pointing at the accepted combined-loader.
 
 ## 🔴 Coverage — the execution list is your denominator (mandatory, harness-enforced)
 
