@@ -21,7 +21,8 @@ export const meta = {
 // ---------------------------------------------------------------------------
 // Args + defaults. A JS workflow can't read its own path, so workflow_dir is passed in.
 // ---------------------------------------------------------------------------
-const A = args || {};
+// The Workflow tool may hand a large args object over as a JSON-encoded string.
+const A = (typeof args === 'string') ? JSON.parse(args) : (args || {});
 const WORKFLOW_DIR = String(A.workflow_dir || '').replace(/\/+$/, '');
 if (!WORKFLOW_DIR) {
   throw new Error('args.workflow_dir is required: absolute path to the dir holding e2e_workflow.js, ' +
