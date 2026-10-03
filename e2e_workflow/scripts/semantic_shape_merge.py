@@ -443,20 +443,29 @@ def _kernel_trace_schema(trace_shape):
             continue
         dtype = raw.get("dtype") or (
             types[index] if index < len(types) else "Tensor")
-        tensors.append({
-            **operand,
-            "io": operand["direction"],
-            "tensor_path": "operator_args.%s" % schema_name,
-            "arg_name": schema_name,
-            "trace_arg_index": index,
-            "shape": list(shape),
-            "logger_shape": list(shape),
-            "effective_shape": list(shape),
-            "dtype": dtype,
-            "axes": [
-                _axis(value, "unresolved", "graph_capture_trace")
-                for value in shape],
-        })
+        # A TensorList operand's Input Dims entry is a list of shapes; emit
+        # one tensor per non-empty member, all under the same arg index.
+        if all(isinstance(value, list) for value in shape):
+            members = [
+                ("operator_args.%s[%d]" % (schema_name, position), member)
+                for position, member in enumerate(shape) if member]
+        else:
+            members = [("operator_args.%s" % schema_name, shape)]
+        for tensor_path, member in members:
+            tensors.append({
+                **operand,
+                "io": operand["direction"],
+                "tensor_path": tensor_path,
+                "arg_name": schema_name,
+                "trace_arg_index": index,
+                "shape": list(member),
+                "logger_shape": list(member),
+                "effective_shape": list(member),
+                "dtype": dtype,
+                "axes": [
+                    _axis(value, "unresolved", "graph_capture_trace")
+                    for value in member],
+            })
     return {
         "source": trace_shape.get(
             "source", "graph_capture_trace_external_id"),
