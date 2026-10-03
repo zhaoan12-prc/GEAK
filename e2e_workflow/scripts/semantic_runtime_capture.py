@@ -225,7 +225,14 @@ def install_graph_capture_profiler():
     try:
         import torch
         from torch.profiler import ProfilerActivity, profile
-        from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+        try:
+            from sglang.srt.model_executor.cuda_graph_runner import (
+                CudaGraphRunner)
+        except ImportError:
+            # Newer SGLang moved the decode graph runner; the two profile
+            # hooks keep the same names and signatures there.
+            from sglang.srt.model_executor.runner.decode_cuda_graph_runner \
+                import DecodeCudaGraphRunner as CudaGraphRunner
 
         def _init_profile_context_and_memory_record(self):
             if _distributed_rank() != int(os.environ.get(
