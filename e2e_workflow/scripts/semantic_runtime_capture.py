@@ -775,9 +775,82 @@ def _register_hooks(model):
             # tensor roles; fail explicitly instead of silently mislabelling.
             raise RuntimeError(
                 "runtime torch lacks kwargs-capable forward hooks")
+    layer_scope_count += _wrap_layer_entry_functions(model, logger)
     sys.stderr.write(
         "[GEAK_SEMANTICS] registered %d all-layer scopes and %d "
         "marker+metadata hooks\n" % (layer_scope_count, count))
+
+
+# Per-layer entries that bypass ``layer.forward``.  DeepSeek-V4.x with
+# ``hc_pre_from_prev_sublayer`` drives each layer through
+# ``layer.forward_hc_pre_from_prev(...)`` or, on ROCm with
+# ``hc_boundary_fused``, through the module-level
+# ``forward_hc_pre_from_prev_fused_boundary(layer, ...)``.  Extra names may be
+# given as ``GEAK_SEMANTICS_LAYER_ENTRY_METHODS`` / ``..._FUNCTIONS`` (csv).
+_LAYER_ENTRY_METHODS = ("forward_hc_pre_from_prev",)
+_LAYER_ENTRY_FUNCTIONS = ("forward_hc_pre_from_prev_fused_boundary",)
+
+
+def _csv_names(name, defaults):
+    extra = [item.strip() for item in os.environ.get(name, "").split(",")
+             if item.strip()]
+    return tuple(dict.fromkeys(list(defaults) + extra))
+
+
+def _wrap_layer_entry_functions(model, logger):
+    layer_paths = {}
+    for raw_path, module in model.named_modules():
+        path = _op_path(raw_path) if raw_path else ""
+        if path and _MAIN_LAYER_RE.search(path):
+            layer_paths[id(module)] = (module, _layer_id(path), path)
+    if not layer_paths:
+        return 0
+    wrapped = 0
+    for module, layer, path in layer_paths.values():
+        for name in _csv_names(
+                "GEAK_SEMANTICS_LAYER_ENTRY_METHODS", _LAYER_ENTRY_METHODS):
+            flag = "_geak_semantics_entry_wrapped_" + name
+            original = getattr(module, name, None)
+            if original is None or getattr(module, flag, False):
+                continue
+
+            @functools.wraps(original)
+            def scoped_method(*args, __fn=original, __layer=layer,
+                              __path=path, **kwargs):
+                with logger.layer_scope(__layer, __path):
+                    return __fn(*args, **kwargs)
+
+            setattr(module, name, scoped_method)
+            setattr(module, flag, True)
+            wrapped += 1
+    by_module = {id(m): (layer, path) for m, layer, path in layer_paths.values()}
+    for module_name in {type(model).__module__} | {
+            type(m).__module__ for m, _, _ in layer_paths.values()}:
+        namespace = sys.modules.get(module_name)
+        if namespace is None:
+            continue
+        for name in _csv_names(
+                "GEAK_SEMANTICS_LAYER_ENTRY_FUNCTIONS", _LAYER_ENTRY_FUNCTIONS):
+            original = getattr(namespace, name, None)
+            if original is None or getattr(
+                    original, "_geak_semantics_entry_wrapped", False):
+                continue
+
+            @functools.wraps(original)
+            def scoped_function(layer_module, *args, __fn=original, **kwargs):
+                owner = by_module.get(id(layer_module))
+                if owner is None:
+                    return __fn(layer_module, *args, **kwargs)
+                with logger.layer_scope(owner[0], owner[1]):
+                    return __fn(layer_module, *args, **kwargs)
+
+            scoped_function._geak_semantics_entry_wrapped = True
+            setattr(namespace, name, scoped_function)
+            wrapped += len(layer_paths)
+            sys.stderr.write(
+                "[GEAK_SEMANTICS] layer scope wrapped %s.%s\n" %
+                (module_name, name))
+    return wrapped
 
 
 def install_on_model(model):
