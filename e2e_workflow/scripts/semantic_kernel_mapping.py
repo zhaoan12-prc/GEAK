@@ -1491,6 +1491,95 @@ def _trace_pattern_consistency(instances):
     }
 
 
+def _step_audit(diagnostic, step_instances):
+    """Whether one step holds complete, ordered, non-overlapping layer passes."""
+    step_instances = sorted(
+        step_instances, key=lambda item: item["first_device_seq_index"])
+    layer_count = diagnostic["configured_layer_count"]
+    pass_count = int(diagnostic.get("mapped_pass_count", 1) or 1)
+    expected_order = list(range(layer_count)) * pass_count
+    actual_order = [item["layer_id"] for item in step_instances]
+    non_overlapping = all(
+        left["last_device_seq_index"] < right["first_device_seq_index"]
+        for left, right in zip(step_instances, step_instances[1:]))
+    return {
+        "step_id": diagnostic["step_id"],
+        "expected_instance_count": len(expected_order),
+        "actual_instance_count": len(step_instances),
+        "layer_order_valid": actual_order == expected_order,
+        "non_overlapping": non_overlapping,
+        "boundary_source_status": diagnostic.get("status"),
+        "status": "pass" if (
+            diagnostic.get("status") == "mapped"
+            and actual_order == expected_order
+            and non_overlapping) else "fail",
+    }
+
+
+def _select_analysis_windows(rows, instances, partition_diagnostics):
+    """Keep one complete step per phase as that phase's analysis window.
+
+    A capture window may hold several steps of one phase, and not every step
+    is guaranteed to carry complete layer passes. Each phase is analysed on
+    one step that passes the same per-step audit `_quality` applies: the
+    prefill step with the most input tokens, any other phase's step with the
+    largest batch, the latest step on a tie. Other steps of that phase leave
+    the tables and the gates but stay in the audit files. A phase with no
+    complete step keeps every step, so its gates fail as before.
+
+    Returns (selection audit, step ids left out of the analysis window).
+    """
+    instances_by_step = {}
+    for instance in instances:
+        instances_by_step.setdefault(instance.get("step_id"), []).append(instance)
+    step_info = {}
+    for row in rows:
+        step_id = row.get("step_id")
+        if not step_id:
+            continue
+        info = step_info.setdefault(step_id, {
+            "phase": row["phase"],
+            "input_tokens": row.get("step_input_tokens"),
+            "batch_size": row.get("step_batch_size"),
+            "first_device_seq_index": row["device_seq_index"],
+        })
+        info["first_device_seq_index"] = min(
+            info["first_device_seq_index"], row["device_seq_index"])
+    by_phase = {}
+    for diagnostic in partition_diagnostics:
+        info = step_info.get(diagnostic["step_id"])
+        if info is None:
+            continue
+        audit = _step_audit(
+            diagnostic, instances_by_step.get(diagnostic["step_id"], []))
+        by_phase.setdefault(info["phase"], []).append({
+            "step_id": diagnostic["step_id"],
+            "input_tokens": info["input_tokens"],
+            "batch_size": info["batch_size"],
+            "first_device_seq_index": info["first_device_seq_index"],
+            "complete": audit["status"] == "pass",
+        })
+    selection = {}
+    excluded = set()
+    for phase, candidates in sorted(by_phase.items()):
+        candidates.sort(key=lambda item: item["first_device_seq_index"])
+        size_key = "input_tokens" if phase == "prefill" else "batch_size"
+        complete = [item for item in candidates if item["complete"]]
+        chosen = max(complete, key=lambda item: (
+            item[size_key] or 0, item["first_device_seq_index"])) if complete else None
+        if chosen is not None:
+            excluded.update(item["step_id"] for item in candidates
+                            if item is not chosen)
+        selection[phase] = {
+            "selected_step_id": chosen["step_id"] if chosen else None,
+            "rule": ("largest %s among complete steps, latest on a tie" % size_key
+                     if chosen else
+                     "no complete step: every step stays in the gates"),
+            "candidates": candidates,
+        }
+    return selection, excluded
+
+
 def _quality(
         pattern_doc, rows, instances, representatives, spans, out_of_scope,
         partition_diagnostics, tables):
@@ -1507,30 +1596,9 @@ def _quality(
     instances_by_step = {}
     for instance in instances:
         instances_by_step.setdefault(instance.get("step_id"), []).append(instance)
-    step_audits = []
-    for diagnostic in partition_diagnostics:
-        step_instances = sorted(
-            instances_by_step.get(diagnostic["step_id"], []),
-            key=lambda item: item["first_device_seq_index"])
-        layer_count = diagnostic["configured_layer_count"]
-        pass_count = int(diagnostic.get("mapped_pass_count", 1) or 1)
-        expected_order = list(range(layer_count)) * pass_count
-        actual_order = [item["layer_id"] for item in step_instances]
-        non_overlapping = all(
-            left["last_device_seq_index"] < right["first_device_seq_index"]
-            for left, right in zip(step_instances, step_instances[1:]))
-        step_audits.append({
-            "step_id": diagnostic["step_id"],
-            "expected_instance_count": len(expected_order),
-            "actual_instance_count": len(step_instances),
-            "layer_order_valid": actual_order == expected_order,
-            "non_overlapping": non_overlapping,
-            "boundary_source_status": diagnostic.get("status"),
-            "status": "pass" if (
-                diagnostic.get("status") == "mapped"
-                and actual_order == expected_order
-                and non_overlapping) else "fail",
-        })
+    step_audits = [
+        _step_audit(diagnostic, instances_by_step.get(diagnostic["step_id"], []))
+        for diagnostic in partition_diagnostics]
     mechanical_pass = (not partition_diagnostics or bool(step_audits)) and all(
         item["status"] == "pass" for item in step_audits)
     phase_status = "pass" if spans else "partial"
@@ -1829,15 +1897,43 @@ def build(trace_path, pattern_path, out_dir, table_phases=None,
     # rewrite an authoritative boundary from sequence similarity.
     prefix_demotions = []
     instances = _layer_instances(rows)
-    representative_instances = [
+    analysis_windows, excluded_steps = _select_analysis_windows(
+        rows, instances, partition_diagnostics)
+    # Steps outside the analysis window are marked in the audit files and
+    # left out of representatives, tables and gates.
+    for item in rows + instances + partition_diagnostics:
+        if item.get("step_id") in excluded_steps:
+            item["analysis_window"] = "excluded"
+    window_rows = [row for row in rows if row.get("step_id") not in excluded_steps]
+    window_instances = [
         instance for instance in instances
+        if instance.get("step_id") not in excluded_steps]
+    window_diagnostics = [
+        diagnostic for diagnostic in partition_diagnostics
+        if diagnostic.get("step_id") not in excluded_steps]
+    window_out_of_scope = out_of_scope
+    if excluded_steps:
+        excluded_rows = [row for row in rows
+                         if row.get("step_id") in excluded_steps]
+        window_out_of_scope = dict(out_of_scope, excluded_analysis_window={
+            "step_ids": sorted(excluded_steps),
+            "count": len(excluded_rows),
+            "duration_us": round(sum(
+                row["duration_us"] for row in excluded_rows), 6),
+        })
+    representative_instances = [
+        instance for instance in window_instances
         if not table_phases or instance["phase"] in table_phases]
     representatives = _representatives(
         pattern_doc, representative_instances, representative_layer_hints)
-    tables = _table(pattern_doc, rows, representatives, table_phases)
+    tables = _table(pattern_doc, window_rows, representatives, table_phases)
     quality = _quality(
-        pattern_doc, rows, instances, representatives, spans, out_of_scope,
-        partition_diagnostics, tables)
+        pattern_doc, window_rows, window_instances, representatives, spans,
+        window_out_of_scope, window_diagnostics, tables)
+    quality["analysis_windows"] = analysis_windows
+    if excluded_steps:
+        for gate in ("layer_boundaries", "step_layer_order"):
+            quality["gates"][gate]["scope"] = "selected_analysis_window"
     coverage = _phase_coverage(
         instances, tables, trace_paths, adopted_siblings, table_phases,
         require_phases)
@@ -1890,6 +1986,7 @@ def build(trace_path, pattern_path, out_dir, table_phases=None,
             "boundary_partition_diagnostics": partition_diagnostics,
             "prefix_demotions": prefix_demotions,
             "pattern_stage_templates": pattern_templates,
+            "analysis_windows": analysis_windows,
             "instances": instances, "representatives": representatives}),
         (paths["semantic_table_json"], {
             "schema_version": 3,

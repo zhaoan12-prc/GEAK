@@ -749,5 +749,114 @@ class DiagnosticStageRecurrenceTest(unittest.TestCase):
             [row["layer_id"] for row in second])
 
 
+class AnalysisWindowTest(unittest.TestCase):
+    _patterns = SemanticKernelMappingTest._patterns
+
+    def _multi_step_trace(self, root, steps):
+        """One EXTEND step per (input_tokens, layer_ids) entry, 1000 us apart."""
+        events = []
+        ext = 0
+        for index, (tokens, layer_ids) in enumerate(steps):
+            base = index * 1000
+            events.append({"cat": "gpu_user_annotation",
+                           "name": "step[EXTEND bs=1 toks=%d]" % tokens,
+                           "ts": base, "dur": 500})
+            for position, layer_id in enumerate(layer_ids):
+                ext += 1
+                cpu_ts = base + 10 + 30 * position
+                events.append({"cat": "python_function",
+                               "name": "nn.Module: GenericDecoderLayer_%d" % layer_id,
+                               "ts": cpu_ts, "dur": 20})
+                events.append({"cat": "cpu_op", "name": "aten::mm",
+                               "ts": cpu_ts + 2, "dur": 2,
+                               "args": {"External id": ext, "Input Dims": [[tokens, 4]]}})
+                events.append({"cat": "kernel", "name": "fused_mlp_kernel",
+                               "ts": base + 200 + 10 * position, "dur": 5,
+                               "args": {"External id": ext, "stream": 7}})
+        path = os.path.join(root, "trace.json")
+        with open(path, "w") as fh:
+            json.dump({"traceEvents": events}, fh)
+        return path
+
+    def _build_steps(self, tmp, steps):
+        result = mapping.build(
+            self._multi_step_trace(tmp, steps), self._patterns(tmp),
+            os.path.join(tmp, "out"))
+        with open(result["quality_json"]) as fh:
+            quality = json.load(fh)
+        with open(result["semantic_table_json"]) as fh:
+            tables = json.load(fh)["tables"]
+        return result, quality, tables
+
+    def test_one_complete_prefill_step_is_enough(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, quality, tables = self._build_steps(
+                tmp, [(8, [0, 1]), (32, [0]), (16, [0, 1])])
+            self.assertEqual(result["status"], "pass")
+            window = quality["analysis_windows"]["prefill"]
+            selected = window["selected_step_id"]
+            by_step = {item["step_id"]: item for item in window["candidates"]}
+            # The 32-token step has the most tokens but only one layer.
+            self.assertEqual(by_step[selected]["input_tokens"], 16)
+            self.assertEqual(
+                sorted(item["input_tokens"] for item in window["candidates"]
+                       if not item["complete"]), [32])
+            self.assertEqual({table["selected_step_id"] for table in tables},
+                             {selected})
+            order = quality["gates"]["step_layer_order"]
+            self.assertEqual([item["step_id"] for item in order["steps"]],
+                             [selected])
+            self.assertEqual(order["scope"], "selected_analysis_window")
+            excluded = quality["gates"]["analysis_window_conservation"][
+                "out_of_scope"]["excluded_analysis_window"]
+            self.assertEqual(len(excluded["step_ids"]), 2)
+            self.assertEqual(excluded["count"], 3)
+            with open(result["layer_instance_audit_json"]) as fh:
+                audit = json.load(fh)
+            self.assertEqual(audit["analysis_windows"], quality["analysis_windows"])
+            # The incomplete step has no instances; the complete 8-token
+            # step keeps its instances in the audit, marked excluded.
+            eight = next(item["step_id"] for item in window["candidates"]
+                         if item["input_tokens"] == 8)
+            self.assertEqual(
+                {item["step_id"] for item in audit["instances"]
+                 if item.get("analysis_window") == "excluded"}, {eight})
+            self.assertEqual(
+                {item["step_id"]
+                 for item in audit["boundary_partition_diagnostics"]
+                 if item.get("analysis_window") == "excluded"},
+                set(excluded["step_ids"]))
+
+    def test_prefill_window_is_the_largest_complete_bucket_latest_on_tie(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, quality, _ = self._build_steps(
+                tmp, [(32, [0, 1]), (8, [0, 1]), (32, [0, 1])])
+            window = quality["analysis_windows"]["prefill"]
+            latest = max(window["candidates"],
+                         key=lambda item: item["first_device_seq_index"])
+            self.assertEqual(window["selected_step_id"], latest["step_id"])
+
+    def test_single_step_keeps_every_gate_scope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, quality, _ = self._build_steps(tmp, [(8, [0, 1])])
+            self.assertEqual(result["status"], "pass")
+            self.assertEqual(
+                quality["gates"]["step_layer_order"]["scope"], "all_required_steps")
+            self.assertNotIn(
+                "excluded_analysis_window",
+                quality["gates"]["analysis_window_conservation"]["out_of_scope"])
+
+    def test_no_complete_step_keeps_every_step_in_the_gates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, quality, _ = self._build_steps(tmp, [(8, [0]), (16, [1])])
+            self.assertNotEqual(result["status"], "pass")
+            self.assertIsNone(
+                quality["analysis_windows"]["prefill"]["selected_step_id"])
+            self.assertEqual(
+                len(quality["gates"]["step_layer_order"]["steps"]), 2)
+            self.assertEqual(
+                quality["gates"]["step_layer_order"]["status"], "fail")
+
+
 if __name__ == "__main__":
     unittest.main()
