@@ -73,6 +73,12 @@ or the ATOM profiling contract at the top of `SKILL_DIR/scripts/adapters/atom.sh
     not just by the `PROFILE_WINDOW_SEC` sleep (20–30s band). On <0.26 the shorter time window is the only
     bound. Grep server.log for `Max profiling iterations reached` to confirm the self-stop fired. (The
     KernelFusion capture is the one exception: stacks ON and `GEAK_FUSION_MAX_ITERS`, see adapters/vllm.sh.)
+  - Triton launch probe: on vLLM the round-0 `EXTRA_ENV` carries `GEAK_TRITON_LAUNCH_SHAPES=1`, and
+    `bench_e2e.sh` builds a probe overlay seeded from `OVERLAY_PYTHONPATH` (pass both through
+    unchanged). It names a record_function after each Python-launched Triton kernel's tensor
+    arguments, the only shape evidence those kernels can have. GPU timing is unaffected (same-boot
+    A/B, MiniMax-M3 TP8: prefill step +0.07%, kernel time +0.17%), so the Top-N stays valid. Confirm
+    `[GEAK_TRITON_LAUNCH_PROBE] armed` in server.log; a `!!!` line from bench_e2e.sh means it was not.
   - The old adaptive "enlarge window + re-capture until N decode steps" gate is DISABLED — that proxy loop
     used to double the window until the trace bloated / OOMed the profiler buffer. `bench_e2e.sh` now
     captures ONCE with the up-front-sized window; trust the sizing.

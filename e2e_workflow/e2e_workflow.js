@@ -3291,8 +3291,12 @@ if (want('setup')) {
   // trace carries the module hierarchy semantics needs. Reprofiles keep curEnv
   // (the optimization Top-N does not need stacks, which bloat the trace).
   // Each adapter has its own with_stack switch; the sglang one is a no-op env on vllm.
+  // vLLM also arms the Triton launch probe here: a Python-launched Triton kernel has no
+  // dispatcher op, so this trace -- the Clean Trace semantics reads prefill shapes from --
+  // gives it no dims otherwise (bench_e2e.sh builds the probe overlay; GPU timing unchanged).
   const PROFILE_WITH_STACK_ENV = {
-    sglang: 'SGLANG_PROFILE_WITH_STACK=true', vllm: 'VLLM_PROFILE_WITH_STACK=true',
+    sglang: 'SGLANG_PROFILE_WITH_STACK=true',
+    vllm: 'VLLM_PROFILE_WITH_STACK=true GEAK_TRITON_LAUNCH_SHAPES=1',
   }[BACKEND];
   const baselineExtraEnv = (SEMANTICS_MAPPING_ON && PROFILE_WITH_STACK_ENV)
     ? (curEnv ? curEnv + ' ' : '') + PROFILE_WITH_STACK_ENV
@@ -3369,7 +3373,8 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON && FUSION_BACKENDS.has(BACKEND)) {
     //            instead. Opt-in, because on a build that already annotates it is pure overhead.
     const FUSION_CAPTURE_ENV = {
       sglang: 'GEAK_FUSION_TRACE=1 PROFILE_NUM_STEPS=1 SGLANG_PROFILE_WITH_STACK=true',
-      vllm: 'GEAK_FUSION_TRACE=1' + (VLLM_PHASE_ANNOTATE ? ' GEAK_VLLM_PHASE_ANNOTATE=1' : ''),
+      vllm: 'GEAK_FUSION_TRACE=1 GEAK_TRITON_LAUNCH_SHAPES=1' +
+        (VLLM_PHASE_ANNOTATE ? ' GEAK_VLLM_PHASE_ANNOTATE=1' : ''),
     };
     // An UNADAPTED backend keeps its previous env verbatim rather than being handed a
     // fusion flag no adapter honors: it would disable bench_e2e.sh's window sizing and

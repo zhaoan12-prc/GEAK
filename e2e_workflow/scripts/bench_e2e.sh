@@ -575,6 +575,35 @@ RESULT_JSONL="$OUT_DIR/bench_runs.jsonl"
 COLD_JSONL="$OUT_DIR/bench_runs.cold.jsonl"
 : > "$COLD_JSONL"
 
+# ---- Triton launch probe (shape evidence for capture runs) ----
+# GEAK_TRITON_LAUNCH_SHAPES=1 in EXTRA_ENV asks for a trace whose Python-launched Triton kernels
+# carry their tensor arguments (triton_launch_probe.py) -- the only shape such a kernel can get.
+# The probe is a post-import hook, so it rides in an overlay, SEEDED from the current one: only
+# the first sitecustomize on PYTHONPATH runs, so prepending a second overlay dir would silently
+# drop one of the two. Same-boot A/B on MiniMax-M3 TP8: prefill step +0.07%, kernel time +0.17%.
+# A missing helper degrades to an unprobed trace (it is still the Top-N source), loudly.
+case " $EXTRA_ENV " in *" GEAK_TRITON_LAUNCH_SHAPES=1 "*)
+  _OVERLAY_SETUP="$(_stage_lookup overlay_setup.py || true)"
+  _PROBE_OVERLAY="$OUT_DIR/triton_launch_probe_overlay"
+  _OVL_FIRST="${OVERLAY_PYTHONPATH%%:*}"
+  _OVL_REST=""; [ "$_OVL_FIRST" != "$OVERLAY_PYTHONPATH" ] && _OVL_REST="${OVERLAY_PYTHONPATH#*:}"
+  if [ -z "$_OVERLAY_SETUP" ] || [ ! -f "$(dirname "$_OVERLAY_SETUP")/triton_launch_probe.py" ]; then
+    echo "!!! GEAK_TRITON_LAUNCH_SHAPES=1 but overlay_setup.py + triton_launch_probe.py are not staged" \
+         "next to this script or under SKILL_DIR: Triton rows will stay shape-less." >&2
+  elif [ -n "$_OVL_FIRST" ] && [ -f "$_OVL_FIRST/sitecustomize.py" ] \
+       && [ ! -f "$_OVL_FIRST/_overlay_manifest.json" ]; then
+    echo "!!! GEAK_TRITON_LAUNCH_SHAPES=1 but $_OVL_FIRST has its own sitecustomize and no overlay" \
+         "manifest to seed from: Triton launch probe NOT armed." >&2
+  else
+    rm -rf "$_PROBE_OVERLAY"
+    python3 "$_OVERLAY_SETUP" add-triton-launch-probe --overlay "$_PROBE_OVERLAY" \
+      ${_OVL_FIRST:+--from "$_OVL_FIRST"} >/dev/null \
+      && OVERLAY_PYTHONPATH="$_PROBE_OVERLAY${_OVL_REST:+:$_OVL_REST}" \
+      || echo "!!! failed to build the Triton launch probe overlay; capturing without it." >&2
+  fi
+  ;;
+esac
+
 # export everything the adapter reads
 export MODEL HOST PORT TP GPU MEM_FRACTION EXTRA_SERVER_ARGS EXTRA_ENV OVERLAY_PYTHONPATH
 export ISL OSL CONC SEED PROFILE PROFILE_DIR PROFILE_NUM_STEPS BASE_URL RESULT_JSONL LOG
