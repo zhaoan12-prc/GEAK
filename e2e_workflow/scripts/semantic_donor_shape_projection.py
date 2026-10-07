@@ -73,13 +73,42 @@ def _layer_identity(identity):
     return _GRAPH_REPLAY_COPY_ALIASES.get(identity, identity)
 
 
+def _forced_subsequence_pairs(short, long):
+    """{short_index: long_index} fixed by EVERY embedding of `short` in `long`.
+
+    None when `short` is not a subsequence of `long`. Any embedding E satisfies
+    leftmost[i] <= E[i] <= rightmost[i], so where the greedy leftmost and
+    rightmost embeddings agree the pairing is forced; elsewhere it is a guess
+    and stays unpaired.
+    """
+    leftmost, cursor = [], 0
+    for identity in short:
+        while cursor < len(long) and long[cursor] != identity:
+            cursor += 1
+        if cursor == len(long):
+            return None
+        leftmost.append(cursor)
+        cursor += 1
+    rightmost, cursor = [None] * len(short), len(long) - 1
+    for index in range(len(short) - 1, -1, -1):
+        while long[cursor] != short[index]:
+            cursor -= 1
+        rightmost[index] = cursor
+        cursor -= 1
+    return {index: left for index, (left, right) in enumerate(zip(leftmost, rightmost))
+            if left == right}
+
+
 def _layer_identical_pairs(group, donor, recipient_sequence):
-    """Positional pairs over each layer's identical prefix (donor vs recipient).
+    """Positional pairs inside each validated layer cut (donor vs recipient).
 
     The stable projection drops any identity whose step-wide multiplicity differs
     -- typically GEMM/quant kernels that also run outside the layer stack (lm_head,
-    sampler), which are exactly the rows fusion cares about. Inside one validated
-    layer cut, a byte-equal identity sequence admits only the positional pairing.
+    sampler), which are exactly the rows fusion cares about. Inside one layer cut,
+    when one side's identity sequence is a subsequence of the other's (the eager
+    donor adds work graph replay drops, e.g. the copy into a custom all-reduce's
+    registered buffer), the positions every embedding agrees on are forced pairs.
+    Otherwise only the agreeing prefix from the cut is paired.
     """
     # layer_ranges already exclude any inter-layer residual; a layer whose width
     # then differs from the donor's simply is not paired.
@@ -91,6 +120,20 @@ def _layer_identical_pairs(group, donor, recipient_sequence):
     for layer, ((r_start, r_stop), d_start) in enumerate(
             zip(recipient_ranges, donor_starts)):
         d_stop = donor_starts[layer + 1] if layer + 1 < len(donor_starts) else donor_end
+        recipient_layer = [_layer_identity(identity)
+                           for identity in recipient_sequence[r_start:r_stop]]
+        donor_layer = [_layer_identity(identity)
+                       for identity in donor["sequence"][d_start:d_stop]]
+        forced = _forced_subsequence_pairs(recipient_layer, donor_layer)
+        if forced is not None:
+            for r_offset, d_offset in forced.items():
+                pairs[d_start + d_offset] = r_start + r_offset
+            continue
+        forced = _forced_subsequence_pairs(donor_layer, recipient_layer)
+        if forced is not None:
+            for d_offset, r_offset in forced.items():
+                pairs[d_start + d_offset] = r_start + r_offset
+            continue
         # Both sides start at the same validated cut, so while their identities
         # agree position by position the pairing is forced; stop at the first
         # divergence (e.g. the last layer's tail runs into different post-model work).
@@ -133,7 +176,9 @@ def _shape_key(row):
 
 
 def _resolved(row):
-    return (row.get("shape") or {}).get("source") not in (None, "unresolved")
+    # Dims, not the source label: a parent_context row can name its scope op and
+    # still carry no dims, and must neither block nor supply a projection.
+    return bool((row.get("shape") or {}).get("input_dims"))
 
 
 def project(table_path, boundary_map_path, recipient_trace, donor_trace,
@@ -246,11 +291,15 @@ def project(table_path, boundary_map_path, recipient_trace, donor_trace,
                 stats[phase][reason] += 1
                 continue
             donor_shape = donor_row["shape"]
+            # Projection moves dims across traces; it cannot make an operator's
+            # inputs into the kernel's own, so the donor row's granularity travels.
+            granularity = semantic_evidence_ledger.shape_granularity(donor_row)
             row["shape"] = {
                 "source": SOURCE,
                 "input_dims": donor_shape.get("input_dims") or [],
                 "input_types": donor_shape.get("input_types") or [],
                 "donor_shape_source": donor_shape.get("source"),
+                "granularity": granularity,
             }
             donor_parent = donor_row.get("parent_operator") or {}
             if (row.get("parent_operator") or {}).get("canonical_op") in (
@@ -262,7 +311,7 @@ def project(table_path, boundary_map_path, recipient_trace, donor_trace,
                 }
             row["semantic_evidence"] = {
                 "level": "P",
-                "probe_scope": "kernel",
+                "probe_scope": "kernel" if granularity == "kernel" else "wrapper",
                 "status": "matched",
                 "source": SOURCE,
                 "mapping_basis": (

@@ -41,6 +41,11 @@ Commands:
                 shorthand: wire scripts/vllm_phase_annotate.py so a vLLM trace carries the
                 sglang-dialect step[EXTEND|DECODE ...] spans the fusion semantics layer needs.
                 Inert unless GEAK_VLLM_PHASE_ANNOTATE=1.   --overlay O
+  add-triton-launch-probe
+                wire scripts/triton_launch_probe.py so every Triton launch made while a
+                torch profiler records carries its tensor arguments in the trace (the only
+                shape a Python-launched Triton kernel can get). Inert unless
+                GEAK_TRITON_LAUNCH_SHAPES=1.   --overlay O [--from BASE]
   check         print where a module resolves from (run with the overlay on PYTHONPATH)
                 --module sglang.srt.layers.activation [--path-only]
   Every add-* takes --from BASE to SEED a new overlay from an existing one, so a candidate overlay is
@@ -367,6 +372,23 @@ def cmd_add_vllm_semantic_capture(a):
     cmd_add_hook(a)
 
 
+def cmd_add_triton_launch_probe(a):
+    """Wire scripts/triton_launch_probe.py as a post-import hook on triton.runtime.jit.
+
+    Every Triton launch made while a torch profiler records is then annotated with its
+    tensor arguments, which is the only shape evidence a Python-launched Triton kernel
+    can have (it has no dispatcher op). Inert unless GEAK_TRITON_LAUNCH_SHAPES=1.
+    """
+    impl = os.path.join(os.path.dirname(os.path.abspath(__file__)), "triton_launch_probe.py")
+    if not os.path.exists(impl):
+        raise SystemExit(f"triton_launch_probe.py not found at {impl}")
+    _ensure_overlay(a.overlay, a.base)
+    a.impl_file = impl
+    a.impl_module = "triton_launch_probe"
+    a.impl_attr = "install"
+    cmd_add_hook(a)
+
+
 def cmd_check(a):
     f = module_file(a.module)
     if getattr(a, "path_only", False):
@@ -440,6 +462,12 @@ def main():
     p.add_argument("--overlay", required=True)
     p.add_argument("--module", default="vllm.v1.worker.gpu_model_runner")
     p.set_defaults(func=cmd_add_vllm_semantic_capture)
+
+    p = sub.add_parser("add-triton-launch-probe")
+    p.add_argument("--overlay", required=True)
+    p.add_argument("--module", default="triton.runtime.jit")
+    p.add_argument("--from", dest="base", default="", help="seed the overlay from this existing overlay dir")
+    p.set_defaults(func=cmd_add_triton_launch_probe)
 
     p = sub.add_parser("check")
     p.add_argument("--module", required=True)

@@ -13,6 +13,7 @@ import re
 import statistics
 
 import parse_profile
+import triton_launch_probe
 
 
 DEVICE_CATEGORIES = ("kernel", "gpu_memcpy", "gpu_memset")
@@ -403,6 +404,52 @@ def _load_events_multi(paths):
     return merged
 
 
+def _triton_launch_evidence(events):
+    """{correlation: launch-probe evidence} for kernels a Triton launch probe annotated.
+
+    The probe's annotation and the launch runtime event share a thread, and Kineto
+    links neither the annotation nor the kernel by External id, so the kernel is
+    attributed through its runtime event's correlation to the probe annotation
+    whose span holds that launch. See triton_launch_probe.py.
+    """
+    by_tid = collections.defaultdict(list)
+    for index, event in enumerate(events):
+        if (not isinstance(event, dict) or event.get("cat") != "user_annotation"
+                or event.get("ts") is None or event.get("dur") is None):
+            continue
+        parsed = triton_launch_probe.parse_annotation(event.get("name"))
+        if parsed:
+            by_tid[event.get("tid")].append(
+                (event["ts"], event["ts"] + event["dur"], parsed, index))
+    if not by_tid:
+        return {}
+    starts = {}
+    for tid, spans in by_tid.items():
+        spans.sort(key=lambda item: item[0])
+        starts[tid] = [item[0] for item in spans]
+    evidence = {}
+    for event in events:
+        if (not isinstance(event, dict)
+                or event.get("cat") not in ("cuda_runtime", "hip_runtime")):
+            continue
+        correlation = (event.get("args") or {}).get("correlation")
+        spans = by_tid.get(event.get("tid"))
+        if correlation is None or not spans or event.get("ts") is None:
+            continue
+        pos = bisect.bisect_right(starts[event["tid"]], event["ts"]) - 1
+        if pos < 0 or event["ts"] > spans[pos][1]:
+            continue
+        kernel_name, dims, types, names = spans[pos][2]
+        evidence[correlation] = {"kernel_name": kernel_name, "input_dims": dims,
+                                 "input_types": types, "operand_names": names,
+                                 "event_index": spans[pos][3]}
+    return evidence
+
+
+def _launched_kernel_name(name):
+    return name[:-len(".kd")] if name.endswith(".kd") else name
+
+
 def _cpu_evidence(events):
     by_ext = {}
     scopes = []
@@ -739,6 +786,7 @@ def _event_rows(events, pattern_doc):
     spans = _collect_step_spans(events)
     span_starts = [span[0] for span in spans]
     cpu_by_ext, scopes, scope_starts = _cpu_evidence(events)
+    triton_launches = _triton_launch_evidence(events)
     module_scopes, module_diagnostics = _module_layer_scopes(
         events, spans, pattern_doc)
     module_starts = [scope["ts"] for scope in module_scopes]
@@ -814,6 +862,14 @@ def _event_rows(events, pattern_doc):
             ext is not None and external_id_launch_count.get(ext) == 1)
         shape_source = "kernel_exact" if dims and one_to_one_launch else (
             "parent_context" if parent else "unresolved")
+        launch = triton_launches.get(args.get("correlation"))
+        operand_names = None
+        if (shape_source != "kernel_exact" and launch
+                and launch["kernel_name"] == _launched_kernel_name(name)):
+            # The kernel's own arguments beat its enclosing operator's inputs.
+            dims, types = launch["input_dims"], launch["input_types"]
+            operand_names = launch["operand_names"]
+            shape_source = "triton_launch_args"
         stage, stage_rule_id, stage_source = _stage_detail(
             name, event.get("cat"), (parent or {}).get("name", ""))
         rows.append({
@@ -859,11 +915,11 @@ def _event_rows(events, pattern_doc):
                     "medium" if scope else "low"),
                 "evidence_event_index": (parent or {}).get("event_index"),
             },
-            "shape": {
+            "shape": dict({
                 "source": shape_source,
                 "input_dims": dims,
                 "input_types": types,
-            },
+            }, **({"operand_names": operand_names} if operand_names else {})),
         })
     out_of_scope["duration_us"] = round(out_of_scope["duration_us"], 6)
     return rows, spans, out_of_scope, module_scopes, module_diagnostics
@@ -2116,7 +2172,8 @@ def _shape_capture_plan(tables, pattern_doc, trace_path,
         })
         target_buckets.append(bucket)
         for row in table["rows"]:
-            if row["shape"]["source"] == "kernel_exact":
+            # Both carry the kernel's own inputs; nothing left to capture.
+            if row["shape"]["source"] in ("kernel_exact", "triton_launch_args"):
                 continue
             needs.append({
                 "phase": table["phase"],

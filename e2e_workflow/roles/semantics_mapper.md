@@ -192,6 +192,13 @@ vLLM — this list overrides them:
   capture supplies layer cuts (and later Shape evidence) only; its timing is never used.
   It loads the full model and outlives one Bash call: launch it detached and wait for it exactly as in
   *Running and waiting for a replay* above (poll for its `profile_trace_manifest.json`).
+  Arm the Triton launch probe on this capture: seed `OVERLAY_PYTHONPATH` with
+  `python3 $SKILL_DIR/scripts/overlay_setup.py add-triton-launch-probe --overlay <donor overlay>
+  --from <Clean Trace overlay, if any>` and add `GEAK_TRITON_LAUNCH_SHAPES=1` to `EXTRA_ENV`. A
+  Triton kernel launched from Python has no dispatcher op, so `record_shapes` gives it no dims in
+  any trace; the probe annotates each launch with its tensor arguments, and its rows come out
+  `triton_launch_args` (the kernel's own inputs). It adds CPU time per launch, which is why it goes
+  on the donor, whose timing is never used, and never on the Clean Trace.
 - **Step 5 (transfer).** Run `semantic_layer_boundary_transfer.py` with the donor capture's rank-0
   trace. With no `GEAK_LAYER_SCOPE` markers it builds donor layer scopes from the declared
   `runtime_dispatch_branch` ops and applies the same exact / stable-projection rules; the map records

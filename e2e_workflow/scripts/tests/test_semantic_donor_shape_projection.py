@@ -153,6 +153,41 @@ class DonorShapeProjectionTest(unittest.TestCase):
         # agreeing prefix ("b") and stops at the divergence ("c" vs "x").
         self.assertEqual(pairs, {0: 0, 1: 1, 2: 2})
 
+    def test_layer_pairing_skips_work_only_the_eager_donor_launches(self):
+        # MiniMax-M3 TP8 decode: eager copies each all-reduce input into the
+        # registered buffer; graph replay does not. The prefix rule stopped at the
+        # first copy and left every all-reduce and everything after it unpaired.
+        group = {"layer_ranges": [{"start_position": 0, "end_position": 5}]}
+        donor = {"layer_starts": [0],
+                 "sequence": ["rope", "gemm", "pad_copy", "allreduce", "norm",
+                              "pad_copy", "allreduce"]}
+        pairs = projection._layer_identical_pairs(
+            group, donor, ["rope", "gemm", "allreduce", "norm", "allreduce"])
+        self.assertEqual(pairs, {0: 0, 1: 1, 3: 2, 4: 3, 6: 4})
+
+    def test_layer_pairing_leaves_an_ambiguous_embedding_unpaired(self):
+        # "x" could be either donor "x": only the unambiguous rows pair.
+        self.assertEqual(projection._forced_subsequence_pairs(
+            ["a", "x", "b"], ["a", "x", "x", "b"]), {0: 0, 2: 3})
+        self.assertIsNone(projection._forced_subsequence_pairs(["a", "c"], ["a", "b"]))
+
+    def test_layer_pairing_works_when_graph_replay_adds_the_extra_kernel(self):
+        group = {"layer_ranges": [{"start_position": 0, "end_position": 3}]}
+        donor = {"layer_starts": [0], "sequence": ["a", "b"]}
+        self.assertEqual(projection._layer_identical_pairs(
+            group, donor, ["a", "graph_only", "b"]), {0: 0, 1: 2})
+
+    def test_projection_keeps_the_donor_rows_shape_granularity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, doc = self._run(tmp, [_dims(1)])
+            for table in doc["tables"]:
+                for row in table["rows"]:
+                    # one kernel per parent op in the fixture -> the kernel's own dims
+                    self.assertEqual(row["shape"]["granularity"], "kernel")
+                    self.assertEqual(row["semantic_evidence"]["probe_scope"], "kernel")
+            decode = doc["phase_coverage"]["shape_resolution_by_phase"]["decode"]
+            self.assertEqual(decode["kernel_level"], decode["rows"])
+
     def test_per_layer_rule_pairs_rows_of_the_same_identity(self):
         """A reordered layer must pair each row with its own kind, not its index."""
         donor = ["a", "b", "a", "c", "d"]

@@ -132,7 +132,10 @@ Read the candidate object for `CANDIDATE_ID` from `FUSION_CANDIDATES_JSON`:
   `activation_quant`, `quant_gemm_prologue`).
 - `members[].shape.input_dims` / `input_types` — the EXACT captured shapes+dtypes the
   ops ran on (source `kernel_exact`). These ARE your microbench inputs — build tensors
-  of exactly these shapes/dtypes. Your `tested_shape` MUST be one of these member rows
+  of exactly these shapes/dtypes. A member whose `shape.granularity` is `operator`
+  carries the ENCLOSING operator's inputs (one op launched several kernels), not that
+  kernel's own: drive the reference and fused paths through that operator with those
+  inputs, never by feeding those dims straight to the inner kernel. Say which in `notes`. Your `tested_shape` MUST be one of these member rows
   (the harness rejects a verdict tested on any other shape).
 - `members[].parent_operator` / `kernel` — the SPLIT reference ops, in `pos` order
   (e.g. `sgl_kernel::qr_all_reduce` → `aiter::rmsnorm` [→ `aiter::dynamic_..._scaled_quant`]).
