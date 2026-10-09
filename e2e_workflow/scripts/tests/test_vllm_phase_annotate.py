@@ -4,7 +4,7 @@
 Run:  python3 -m unittest discover -s e2e_workflow/scripts/tests -v
 
 This module exists to make a vLLM trace carry `step[EXTEND bs=N toks=M]` / `step[DECODE bs=N]`
-spans so `semantic_kernel_mapping.SGLANG_STEP_RE` can phase-tag device events. Two properties
+spans so `sglang_step_modes.parse_step` can phase-tag device events. Two properties
 are load-bearing and both fail silently at 8-GPU scale:
 
   1. THE NAME MUST MATCH THE PARSER'S REGEX, byte for byte. A name that is one space or one
@@ -30,7 +30,7 @@ if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
 import vllm_phase_annotate as vpa                                    # noqa: E402
-from semantic_kernel_mapping import SGLANG_STEP_RE                   # noqa: E402
+from sglang_step_modes import parse_step                             # noqa: E402
 
 
 class _SchedulerOutput:
@@ -63,17 +63,18 @@ class TestStepNameDialect(unittest.TestCase):
     def test_decode_name_matches_the_parsers_regex_and_fields(self):
         name = vpa._step_name(_Runner(), _SchedulerOutput({"a": 1, "b": 1, "c": 1}))
         self.assertEqual(name, "step[DECODE bs=3]")
-        m = SGLANG_STEP_RE.match(name)
-        self.assertIsNotNone(m, "name must parse with the REAL parser regex")
-        self.assertEqual(m.group(1), "DECODE")
-        self.assertEqual(m.group(2), "3")
+        step = parse_step(name)
+        self.assertIsNotNone(step, "name must parse with the REAL step parser")
+        self.assertEqual(step["mode"], "DECODE")
+        self.assertEqual(step["batch_size"], 3)
 
     def test_prefill_name_matches_the_parsers_regex_and_fields(self):
         name = vpa._step_name(_Runner(), _SchedulerOutput({"a": 4096, "b": 2048}))
         self.assertEqual(name, "step[EXTEND bs=2 toks=6144]")
-        m = SGLANG_STEP_RE.match(name)
-        self.assertIsNotNone(m)
-        self.assertEqual((m.group(1), m.group(2), m.group(3)), ("EXTEND", "2", "6144"))
+        step = parse_step(name)
+        self.assertIsNotNone(step)
+        self.assertEqual((step["mode"], step["batch_size"], step["tokens"]),
+                         ("EXTEND", 2, 6144))
 
     def test_round_trips_through_the_parsers_own_name_builder(self):
         # _step_span_name() reconstructs the annotation from a parsed span; if our emitted

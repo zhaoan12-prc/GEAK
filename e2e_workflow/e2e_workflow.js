@@ -846,6 +846,7 @@ const FUSION_UNIT_SCHEMA = obj({
 const FUSION_UNIT_AGG_SCHEMA = obj({
   status: { type: 'string' }, fusion_unitside_json: { type: 'string' },
   fusion_unitside_md: { type: 'string' }, validated_count: { type: 'number' },
+  applyback_eligible_ids: arrStr,
   waived: arrObj, deferred: arrObj, notes: { type: 'string' },
 }, ['status', 'fusion_unitside_json']);
 
@@ -1285,6 +1286,26 @@ function fusionGsm8kConcurrency(flags) {
 function fusionStackKey() {
   const ids = acceptedFusions.map((r) => String((r && (r.exec_id || r.fusion)) || '')).sort();
   return JSON.stringify({ fusions: ids, overlay: curOverlay || '', flags: curFlags || '', env: curEnv || '' });
+}
+
+// Execution-list entries the apply-back loop calls. The budget counts only entries with a
+// 单侧 apply-back-eligible candidate: an entry the unit-side gate already blocked costs no
+// serving A/B, so it must not take a slot from a later passing entry. Ineligible entries
+// before the cut are still sent (the integrator records their disposition in a minute or
+// two). Without the eligible-id list this is the plain first-N slice. Must match
+// fusion_applyback_harness._budget_cutoff_rank.
+function fusionApplyBudgetEntries(list, eligibleIds, budget) {
+  const n = Math.max(0, budget);
+  if (!Array.isArray(eligibleIds)) return list.slice(0, n);
+  const eligible = new Set(eligibleIds.map(String));
+  const out = [];
+  let used = 0;
+  for (const entry of list) {
+    if (used >= n) break;
+    out.push(entry);
+    if ((entry.candidate_ids || []).some((cid) => eligible.has(String(cid)))) used += 1;
+  }
+  return out;
 }
 
 function roleAgent(role, phase, intro, inputs) {
@@ -2407,6 +2428,9 @@ let EVAL_DIR, MODEL_NAME, BASELINE_TPUT, NOISE_BAND, curFlags, curEnv;
 let profile, strategy, kernelQueue = [], headQueue = [], semantics, fusionCapture;
 let fusionSemanticsAttempted = false;
 let fusionExecutionList = [];
+// candidate_ids whose 单侧 status is apply-back eligible, as the unit-side aggregate
+// read them from fusion_unitside.json; null when it did not report them.
+let fusionUnitEligibleIds = null;
 // Base gsm8k score of the current fusion stack, reused across apply-back calls
 // until a fusion is accepted. {stack_key, exact_match, n, path, harness}.
 let fusionAccuracyRef = null;
@@ -3358,8 +3382,10 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON && FUSION_BACKENDS.has(BACKEND)) {
     // sizing unchanged; only this capture is switched into fusion evidence mode.
     //
     // The two stacks reach that mode differently and NEITHER can be left at its default:
-    //   sglang - profile_by_stage writes EXTEND and DECODE as separate traces, so one forward
-    //            per stage suffices; with_stack must be forced ON (the adapter defaults it off).
+    //   sglang - profile_by_stage writes EXTEND and DECODE as separate traces; three steps
+    //            per stage with no client warmup inside the window (bench_e2e.sh), so prefill
+    //            reaches a real batch and decode/verify reaches full concurrency. with_stack
+    //            must be forced ON (the adapter defaults it off).
     //   vllm   - has no profile_by_stage, so a SINGLE window has to contain both phases. It DOES
     //            annotate natively: gpu_worker wraps every execute_model in annotate_profile(),
     //            whose default branch emits execute_context_<n>(<t>)_generation_<n>(<t>) as a
@@ -3372,7 +3398,8 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON && FUSION_BACKENDS.has(BACKEND)) {
     //            (scripts/vllm_phase_annotate.py), which supplies sglang's step[...] dialect
     //            instead. Opt-in, because on a build that already annotates it is pure overhead.
     const FUSION_CAPTURE_ENV = {
-      sglang: 'GEAK_FUSION_TRACE=1 PROFILE_NUM_STEPS=1 SGLANG_PROFILE_WITH_STACK=true',
+      sglang: 'GEAK_FUSION_TRACE=1 GEAK_FUSION_PROFILE_STEPS=3 GEAK_FUSION_PROFILE_WARMUPS=0 ' +
+        'SGLANG_PROFILE_WITH_STACK=true',
       vllm: 'GEAK_FUSION_TRACE=1 GEAK_TRITON_LAUNCH_SHAPES=1' +
         (VLLM_PHASE_ANNOTATE ? ' GEAK_VLLM_PHASE_ANNOTATE=1' : ''),
     };
@@ -3639,7 +3666,9 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON && FUSION_BACKENDS.has(BACKEND)) {
               'Aggregate only the Top-K execution_list candidate ids. Pass EQUIVALENT_COVERED rows as ' +
               '--equivalent <id>=<representative_candidate_id> and SUBSUMED_COVERED rows as ' +
               '--subsumed <id>=<ladder_top> (covered: their ladder top was benched and passed) and BUDGET_SKIPPED rows as ' +
-              '--budget-skipped <id>=<reason> (NOT covered — never measured). Do NOT launder a budget skip through --waive.', {
+              '--budget-skipped <id>=<reason> (NOT covered — never measured). Do NOT launder a budget skip through --waive. ' +
+              'Return applyback_eligible_ids: every candidate_id whose unit_side_status in the written ' +
+              'fusion_unitside.json is pass, equivalent_pass or subsumed_pass.', {
                 EVAL_DIR, FUSION_CANDIDATES_JSON: discover.fusion_candidates_json,
                 FUSION_TOPK_JSON: ranked.fusion_topk_json,
                 FUSION_DIR: discover.fusion_candidates_json.replace(/\/[^/]+$/, ''),
@@ -3656,6 +3685,9 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON && FUSION_BACKENDS.has(BACKEND)) {
           if (aggregate && aggregate.fusion_unitside_json) {
             FUSION_INPUTS.FUSION_UNITSIDE_JSON = aggregate.fusion_unitside_json;
           }
+          if (aggregate && Array.isArray(aggregate.applyback_eligible_ids)) {
+            fusionUnitEligibleIds = aggregate.applyback_eligible_ids;
+          }
         }
       }
     }
@@ -3670,7 +3702,8 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON && FUSION_BACKENDS.has(BACKEND)) {
   let fusionApplyUnprocessed = [];
   if (FUSION_INPUTS.FUSION_TOPK_JSON && FUSION_INPUTS.FUSION_UNITSIDE_JSON) {
     const FUSION_BUDGET = parseInt(A.fusion_budget != null ? A.fusion_budget : 6, 10);
-    const fusionApplyEntries = fusionExecutionList.slice(0, Math.max(0, FUSION_BUDGET));
+    const fusionApplyEntries = fusionApplyBudgetEntries(
+      fusionExecutionList, fusionUnitEligibleIds, FUSION_BUDGET);
     let applyState = {
       accepted_fusions: [], final_overlay: curOverlay,
       e2e_throughput_tok_s: curTput, accepted_flags: curFlags, accepted_env: curEnv,

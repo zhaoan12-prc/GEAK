@@ -767,9 +767,15 @@ class PhaseCoverageTest(unittest.TestCase):
         attention operator itself) was not a donor -- and Phase 2.1's escalation gate then
         demanded a fusion candidate for the model's own attention. The parent op is
         authoritative: it is the registered op the kernel ran under.
+
+        `_fwd_kernel` itself now also matches a name rule (SGLang's triton attention
+        launches it too), so the parent-op path is exercised with a name no rule knows.
         """
-        stage, rule, source = mapping._stage_detail(
+        stage, _, _ = mapping._stage_detail(
             "_fwd_kernel", "kernel", "vllm::unified_attention_with_output")
+        self.assertEqual(stage, "attn")
+        stage, rule, source = mapping._stage_detail(
+            "_triton_kernel", "kernel", "vllm::unified_attention_with_output")
         self.assertEqual(stage, "attn")
         self.assertEqual(source, "parent_operator")
         self.assertEqual(rule, "attention.full.parent")

@@ -23,6 +23,15 @@ no donor pass validates stays unresolved and makes the map ``partial``; it does
 not void the steps that did transfer.  Stage
 names, model names, attention kinds and recurring subsequences are never used to
 invent a boundary.
+
+Preferred donor: the graph-capture pass (``src=capture`` markers).  Graph
+capture launches no device work, so its kernel identities come from the
+runtime launch records (``args.kernel``), and they are exactly what graph
+replay -- the Clean Trace -- executes.  Eager warmups may additionally run
+one-shot work (overlay self-checks, lazy init) that never reaches the graph.
+A capture donor is matched as an ordered subsequence of the Clean Trace step:
+Clean-Trace-only kernels (input preparation, overlapped scheduler work) are
+allowed anywhere, and the eager-warmup rules above remain the fallback.
 """
 import argparse
 import bisect
@@ -32,6 +41,7 @@ import json
 import os
 
 import semantic_kernel_mapping
+import sglang_step_modes
 
 
 MARKER_PREFIX = "GEAK_LAYER_SCOPE|"
@@ -42,6 +52,11 @@ STABLE_MIN_DONOR_EVENT_FRACTION = 0.5
 STABLE_MIN_RECIPIENT_BODY_FRACTION = 0.5
 STABLE_RULE = "exact_equal_multiplicity_stable_identity_projection"
 STABLE_PER_LAYER_RULE = "equal_multiplicity_stable_identity_per_layer_multiset"
+# Capture donor: share of its kernels that must be found, in order, in the
+# Clean Trace step, and how far ahead one missing kernel may be searched for
+# before it is skipped instead of consuming later work.
+CAPTURE_MIN_MATCHED_FRACTION = 0.9
+CAPTURE_LOOKAHEAD = 64
 
 
 def _sha256(path):
@@ -57,6 +72,8 @@ def _phase(value):
     return {
         "extend": "prefill", "prompt": "prefill",
         "generation": "decode",
+        # Speculative decoding: the target model's generation step.
+        "target_verify": "verify",
     }.get(value, value)
 
 
@@ -104,6 +121,7 @@ def _scope_markers(events):
             "batch_size": _integer(fields.get("bs")),
             "input_tokens": _integer(fields.get("toks")),
             "layer_id": _integer(fields.get("layer")),
+            "source": fields.get("src") or "eager",
             "op_path": fields.get("path"),
             "pid": event.get("pid"),
             "tid": event.get("tid"),
@@ -137,6 +155,8 @@ def _dispatch_scope_markers(events, pattern_doc):
             "batch_size": _integer(scope.get("batch_size")),
             "input_tokens": _integer(scope.get("input_tokens")),
             "layer_id": scope["layer_id"],
+            # A dispatch-op donor walks the model eagerly (graph replay off).
+            "source": "eager",
             "op_path": scope["name"],
             "pid": scope.get("pid"),
             "tid": scope.get("tid"),
@@ -148,7 +168,12 @@ def _dispatch_scope_markers(events, pattern_doc):
 
 
 def _attach_device_entries(events, markers):
-    """Attach correlated device launches to their enclosing layer scope."""
+    """Attach the kernels launched inside each layer scope.
+
+    Eager scopes take the correlated device kernel.  Capture scopes take the
+    kernel named by the launch record itself: nothing executes on the device
+    while a graph is being recorded.
+    """
     by_thread = {}
     for marker in markers:
         by_thread.setdefault((marker["pid"], marker["tid"]), []).append(marker)
@@ -178,8 +203,6 @@ def _attach_device_entries(events, markers):
         args = event.get("args") or {}
         correlation = args.get("correlation", args.get("Correlation ID"))
         device_matches = device_by_correlation.get(correlation, [])
-        if correlation is None or len(device_matches) != 1:
-            continue
         key = (event.get("pid"), event.get("tid"))
         candidates = by_thread.get(key, [])
         if not candidates:
@@ -190,6 +213,22 @@ def _attach_device_entries(events, markers):
             continue
         marker = candidates[position]
         if not (marker["ts"] <= timestamp <= marker["end"]):
+            continue
+        if marker["source"] == "capture":
+            # A launch recorded into a graph runs nothing yet: the runtime
+            # event names its kernel and has no device row.
+            raw_name = str(args.get("kernel") or "")
+            if device_matches or not raw_name:
+                continue
+            marker["entries"].append({
+                "runtime_event_index": runtime_index,
+                "device_event_index": -1,
+                "raw_name": raw_name,
+                "identity": _kernel_identity(raw_name, "kernel"),
+                "event_type": "kernel",
+            })
+            continue
+        if correlation is None or len(device_matches) != 1:
             continue
         device_index, device = device_matches[0]
         attachment = (marker["event_index"], device_index)
@@ -218,7 +257,8 @@ def _complete_donor_passes(events, expected_layers, markers=None):
     passes = []
     by_bucket = {}
     for marker in markers:
-        key = (marker["phase"], marker["batch_size"], marker["input_tokens"])
+        key = (marker["phase"], marker["batch_size"], marker["input_tokens"],
+               marker["source"])
         by_bucket.setdefault(key, []).append(marker)
     for bucket, values in sorted(by_bucket.items()):
         current = []
@@ -241,6 +281,7 @@ def _complete_donor_passes(events, expected_layers, markers=None):
                         "phase": bucket[0],
                         "batch_size": bucket[1],
                         "input_tokens": bucket[2],
+                        "source": bucket[3],
                         "markers": list(current),
                         "entries": entries,
                         "layer_starts": layer_starts,
@@ -267,10 +308,30 @@ def _complete_authoritative_step(step_rows, expected_layers):
 def _bucket_matches(donor, phase, batch_size, input_tokens):
     if donor["phase"] != phase or donor["batch_size"] != batch_size:
         return False
-    if phase == "decode":
+    if sglang_step_modes.is_generation_phase(phase):
         return True
     return (input_tokens < 0 or donor["input_tokens"] < 0
             or donor["input_tokens"] == input_tokens)
+
+
+def _compatible_donors(donor_passes, phase, batch_size, input_tokens):
+    """Donor passes for one clean step.
+
+    Generation (decode/verify) steps replay the smallest captured CUDA graph
+    whose batch is >= the live batch, so a bs=9 step runs the bs=10 graph.
+    Match exactly first, then that padded bucket.  Prefill stays exact.
+    """
+    exact = [donor for donor in donor_passes
+             if _bucket_matches(donor, phase, batch_size, input_tokens)]
+    if exact or not sglang_step_modes.is_generation_phase(phase):
+        return exact
+    larger = sorted({donor["batch_size"] for donor in donor_passes
+                     if donor["phase"] == phase
+                     and donor["batch_size"] > batch_size})
+    if not larger:
+        return []
+    return [donor for donor in donor_passes
+            if _bucket_matches(donor, phase, larger[0], input_tokens)]
 
 
 def _subsequence_starts(sequence, needle):
@@ -630,6 +691,89 @@ def _stable_projection_map(sequence, donor, expected_layers):
     }, None
 
 
+def _capture_subsequence_map(sequence, donor, expected_layers):
+    """Map a graph-capture donor as an ordered subsequence of one step.
+
+    Walk the donor kernels in order and take the next equal identity in the
+    step within ``CAPTURE_LOOKAHEAD`` events.  Step-only kernels are passed
+    over; a donor kernel not found nearby is skipped without moving on.  A
+    layer starts at its first found kernel and runs to the next layer's
+    start, so every step kernel in the body keeps a layer.  Kernels the
+    capture did not name (overlapped scheduler work, copy/memset nodes,
+    side-stream work) are only listed in ``capture_unmatched_positions``.
+    The only requirements are that every layer finds a kernel and that most
+    donor kernels are found.
+    """
+    donor_sequence = donor["sequence"]
+    layer_starts = donor["layer_starts"]
+    if len(layer_starts) != expected_layers or not donor_sequence:
+        return None, {"reason": "donor_layer_starts_invalid"}
+    first_found = [None] * expected_layers
+    matched_positions = set()
+    skipped = []
+    found = 0
+    cursor = 0
+    last = -1
+    for layer_id in range(expected_layers):
+        stop = (layer_starts[layer_id + 1]
+                if layer_id + 1 < expected_layers else len(donor_sequence))
+        for donor_position in range(layer_starts[layer_id], stop):
+            identity = donor_sequence[donor_position]
+            limit = min(len(sequence), cursor + CAPTURE_LOOKAHEAD)
+            hit = next((position for position in range(cursor, limit)
+                        if sequence[position] == identity), None)
+            if hit is None:
+                skipped.append({"layer_id": layer_id, "identity": identity})
+                continue
+            if first_found[layer_id] is None:
+                first_found[layer_id] = hit
+            matched_positions.add(hit)
+            found += 1
+            cursor = hit + 1
+            last = hit
+    matched_fraction = float(found) / len(donor_sequence)
+    empty_layers = [layer_id for layer_id, start in enumerate(first_found)
+                    if start is None]
+    if empty_layers or matched_fraction < CAPTURE_MIN_MATCHED_FRACTION:
+        return None, {
+            "reason": "capture_donor_not_found_in_step",
+            "matched_fraction": round(matched_fraction, 6),
+            "layers_without_match": empty_layers[:16],
+            "skipped_donor_kernels": skipped[:16],
+        }
+    end = last + 1
+    widths = [
+        (first_found[layer_id + 1] if layer_id + 1 < expected_layers else end)
+        - first_found[layer_id]
+        for layer_id in range(expected_layers)]
+    unmatched = [position for position in range(first_found[0], end)
+                 if position not in matched_positions]
+    return {
+        "body_start_position": first_found[0],
+        "body_end_position": end,
+        "layer_start_positions": first_found,
+        "layer_widths": widths,
+        "layer_ranges": [{
+            "layer_id": layer_id,
+            "start_position": first_found[layer_id],
+            "end_position": first_found[layer_id] + widths[layer_id],
+            "representative_eligible": True,
+        } for layer_id in range(expected_layers)],
+        "residual_ranges": [],
+        "capture_unmatched_positions": unmatched,
+        "prefix_row_count": first_found[0],
+        "suffix_row_count": len(sequence) - end,
+        "match_rule": "capture_launch_ordered_subsequence",
+        "capture_subsequence": {
+            "donor_kernel_count": len(donor_sequence),
+            "matched_kernel_count": found,
+            "matched_fraction": round(matched_fraction, 6),
+            "skipped_donor_kernels": skipped[:32],
+            "capture_unmatched_kernels_in_body": len(unmatched),
+        },
+    }, None
+
+
 def _map_step(step_rows, donor_passes, expected_layers):
     sequence = [
         _kernel_identity(row.get("raw_name"), row.get("event_type"))
@@ -637,12 +781,41 @@ def _map_step(step_rows, donor_passes, expected_layers):
     phase = _phase(step_rows[0].get("phase"))
     batch_size = _integer(step_rows[0].get("step_batch_size"))
     input_tokens = _integer(step_rows[0].get("step_input_tokens"))
+    candidates = _compatible_donors(
+        donor_passes, phase, batch_size, input_tokens)
+    capture_failures = []
+    for donor in candidates:
+        if donor.get("source") != "capture":
+            continue
+        group, failure = _capture_subsequence_map(
+            sequence, donor, expected_layers)
+        if group is None:
+            capture_failures.append({
+                "donor_batch_size": donor["batch_size"], **failure})
+            continue
+        group.update({
+            "phase": phase,
+            "batch_size": batch_size,
+            "input_tokens": input_tokens,
+            "recipient_step_id": step_rows[0].get("step_id"),
+            "recipient_row_count": len(step_rows),
+            "recipient_sequence_sha256": _sequence_sha(sequence),
+            "donor": {
+                "phase": donor["phase"],
+                "batch_size": donor["batch_size"],
+                "input_tokens": donor["input_tokens"],
+                "source": "capture",
+                "sequence_sha256": _sequence_sha(donor["sequence"]),
+                "event_count": len(donor["sequence"]),
+            },
+        })
+        return group, None
+
     mappings = {}
     compatible_donors = []
     considered = 0
-    for donor in donor_passes:
-        if not _bucket_matches(
-                donor, phase, batch_size, input_tokens):
+    for donor in candidates:
+        if donor.get("source") == "capture":
             continue
         considered += 1
         compatible_donors.append(donor)
@@ -656,6 +829,7 @@ def _map_step(step_rows, donor_passes, expected_layers):
             "reason": "ambiguous_exact_contiguous_donor_sequence",
             "compatible_donor_pass_count": considered,
             "exact_match_count": len(mappings),
+            "capture_donor_failures": capture_failures,
             "recipient_sequence_sha256": _sequence_sha(sequence),
         }
     if len(mappings) == 1:
@@ -728,6 +902,7 @@ def _map_step(step_rows, donor_passes, expected_layers):
             "exact_match_count": 0,
             "stable_projection_count": len(stable_mappings),
             "stable_projection_failures": stable_failures,
+            "capture_donor_failures": capture_failures,
             "recipient_sequence_sha256": _sequence_sha(sequence),
         }
 
@@ -748,6 +923,23 @@ def _map_step(step_rows, donor_passes, expected_layers):
         },
     })
     return stable, None
+
+
+def _split_step_failures(failures, analysis_step_ids):
+    """Only the steps semantics builds tables from may fail the transfer.
+
+    A capture holds several steps; a non-analysis step (e.g. an extra prefill
+    batch, or a ramp-up verify step) that cannot be mapped is reported but
+    does not discard the validated cuts of the analysis steps.
+    """
+    blocking, ignored = [], []
+    for failure in failures:
+        step_id = failure.get("step_id")
+        if step_id is not None and step_id not in analysis_step_ids:
+            ignored.append(failure)
+        else:
+            blocking.append(failure)
+    return blocking, ignored
 
 
 def transfer(donor_trace, recipient_traces, pattern_path, out_path=""):
@@ -771,8 +963,11 @@ def transfer(donor_trace, recipient_traces, pattern_path, out_path=""):
         donor_scope_source = "declared_dispatch_op_span"
     recipient_events = semantic_kernel_mapping._load_events_multi(
         recipient_traces)
-    rows, _, _, _, _ = semantic_kernel_mapping._event_rows(
+    rows, spans, _, _, _ = semantic_kernel_mapping._event_rows(
         recipient_events, pattern_doc)
+    analysis_step_ids = {
+        item["step_id"] for item in
+        semantic_kernel_mapping._select_analysis_steps(spans).values()}
     by_step = {}
     for row in rows:
         if row.get("step_id"):
@@ -829,6 +1024,8 @@ def transfer(donor_trace, recipient_traces, pattern_path, out_path=""):
             "marker_count": len(markers),
             "expected_layers": expected_layers,
         })
+    failures, non_analysis_failures = _split_step_failures(
+        failures, analysis_step_ids)
     has_residuals = any(
         group.get("residual_ranges") for group in groups)
     # A step no donor pass validates (typically a batch size the donor never ran)
@@ -849,6 +1046,8 @@ def transfer(donor_trace, recipient_traces, pattern_path, out_path=""):
         "evidence_policy": (
             "Boundary cuts only; Clean Trace rows, order, timestamps and "
             "durations are never copied or replaced."),
+        "analysis_step_ids": sorted(analysis_step_ids),
+        "non_analysis_step_failures": non_analysis_failures,
         "expected_main_layers": expected_layers,
         "patterns": {
             "path": os.path.abspath(pattern_path),

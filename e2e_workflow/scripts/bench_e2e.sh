@@ -862,8 +862,11 @@ PY
   # Python/module spans and a SHORT window, not a long statistical sample.  Its caller sets
   # GEAK_FUSION_TRACE=1, and the auto-sizing below is skipped for EVERY backend -- the window
   # is owned by the adapter in fusion mode:
-  #   sglang -> PROFILE_NUM_STEPS=1, one representative forward per separately captured stage
-  #             (profile_by_stage splits EXTEND/DECODE into their own traces).
+  #   sglang -> PROFILE_NUM_STEPS=GEAK_FUSION_PROFILE_STEPS (default 3) per separately captured
+  #             stage (profile_by_stage splits EXTEND/DECODE into their own traces). Three steps
+  #             reach a real prefill batch and a full-concurrency decode/verify step once the
+  #             client warmup is kept out of the window (see _BG_WARMUPS below); semantics then
+  #             picks one analysis step per phase.
   #   vllm   -> ProfilerConfig.max_iterations (GEAK_FUSION_MAX_ITERS, see adapters/vllm.sh).
   #             There is NO profile_by_stage, so one window must contain BOTH phases.
   # (Gating this on BACKEND = sglang let a vllm fusion capture fall into the full statistical
@@ -875,8 +878,8 @@ PY
   [ "${GEAK_FUSION_TRACE:-0}" = "1" ] && _GEAK_FUSION_CAPTURE=1
   if [ "$_GEAK_FUSION_CAPTURE" = "1" ]; then
     if [ "$BACKEND" = "sglang" ]; then
-      PROFILE_NUM_STEPS=1
-      echo ">>> Fusion semantic capture (sglang): PROFILE_NUM_STEPS=${PROFILE_NUM_STEPS}, one forward per stage (steady-state auto-sizing disabled)"
+      PROFILE_NUM_STEPS="${GEAK_FUSION_PROFILE_STEPS:-3}"
+      echo ">>> Fusion semantic capture (sglang): PROFILE_NUM_STEPS=${PROFILE_NUM_STEPS} per stage (steady-state auto-sizing disabled)"
     else
       echo ">>> Fusion semantic capture (${BACKEND}): window owned by the adapter (steady-state auto-sizing disabled)"
     fi
@@ -924,7 +927,16 @@ PY
     # sustained, replenishing background load (>CONC prompts, realistic prefill+decode mix; NOT timed, NOT
     # profiled). With PROFILE_WARMUP_SEC=0 the profiler is armed at load start so the capture includes the
     # initial prefill burst (prefill shapes stay visible for head selection).
-    REQUEST_RATE="${PROFILE_REQUEST_RATE}" \
+    # The sglang fusion window opens at load start. The client's own warmup requests
+    # (NUM_WARMUPS, 8 by default) would then be what the window captures:
+    # Qwen3.5 NEXTN recorded 16/16 verify steps at bs=8 instead of 64. The timed
+    # run above already warmed the server, so the profiled load skips warmup.
+    # vllm places its window by iteration delay (GEAK_FUSION_DELAY_ITERS), tuned
+    # with the client warmup in place, so it keeps NUM_WARMUPS.
+    _BG_WARMUPS="${NUM_WARMUPS:-}"
+    [ "$_GEAK_FUSION_CAPTURE" = "1" ] && [ "$BACKEND" = "sglang" ] && \
+      _BG_WARMUPS="${GEAK_FUSION_PROFILE_WARMUPS:-0}"
+    NUM_WARMUPS="$_BG_WARMUPS" REQUEST_RATE="${PROFILE_REQUEST_RATE}" \
       adapter_bench "$PROFILE_NUM_PROMPTS" "$CONC" 0 >/dev/null 2>&1 &
     _bg_load=$!
     sleep "$PROFILE_WARMUP_SEC"
@@ -958,9 +970,12 @@ PY
       echo "!!! KernelFusion manifest builder missing: $_TRACE_CAPABILITY" >&2
       exit 2
     fi
+    # server.log only enriches speculative facts (accept length, verify
+    # tokens); the trace alone decides decode vs verify.
     if ! python3 "$_TRACE_CAPABILITY" \
         --trace-dir "$PROFILE_DIR" \
         --auto-select-rank \
+        --server-log "$OUT_DIR/server.log" \
         --out "$_TRACE_MANIFEST"; then
       echo "!!! KernelFusion trace manifest generation failed: $_TRACE_MANIFEST" >&2
       exit 2

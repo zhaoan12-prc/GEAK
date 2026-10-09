@@ -37,7 +37,7 @@ class TraceCapabilityTest(unittest.TestCase):
                 tmp, auto_select_rank=True, require_phases=["prefill", "decode"])
             self.assertEqual(required["status"], "failed")
             self.assertEqual(required["phases_present"], ["decode"])
-            self.assertEqual(required["missing_required_phases"], ["extend"])
+            self.assertEqual(required["missing_required_phases"], ["prefill"])
 
     def test_both_phases_in_one_mixed_trace_pass(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -55,7 +55,7 @@ class TraceCapabilityTest(unittest.TestCase):
             result = trace_capability.build_manifest(
                 tmp, auto_select_rank=True, require_phases=["prefill", "decode"])
             self.assertEqual(result["status"], "pass")
-            self.assertEqual(result["phases_present"], ["decode", "extend"])
+            self.assertEqual(result["phases_present"], ["decode", "prefill"])
 
     def test_rank_sorted_manifest_and_capabilities(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -134,7 +134,7 @@ class TraceCapabilityTest(unittest.TestCase):
             self.assertEqual(result["analysis_rank"], 0)
             entry = result["trace_files"][0]
             self.assertEqual(entry["device_events_by_phase"],
-                             {"decode": 3, "extend": 2})
+                             {"decode": 3, "prefill": 2})
 
     def test_auto_selects_rank_with_largest_decode_stage(self):
         with tempfile.TemporaryDirectory() as tmp:
