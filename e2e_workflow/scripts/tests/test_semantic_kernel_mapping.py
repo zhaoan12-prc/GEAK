@@ -524,6 +524,23 @@ class PhaseCoverageTest(unittest.TestCase):
             # rank 1 must not be adopted into a rank 0 analysis
             self.assertNotIn("TP-1", found["DECODE"])
 
+    def test_sibling_discovery_with_expert_parallel_rank_segments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            names = ["1790.1-TP-0-EP-0-EXTEND.trace.json.gz",
+                     "1790.1-TP-0-EP-0-DECODE.trace.json.gz",
+                     "1790.1-TP-1-EP-1-DECODE.trace.json.gz"]
+            for name in names:
+                open(os.path.join(tmp, name), "w").close()
+            self.assertEqual(mapping._phase_tag(names[1]), "DECODE")
+            found = mapping._sibling_phase_traces(
+                os.path.join(tmp, names[1]))
+            self.assertEqual(sorted(found), ["DECODE", "EXTEND"])
+            self.assertTrue(found["EXTEND"].endswith(names[0]))
+            paths, adopted = mapping._resolve_trace_paths(
+                os.path.join(tmp, names[1]))
+            self.assertEqual([item["phase"] for item in adopted], ["EXTEND"])
+            self.assertFalse(any("TP-1" in path for path in paths))
+
     def test_b1_table_phases_never_reports_all(self):
         """`table_phases` must name observed phases, not the word 'all'."""
         coverage = mapping._phase_coverage(
