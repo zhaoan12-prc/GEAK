@@ -113,6 +113,21 @@ Phase 1.2 additionally receives `STRUCTURAL_PATTERNS_JSON`, `SEMANTIC_TABLE_JSON
    Never call `structural_pattern_mapping.py` from this role. There is no fixed-dialect or
    config-only fallback.
 
+   **Layer anchor.** By default a main layer is located by its `nn.Module: ...DecoderLayer_N` span.
+   Some runtimes enter each layer through a plain python function instead of an `nn.Module` call,
+   so no such span exists. When `layer_instance_audit.json` → `module_scope_diagnostics` reports
+   `status=no_anchor_match` (or every required step is `boundary_unresolved` with
+   `module_instance_count=0`):
+   - Find the per-layer entry in the current imported runtime source: the function or module the
+     layer loop calls once per main layer, enclosing that layer's attention and FFN.
+   - Re-run `semantic_kernel_mapping.py` with `--layer-anchor '<regex matching that span name>'`.
+     Also write the same regex list as top-level `layer_anchor_regexes` in
+     `STRUCTURAL_LAYER_PATTERNS.agent.json` and re-validate, so `complete_table` and the boundary
+     transfer use the same anchor.
+   - Cite the runtime source (`path`, `line_start`, `symbol`) for the anchor in `notes`.
+   Every boundary gate still applies to an explicit anchor. If it does not produce complete
+   passes, report the failure; never loosen a gate or partition from recurring stages.
+
    Phase-1 presentation contract includes both phases in execution order:
    **Prefill tables first, then Decode tables**. Keep `--table-phases all`;
    the deterministic script owns this ordering.

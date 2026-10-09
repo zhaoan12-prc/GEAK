@@ -272,6 +272,81 @@ class SemanticKernelMappingTest(unittest.TestCase):
             self.assertTrue(all(item["boundary_complete"] for item in audit["instances"]))
             self.assertEqual({item["layer_id"] for item in audit["instances"]}, {0, 1})
 
+    def _function_layer_case(self, tmp, anchor_in_doc=None):
+        """Two layers entered through a plain python function, no DecoderLayer."""
+        patterns = os.path.join(tmp, "patterns.json")
+        doc = {
+            "schema_version": 1,
+            "num_hidden_layers_main": 2,
+            "patterns": [{"pattern_id": "P_BODY", "pattern_display_name": "Body",
+                          "layer_ids": [0, 1]}],
+            "coverage_check": {"total_main_layers": 2, "covered": 2,
+                               "mutually_exclusive": True, "full_coverage": True},
+            "quality": {"status": "pass"},
+        }
+        if anchor_in_doc:
+            doc[mapping.LAYER_ANCHOR_KEY] = [anchor_in_doc]
+        with open(patterns, "w") as fh:
+            json.dump(doc, fh)
+        layer_fn = "pkg/model_layers.py(464): forward_layer_fused_boundary"
+        events = [
+            {"cat": "gpu_user_annotation", "name": "step[EXTEND bs=1 toks=8]",
+             "ts": 0, "dur": 100},
+            {"cat": "python_function", "name": layer_fn, "ts": 10, "dur": 20},
+            {"cat": "python_function", "name": "nn.Module: AttnLayer_0",
+             "ts": 11, "dur": 5},
+            {"cat": "python_function", "name": layer_fn, "ts": 40, "dur": 20},
+            {"cat": "python_function", "name": "nn.Module: AttnLayer_1",
+             "ts": 41, "dur": 5},
+            {"cat": "cpu_op", "name": "aten::mm", "ts": 12, "dur": 2,
+             "args": {"External id": 1, "Input Dims": [[2, 2]]}},
+            {"cat": "cpu_op", "name": "aten::mm", "ts": 42, "dur": 2,
+             "args": {"External id": 2, "Input Dims": [[2, 2]]}},
+            {"cat": "kernel", "name": "attention_kernel", "ts": 70, "dur": 2,
+             "args": {"External id": 1, "stream": 7}},
+            {"cat": "kernel", "name": "attention_kernel", "ts": 74, "dur": 2,
+             "args": {"External id": 2, "stream": 7}},
+        ]
+        trace = os.path.join(tmp, "trace.json")
+        with open(trace, "w") as fh:
+            json.dump({"traceEvents": events}, fh)
+        return trace, patterns, layer_fn
+
+    def test_explicit_function_anchor_partitions_moduleless_layers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trace, patterns, _ = self._function_layer_case(
+                tmp, anchor_in_doc=r"model_layers\.py\(\d+\): forward_layer_fused_boundary$")
+            result = mapping.build(trace, patterns, os.path.join(tmp, "out"))
+            with open(result["layer_instance_audit_json"]) as fh:
+                audit = json.load(fh)
+            self.assertEqual(audit["module_scope_count"], 2)
+            self.assertEqual({item["layer_id"] for item in audit["instances"]}, {0, 1})
+            self.assertTrue(all(item["boundary_complete"] for item in audit["instances"]))
+
+    def test_layer_anchor_argument_overrides_the_pattern_document(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trace, patterns, _ = self._function_layer_case(tmp)
+            result = mapping.build(
+                trace, patterns, os.path.join(tmp, "out"),
+                layer_anchors=[r"forward_layer_fused_boundary$"])
+            with open(result["layer_instance_audit_json"]) as fh:
+                audit = json.load(fh)
+            self.assertEqual(audit["module_scope_count"], 2)
+            self.assertTrue(all(item["boundary_complete"] for item in audit["instances"]))
+
+    def test_unmatched_anchor_never_selects_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trace, patterns, layer_fn = self._function_layer_case(tmp)
+            with open(trace) as fh:
+                events = json.load(fh)["traceEvents"]
+            with open(patterns) as fh:
+                doc = json.load(fh)
+            spans = mapping._collect_step_spans(events)
+            scopes, diagnostics = mapping._module_layer_scopes(events, spans, doc)
+            self.assertEqual(scopes, [])
+            self.assertEqual(diagnostics[0]["status"], "no_anchor_match")
+            self.assertEqual(diagnostics[0]["anchor_source"], "decoder_layer_module")
+
     def test_cpu_module_spans_use_the_cpu_step_window_not_the_gpu_one(self):
         """Eager decode: host wall-clock >> device time, so the GPU-side
         `step[...]` window covers only a fraction of the CPU-side
