@@ -47,7 +47,7 @@ class AccuracyGateContractTest(unittest.TestCase):
                     "GSM8K_THINKING: FUSION_GSM8K_THINKING",
                     "ACCURACY_STACK_KEY: accuracyKey",
                     "fusionAccuracyRef.stack_key === accuracyKey",
-                    "AB_DECIDE_SCRIPT:", "AB_MAX_PAIRS: FUSION_AB_MAX_PAIRS"):
+                    "AB_DECIDE_SCRIPT:", "AB_MAX_PAIRS: abPairs"):
             self.assertIn(key, block)
 
     def test_thinking_is_off_by_default(self):

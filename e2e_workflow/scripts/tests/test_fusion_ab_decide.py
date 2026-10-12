@@ -54,5 +54,76 @@ class FusionAbDecideTest(unittest.TestCase):
         self.assertIn("AB_DECISION=accept", buf.getvalue())
 
 
+class SmallGainRouteTest(unittest.TestCase):
+    """Expected gain below the noise band: a solo A/B cannot resolve it (B.11)."""
+
+    # Qwen3.5-397B, CONC=4 / NUM_PROMPTS=40: one config spans 263-268 tok/s (+-1%).
+    REF = [265.3, 263.9]
+
+    def test_in_noise_non_regressing_small_gain_goes_to_the_stack(self):
+        out = ab.decide(self.REF, [265.9, 264.6], noise_band_pct=1.0, expected_gain_pct=0.66)
+        self.assertTrue(out["small_gain_route"])
+        self.assertEqual(out["decision"], "stack_pending")
+
+    def test_small_gain_regression_is_still_rejected(self):
+        out = ab.decide(self.REF, [260.0, 259.5], noise_band_pct=1.0, expected_gain_pct=0.66)
+        self.assertTrue(out["regression"])
+        self.assertEqual(out["decision"], "reject")
+
+    def test_slightly_slower_but_inside_the_band_is_not_a_regression(self):
+        out = ab.decide(self.REF, [263.5, 264.0], noise_band_pct=1.0, expected_gain_pct=0.96)
+        self.assertEqual(out["decision"], "stack_pending")
+
+    def test_a_clear_win_is_accepted_even_when_small_was_expected(self):
+        out = ab.decide([191.154, 191.096], [202.704, 202.411], noise_band_pct=1.0,
+                        expected_gain_pct=0.5)
+        self.assertEqual(out["decision"], "accept")
+
+    def test_one_pair_is_still_not_enough(self):
+        out = ab.decide([265.3], [265.9], noise_band_pct=1.0, expected_gain_pct=0.66)
+        self.assertEqual(out["decision"], "continue")
+
+    def test_an_expected_gain_above_the_band_uses_the_solo_rule(self):
+        out = ab.decide(self.REF + [264.5], [265.9, 264.6, 265.0], noise_band_pct=1.0,
+                        expected_gain_pct=6.0)
+        self.assertFalse(out["small_gain_route"])
+        self.assertEqual(out["decision"], "reject")
+
+    def test_cli_prints_stack_pending(self):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ab.main(["--ref", "265.3", "263.9", "--cand", "265.9", "264.6",
+                     "--noise-band-pct", "1.0", "--expected-gain-pct", "0.66"])
+        self.assertIn("AB_DECISION=stack_pending", buf.getvalue())
+
+
+class StackStepTest(unittest.TestCase):
+    def test_clear_no_regression_keeps_early(self):
+        out = ab.decide_stack_step([265.0, 265.1], [265.4, 265.3], noise_band_pct=1.0)
+        self.assertEqual(out["decision"], "keep")
+        self.assertEqual(out["keep_threshold_pct"], -0.5)
+
+    def test_clear_regression_drops_early(self):
+        out = ab.decide_stack_step([265.0, 265.1], [260.0, 260.2], noise_band_pct=1.0)
+        self.assertEqual(out["decision"], "drop")
+
+    def test_borderline_runs_to_max_pairs_then_uses_the_threshold(self):
+        ref, cand = [265.0, 266.0], [264.0, 264.2]
+        self.assertEqual(ab.decide_stack_step(ref, cand, 1.0)["decision"], "continue")
+        out = ab.decide_stack_step(ref + [265.5], cand + [264.1], 1.0)
+        self.assertEqual(out["decision"], "drop" if out["delta_pct"] < -0.5 else "keep")
+
+    def test_cli_stack_step(self):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ab.main(["--ref", "265", "265.1", "--cand", "265.4", "265.3",
+                     "--noise-band-pct", "1.0", "--stack-step"])
+        self.assertIn("AB_DECISION=keep", buf.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

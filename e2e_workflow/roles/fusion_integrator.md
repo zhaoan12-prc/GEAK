@@ -93,6 +93,48 @@ stops engaging.
 interleaved median delta is inflated by the low replicas. Report the delta against the stored
 baseline as well, and cross-check it against the kernel time the trace shows removed.
 
+## 🔴 Serving-GPU lease and process ownership (read before starting anything)
+
+The **workflow** owns the serving GPUs, not you. Before invoking you it acquired the lease
+`GPU_LEASE_ID` (registry file `GPU_LEASE_FILE`, helper `GPU_LEASE_SCRIPT`); after you return it
+waits for every process registered under that lease and then reaps exactly those, by the
+identity recorded at launch. Why this exists — Qwen3.5-397B (20261010): e03 started its A/B
+driver with `nohup`/`setsid` and returned "not finished"; the driver was reparented to PID 1
+and held all eight GPUs. e04…e08 then saw the GPUs occupied, correctly refused to kill a
+process they had not started, and returned "blocked" with **nothing measured**. Five of eight
+Top-K entries were lost to the workflow's own orphan.
+
+- **Register every process you start** — A/B driver, every `bench_e2e.sh` leg, any server you
+  launch yourself, gsm8k / probe clients:
+  ```bash
+  # long work: the helper starts it in its own session (pgid == pid) and registers it
+  python3 "$GPU_LEASE_SCRIPT" launch --lease-dir "$GPU_LEASE_DIR" --lease-id "$GPU_LEASE_ID" \
+    --log "$APPLY_DIR/ab_driver.log" --role ab_driver -- bash "$APPLY_DIR/ab_driver.sh"
+  # a pid you started yourself, immediately after starting it
+  python3 "$GPU_LEASE_SCRIPT" register --lease-dir "$GPU_LEASE_DIR" --lease-id "$GPU_LEASE_ID" \
+    --pid "$SERVER_PID" --role server
+  ```
+  With `EXEC_PREFIX`, run the helper through it too (same pid namespace as the work).
+- **Never background an A/B and return.** No `nohup`, no `setsid`, no trailing `&`, no
+  `disown` for an A/B driver, bench or server — the helper's `launch` subcommand is the only
+  sanctioned detached start, because it registers what it starts. A long A/B runs in the
+  **foreground of this call**: launch it, then poll
+  ```bash
+  python3 "$GPU_LEASE_SCRIPT" wait --lease-dir "$GPU_LEASE_DIR" --lease-id "$GPU_LEASE_ID" --max-s 540
+  ```
+  One `wait` fits inside the Bash tool's 10-minute limit (it is capped at 570 s); repeat it —
+  reading `progress.log` between rounds if you like — until it reports `alive_count: 0`. A
+  3-pair A/B plus gsm8k is several such rounds; that is expected. **Never return while it
+  reports anything alive**: the workflow reaps a returned call's survivors, and the result you
+  return without their numbers is not a measurement.
+- **Do not judge GPU occupancy.** If `bench_e2e.sh` waits on its serving lock, let it wait. If you
+  truly cannot measure (the lock never frees, the A/B cannot finish in this call), return the
+  entry in `retry` with `reason_code: gpu_busy | not_finished | not_reached` and
+  `measured: false`. That is **not** a disposition: the workflow re-runs it after the lease is
+  free. Never write it into `rejected`.
+- Never kill, signal or wait on a process you did not start (PROCESS SAFETY below still holds in
+  full). Reaping the lease is the workflow's job.
+
 ## Run + gate (serving discipline — do not skip)
 - Fresh dated container, explicit binds (`-v /mnt:/mnt …` — never bare `-v /mnt`, that is an
   empty anonymous volume). Delete it at the end. When `EXEC_PREFIX` names the runtime container,
@@ -223,13 +265,59 @@ baseline as well, and cross-check it against the kernel time the trace shows rem
   otherwise decides at `AB_MAX_PAIRS` on `cand_min > ref_max` AND delta > noise band. Put the
   decision JSON in `apply_result.json`. Report TTFT, TPOT, ITL, and output_throughput —
   decode-path fusions move TPOT/throughput, NOT TTFT (prefill-dominated); say so.
+  **Small-gain route.** When `SMALL_GAIN_ROUTE` is true (the entry's `EXPECTED_GAIN_PCT`
+  is below `NOISE_BAND_PCT`, so a solo A/B can never resolve it — CONC=4/NUM_PROMPTS=40 on
+  Qwen3.5-397B spans ±1%, and AR+Norm+Quant is worth ~+0.66%), also pass
+  `--expected-gain-pct "$EXPECTED_GAIN_PCT"`: after 2 pairs it answers
+  `AB_DECISION=stack_pending` when there is no regression (`delta > −noise band`), `reject` on
+  a regression, `accept` only on a clear win. On `stack_pending` with the unit gates passed and
+  the overlay ENGAGED, return the entry as stack-pending (below) — do not spend more pairs or a
+  gsm8k run on it; greedy stacking (PHASE=apply_stack_step) measures accuracy for the stack.
   **Measurement lifecycle:** run every ref and cand leg through `$EVAL_DIR/bench_e2e.sh` with
   `GEAK_REPEAT_MODE=$MEASUREMENT_MODE` (the lifecycle the baseline and Validate use), one
   invocation per leg. Do not call `bench_replica.sh` directly and do not mix lifecycles: a
   `warm_server` leg and an `isolated_server` leg are not comparable. Record the lifecycle in
   `apply_result.json` next to the A/B numbers.
 - **Accuracy verification (精度验证 — mandatory, after a passing A/B, for any fusion whose
-  unit-side parity is not bit-exact, quant or not).**
+  unit-side parity is not bit-exact, quant or not) — decided by the CALIBRATED gate.**
+  The workflow measured a base-vs-base control before the first apply-back call
+  (PHASE=calibrate_accuracy → `ACCURACY_CALIBRATION_JSON`). Qwen3.5-397B (20261010): two
+  boots of the identical base scored 0.555 and 0.465 on gsm8k n=200 no-thinking (p=0.041,
+  48% of questions flipped) — and that harness then "failed" fusions. A test that fails the
+  base against itself cannot reject anything. The verdict therefore comes from
+  `ACCURACY_GATE_SCRIPT` (`scripts/fusion_accuracy_gate.py`):
+  ```bash
+  python3 "$ACCURACY_GATE_SCRIPT" decide --calibration "$ACCURACY_CALIBRATION_JSON" \
+    --base-gsm8k <base gsm8k json> --cand-gsm8k <cand gsm8k json> \
+    [--det-base <base probe json> --det-cand <cand probe json>] \
+    [--unit-ybit <fp8 ybit from the unit test> | --unit-rel-err <rel err>] \
+    --out "$APPLY_DIR/accuracy_decision.json"   # exit 0 pass, 1 fail, 3 inconclusive
+  ```
+  - calibration `mode=gsm8k` → the gsm8k verdict below (`accuracy_gate.py`) decides and may reject;
+  - otherwise gsm8k is **informational only** and can never reject. Run the deterministic
+    probe (`"$ACCURACY_GATE_SCRIPT" probe --base-url "$BASE_URL/v1" --model "$MODEL" --out
+    <leg>/probe.json`: fixed prompts, greedy, one request at a time) on the candidate server
+    and pass it with a base probe of the SAME stack — the calibration's `det_base_probe_json`
+    while nothing has been accepted since calibration, otherwise a probe taken on a ref leg
+    (CURRENT_*) of this A/B;
+  - a fusion numerically equivalent at the unit level (fp8 ybit ≥ 0.99, or error within the fp8
+    quantization noise) is never rejected by an uncalibrated test;
+  - `inconclusive` → neither accept nor reject on it: run the deterministic probe, or both legs
+    with `--limit 1319` and thinking on, and decide again.
+  **If ACCURACY_MODE=skip** (set for the whole round when the calibration found neither gsm8k
+  nor the deterministic probe usable; `GSM8K_EVAL_SCRIPT` is then empty): do NOT run gsm8k or
+  the deterministic probe for this call; accuracy is gated only by unit numerical equivalence
+  (UNIT_SIDE parity). Record `accuracy: {mode: 'skipped', reason: 'calibration_unusable',
+  calibration_json: ACCURACY_CALIBRATION_JSON}` in the returned row (and `accuracy_pass: true`
+  for a stacking step unless the unit parity failed) and decide on the A/B alone. If you call
+  the gate script anyway, use `decide --accuracy-mode skip --unit-parity <pass|fail>`; for the
+  combined decision use `fusion_combined_decide.py --accuracy-mode skip`. Never reject on
+  accuracy (`accuracy_fail`) in this mode. When ACCURACY_MODE is absent or `gate`, the rules
+  below apply unchanged.
+  A rejection on accuracy is `blocked_evidence: accuracy_fail` and must cite
+  `accuracy_decision.json` with `test_used` ≠ `none`. When `ACCURACY_CALIBRATION_JSON` is empty
+  the gate is uncalibrated: write `{"mode": "unit_equivalence_only"}` to
+  `$APPLY_DIR/calibration.json`, pass that, and the same rules apply.
   Run `"$GSM8K_EVAL_SCRIPT"` with exactly this harness on both sides:
   `--limit 200 --max-tokens 4096 --seed 0 --concurrency "$GSM8K_CONCURRENCY"`, plus
   `--no-thinking` when `GSM8K_THINKING` is false (the default).
@@ -247,7 +335,8 @@ baseline as well, and cross-check it against the kernel time the trace shows rem
   - Thinking off is enough for a same-harness base-vs-candidate delta; it is not the model's
     reported accuracy (the Director's Validate measures that). With thinking on, keep
     `--max-tokens` ≥4096 (at 1024 a reasoning model's CoT is cut before `#### N`: ~15pt drop).
-  - **Verdict: `accuracy_gate.py`, not a threshold you apply by eye.**
+  - **gsm8k verdict (used directly only under a calibrated `mode=gsm8k`): `accuracy_gate.py`,
+    not a threshold you apply by eye.**
     ```bash
     python3 "$SKILL_DIR/scripts/accuracy_gate.py" --base <base gsm8k json> --cand <cand gsm8k json> \
       --tol "$ACCURACY_TOL" --out "$APPLY_DIR/accuracy_gate.json"   # exit 0 pass, 1 fail, 3 inconclusive
@@ -281,6 +370,8 @@ NOT settle for the narrow flag when a wider fused kernel wires + gates. Record w
 accepted and why the wider ones were rejected (missing-kernel vs gate-fail).
 
 ### The exec-level ladder (`subsumed_by` / `subsumes` on the execution list)
+(Not to be confused with an alternative group — `alt_group` / `alt_ladder` — which the
+WORKFLOW walks one rung per call; see PHASE=apply_one.)
 The ranker marks rows whose removable-row set is a strict SUBSET of another row's
 (`subsumed_by`, `ladder_top`): AR+norm sits inside AR+norm+quant. Unit-side those rungs
 share one microbench — the top's run exercises every row the subset would remove, so a
@@ -320,7 +411,7 @@ gsm8k_base, gsm8k_cand, reprofile_ok, overlay_path, skipped_branches, notes}`.
 
 ## PHASE=apply_one — apply one execution-list entry (called serially by KernelFusion)
 
-The board is `fusion_screen.py`, not the old unit-side ladder. There is no `FUSION_UNITSIDE_JSON` gate. The workflow applies every entry of the final Top-K, one call per entry; this call handles only `TARGET_EXEC_ID`.
+The board is `fusion_screen.py`. Phase 3.0 (单侧 gate) has already run over every Top-K entry: `UNIT_SIDE` carries this entry's candidate statuses (best measured side) and `FUSION_UNITSIDE_JSON` / `04_FUSION_UNITSIDE.md` hold the verdicts, the measured speedups and the authored kernels (`$EVAL_DIR/fusion/unitside/<candidate_id>/`). **Reuse them**: do not re-run a unit test that already passed on the captured shapes; re-test only what you change (an adapter-side layout fix, a different rung). An entry the unit gate measured as a loss on every side never reaches you (the workflow records it `blocked`/`unit_fail`). `UNIT_SIDE.statuses` empty means Phase 3.0 did not measure it (skipped by argument, or no verdict): then unit-test it yourself as below. The workflow applies every entry of the final Top-K, one call per entry; this call handles only `TARGET_EXEC_ID`.
 
 Always author a fused kernel for the chain. When `TARGET_EXECUTION.compare_existing` is true, also wire the existing fusion kernel, measure both against `TARGET_EXECUTION.estimated_speedup`, and keep whichever is better. When it is false, the self-authored kernel is the only side.
 
@@ -328,7 +419,38 @@ Existing kernel first. `TARGET_EXECUTION.matched_existing_kernels` lists the cat
 
 Both phases. When `TARGET_EXECUTION.phases` has prefill and decode, the entry is one seam that runs in both (`row_ids` in one phase, `partner_row_ids` in the other). Wire it once at the seam; the unit test covers both captured shapes; the serving A/B measures both.
 
-Stack pending. When a side passes both unit checks, is ENGAGED in serving, does not regress throughput or accuracy, but its A/B stays inside the noise band, return it in `rejected` with `stack_pending: true`, its `overlay_path`, `throughput_delta_pct`, `tpot_delta_pct` and the unit results. Do not leave it in `deferred`. The workflow gates all stack-pending entries together after the last `apply_one` (PHASE=apply_stack).
+Stack pending. When a side passes both unit checks, is ENGAGED in serving, does not regress throughput (or, when measured, accuracy), but its A/B stays inside the noise band — or `AB_DECISION=stack_pending` on the small-gain route — return it in `rejected` with `stack_pending: true`, `measured: true`, its `overlay_path`, `throughput_delta_pct`, `tpot_delta_pct`, `expected_gain_pct` and the unit results. Do not leave it in `deferred`. After the last `apply_one` the workflow runs greedy stacking over every stack-pending entry (PHASE=apply_stack_step, one marginal A/B per entry on top of the current stack, then PHASE=apply_stack_confirm) — even a single one — and the final report counts it only once its stacking step has measured it (`stack_result`).
+
+Decision table for one rung (the workflow and the apply-back gate apply exactly this):
+
+| outcome | condition | return it as |
+|---|---|---|
+| accepted | A/B clears the noise band (non-overlapping) AND the calibrated accuracy decision passes | `accepted_fusions[]` — it becomes the base of every later call |
+| stack_pending (direct) | `EXPECTED_GAIN_PCT` < noise band (`SMALL_GAIN_ROUTE`), unit pass + ENGAGED + no regression — no solo verdict is attempted | `rejected[]` with `stack_pending: true`, `measured: true` |
+| stack_pending | A/B inside the noise band, unit pass + ENGAGED + no regression | same |
+| rejected | measured regression, accuracy fail, unit fail — WITH the measured evidence | `rejected[]` with `measured: true`, `blocked_evidence`, the numbers; for an alternative group the workflow then moves to the next rung |
+| wire_failure | the fused path never ran: not ENGAGED on every rank, not captured by the CUDA graph (eager only), or the overlay never loaded | `rejected[]` with `blocked_evidence: wire_failure` (or `not_engaged`) and `wire_cause`; the FIRST occurrence is not a verdict — the workflow calls you once more with `WIRE_RETRY` |
+| retry | GPU busy / measurement not finished / not reached (non-terminal, at most `FUSION_APPLY_RETRIES` re-runs) | `retry[]` with `reason_code`, `measured: false` |
+
+An entry without measured evidence is not accounted for.
+
+Wire retry. When `WIRE_RETRY` is set, the previous attempt of THIS rung failed to wire. Diagnose
+before measuring anything: grep the server log for the `[overlay-…] ENGAGED` banner on every
+TP rank; confirm the fused path is captured by the CUDA graph (a seam that only runs eagerly
+does nothing in graph-replayed decode — patch the module the graph captures, or the
+graph-capture path itself); confirm the overlay dir is really on the server's `PYTHONPATH` and
+imported before the model is built. Fix what you find, then run the A/B once. A second wiring
+failure is returned as `blocked_evidence: wire_failure` with `wire_cause` and stands; it is
+written back as the next round's highest-priority candidate.
+
+Fallback mode. `FALLBACK_MODE: true` means the landing guarantee fired: at half the apply-back
+budget fewer than `MIN_LANDED` fusions had landed, so the workflow is re-running only
+positive-prior and unit-passed entries, highest confidence first. `AB_MAX_PAIRS` is already
+doubled: use the extra pairs to push the noise down, do not stop early on an in-band result.
+A unit-passed entry whose expected gain is below the noise band is not sent to you in this
+mode; it is stacked onto the landed set by PHASE=apply_stack_step.
+
+Alternative groups. An execution entry may be one slot of an alternative group (`alt_group`, `alt_ladder`, best first; rung 0 is the entry): alternative windows that eliminate the same kernel instance, of which at most one can land. Phase 3.0 unit-tested every rung (`<exec_id>.r<rung>` candidate ids). The workflow walks the ladder: it calls you with `TARGET_RUNG` / `TARGET_EXECUTION` set to ONE rung and `RUNG_ATTEMPTS` holding the measured failures of the rungs before it. Apply only that rung's window; keep `exec_id` = the slot's `exec_id` and set `rung` on the row you return. Do not walk the ladder yourself and do not try other rungs: a measured rejection of this rung is the workflow's cue to call you for the next one; the first rung that is accepted or stack_pending ends the slot. A rung whose unit test failed on every side is skipped without a server. Calls arrive in confidence-weighted expected-gain order (`expected_e2e_gain_pct` × confidence: positive measured prior 1.0, existing kernel 0.7, self-authored 0.5, negative prior 0.1), with the highest-confidence entry first — not board order.
 
 Every implementation, existing or self-authored, needs its own unit test against the unfused reference chain at the captured shapes and dtypes:
 
@@ -358,7 +480,7 @@ entry already present in `PRIOR_APPLY_RESULT.accepted_fusions`, do not launch a 
 return the unchanged aggregate after regenerating the report. The harness owns the derived
 `blocked_by_exclusion` classification.
 
-1. Read `FUSION_TOPK_JSON` and locate `TARGET_EXEC_ID` in `execution_list`. It is eligible because it already passed `fusion_screen.py`. Do not drop it for a missing unit-side status. `FUSION_UNITSIDE_JSON` may be empty. Apply only `TARGET_EXEC_ID`; do not select a different entry.
+1. Read `FUSION_TOPK_JSON` and locate `TARGET_EXEC_ID` in `execution_list`. It is eligible because it already passed `fusion_screen.py`. Do not drop it for a missing unit-side status (a `needs_diagnosis` / `blocked` / unmeasured unit result is yours to diagnose, not a reason to skip). Apply only `TARGET_EXEC_ID`; do not select a different entry.
    Tier-A belongs here, not ConfigSweep: apply its one flag/env,
    run serving A/B, verify the fused kernel/route engagement, and keep or revert it
    before returning.
@@ -381,7 +503,8 @@ return the unchanged aggregate after regenerating the report. The harness owns t
    fusion_only_delta_pct,secondary_effect_delta_pct,nonoverlap,gsm8k_base,gsm8k_cand,engaged}],
    final_overlay (the stacked combined-loader dir),
    accepted_flags, accepted_env, e2e_throughput_tok_s (final),
-   rejected:[{exec_id,reason}], deferred:[{exec_id,reason}],
+   rejected:[{exec_id,reason,measured:true,blocked_evidence}], deferred:[{exec_id,reason}],
+   retry:[{exec_id,reason_code:gpu_busy|not_finished|not_reached,reason,measured:false}],
    deferred_author_count, applyback_gate_json, applyback_report_md,
    learned_cards:[{card,action:merged|inserted|archived,key,confidence}],
    accuracy_reference (when this call measured the base), accepted_accuracy (when it accepted), notes}`. Return the full
@@ -399,25 +522,77 @@ target chain under the same dtype/backend/config. Put dtype changes, backend swa
 different kernel selection, batching, or unrelated memory-pressure effects in
 `secondary_effect_delta_pct`; never credit the full mixed delta to fusion.
 
-## PHASE=apply_stack — gate the in-noise fusions together (called once, after the last apply_one)
+## PHASE=apply_stack_step — one greedy stacking step (called once per stacking candidate)
 
-Inputs are the apply_one inputs plus `STACK_ENTRIES`: the `rejected` rows that carry
-`stack_pending: true`. Each already passed unit accuracy and unit speedup and was
-ENGAGED in serving; only its single A/B sat inside the noise band.
+Greedy stacking replaces "stack everything, then drop members": each candidate's MARGINAL
+effect is measured on top of the current stack, in expected-gain order, so one harmful
+member cannot hide several useful ones. `scripts/fusion_stack_greedy.py` (driven by the
+workflow) owns the order, the keep/drop decision, retries and the budget stop; you only
+measure.
 
-1. Stack every entry's `overlay_path` onto `CURRENT_OVERLAY` with one combined-loader and
-   verify every entry's `[overlay-…] ENGAGED` banner on all ranks.
-2. Gate the stack exactly like apply_one: interleaved A/B against `CURRENT_OVERLAY`
-   (`cand_min > ref_max` and above `NOISE_BAND_PCT`), then the gsm8k accuracy check.
-3. On failure, drop the entry with the smallest single-entry `throughput_delta_pct` and
-   re-gate. Stop at two entries; one entry alone was already measured.
-4. Accepted entries go to `accepted_fusions` with `stacked_with` listing the other exec_ids,
-   `throughput_delta_pct` for the whole stack, and each entry's single-entry delta kept in
-   `single_delta_pct`. Entries that never pass stay in `rejected`: keep `stack_pending`
-   and add `stack_result` with the stacked A/B numbers.
+Inputs are the apply_one inputs plus `STACK_CANDIDATE` (`{id, exec_id, source, overlay_path,
+expected_gain_pct, row}`; `source` is `stack_pending` — a solo-measured in-noise / small-gain
+entry with its overlay — or `candidate_pool` — a below-threshold board item whose unit test
+passed, with its authored kernel under `row.kernel_dirs`), `CURRENT_STACK` (`{overlay, flags,
+env, tput, members}`: the accepted stack plus every candidate kept so far), `STACK_STEP`,
+`KEEP_THRESHOLD_PCT` (= −noise band / 2), `STACK_DIR`, `STACK_ATTEMPT`.
 
-Return the full aggregate (`PRIOR_APPLY_RESULT` plus this call) in `FUSION_APPLY_SCHEMA`,
-with `final_overlay` pointing at the accepted combined-loader.
+1. Build ONE combined-loader overlay = `CURRENT_STACK.overlay` + the candidate. A
+   `candidate_pool` item has no overlay yet: author the adapter at its seam from the unit-side
+   kernel (the adapter pattern above). Verify every member's `[overlay-…] ENGAGED` banner on
+   all ranks.
+2. ONE interleaved serving A/B: ref = `CURRENT_STACK`, cand = the new combined overlay, decided
+   pair by pair with `"$AB_DECIDE_SCRIPT" --stack-step --noise-band-pct "$NOISE_BAND_PCT"`
+   (keep / drop / continue at −noise band / 2). Then the calibrated accuracy decision
+   (`ACCURACY_GATE_SCRIPT decide`, same as apply_one; an uncalibrated test cannot fail it).
+3. Do NOT decide keep/drop yourself and do not drop other members. Return
+   `FUSION_STACK_STEP_SCHEMA`: `{id, measured: true, delta_pct (median cand vs median ref, %),
+   ref_tok_s: [...], cand_tok_s: [...], ab_decision, accuracy_pass, accuracy_verdict,
+   engaged, stack_overlay (the new combined overlay dir), stack_flags, stack_env, evidence
+   (the A/B JSON path), reason}`. The workflow keeps the candidate iff `delta_pct ≥
+   KEEP_THRESHOLD_PCT` and `accuracy_pass`; otherwise it is dropped and recorded as
+   `stack_harmful` (a negative prior for that seam).
+4. GPU busy / not finished → `{measured: false, reason_code: gpu_busy|not_finished, reason}`.
+   That is never a verdict: the workflow re-runs the same step.
+
+## PHASE=apply_stack_confirm — confirm the final greedy stack (called once, after the last step)
+
+Inputs: `FINAL_STACK` (`{overlay, flags, env, tput, members}`), `KEPT` (the members greedy
+stacking added), `FUSION_ENTRY_OVERLAY/FLAGS/ENV/THROUGHPUT` (the stack KernelFusion started
+from), the A/B and accuracy inputs, the lease inputs. ONE interleaved serving A/B: ref =
+`FUSION_ENTRY_*`, cand = `FINAL_STACK`, with `AB_DECIDE_SCRIPT` (no `--expected-gain-pct`, no
+`--stack-step`: the whole stack must clear the noise band), then the calibrated accuracy
+decision. Return `FUSION_STACK_STEP_SCHEMA` with `{measured, ab_decision, delta_pct,
+nonoverlap, accuracy_pass, final_overlay (= FINAL_STACK.overlay), ref_tok_s, cand_tok_s,
+evidence, reason}`. The stack lands only on `ab_decision: accept` with `accuracy_pass`;
+otherwise the kept members are reported `stack_reject` and the accepted stack stays as it was.
+Persist the landed combined overlay under `FUSION_OVERLAYS_DIR/<model>/combined/`.
+
+Both stacking phases follow the lease rules above: everything you start is registered and
+finished in the foreground before you return.
+
+## PHASE=calibrate_accuracy — the base-vs-base control (called once, before the first apply_one)
+
+Inputs: `CURRENT_OVERLAY/FLAGS/ENV`, `CALIBRATION_DIR`, `ACCURACY_GATE_SCRIPT`,
+`GSM8K_EVAL_SCRIPT`, `GSM8K_CONCURRENCY`, `GSM8K_THINKING`, `ACCURACY_STACK_KEY`, the lease
+inputs. Measure nothing but the control.
+
+1. Boot the base config (CURRENT_*) through `bench_e2e.sh` with the gsm8k harness of apply_one
+   as its post-bench hook (`--limit 200 --max-tokens 4096 --seed 0 --concurrency
+   "$GSM8K_CONCURRENCY"`, `--no-thinking` unless `GSM8K_THINKING`), plus the deterministic probe
+   (`"$ACCURACY_GATE_SCRIPT" probe --base-url "$BASE_URL/v1" --model "$MODEL" --out
+   $CALIBRATION_DIR/base_a/probe.json`). Then boot it a SECOND time, identically, into `base_b/`.
+   Two boots, not two runs on one server: boot-to-boot variation is part of what a base-vs-cand
+   comparison sees. Register both servers / drivers under the lease and finish in the foreground.
+2. ```bash
+   python3 "$ACCURACY_GATE_SCRIPT" calibrate --gsm8k-a base_a/gsm8k.json --gsm8k-b base_b/gsm8k.json \
+     --det-a base_a/probe.json --det-b base_b/probe.json --tol "${ACCURACY_TOL:-0.01}" \
+     --out "$CALIBRATION_DIR/calibration.json"
+   ```
+3. Return `{calibration_json, mode, gsm8k_usable, deterministic_usable, accuracy_can_reject,
+   det_base_probe_json: base_a/probe.json, base_reference: {stack_key: ACCURACY_STACK_KEY,
+   exact_match, n, path: base_a/gsm8k.json, harness: {limit, max_tokens, concurrency, thinking}},
+   notes}`. If the gsm8k control fails, say so in `notes` with both scores and the flip rate.
 
 ## 🔴 Coverage — the execution list is your denominator (mandatory, harness-enforced)
 
@@ -428,7 +603,10 @@ checks that before your return is trusted:
 | disposition | when | who says it |
 |---|---|---|
 | `applied` | integrated, gated, kept | you — `accepted_fusions[]` |
-| `blocked` | attempted or ruled out — wire failure, accuracy gate, kernel not built, 单侧 fail | you — `rejected[]`, **with a reason** |
+| `blocked` | **measured** rejection — unit fail, e2e regression / no gain, calibrated accuracy fail, not engaged, wire failure, kernel not built | you — `rejected[]`, **with a reason, `measured: true` and `blocked_evidence`** |
+| `unmeasured` | GPU busy, A/B not finished, not reached — NOT a disposition | you — `retry[]` with `reason_code`; the workflow re-runs it; never accounted |
+| `stack_pending` | in-noise / small-gain, waiting for greedy stacking | you — `rejected[]` with `stack_pending: true`; accounted only once `stack_result` exists (the workflow adds it; `stack_harmful` / `stack_reject` rows are measured blocks) |
+| `deferred_budget` | the workflow stopped solo apply-back to keep ≥30% of the KernelFusion budget for greedy stacking | the workflow — `deferred[]` with `deferred_budget: true`, `reason_code: budget_reserve`; unit results and kernels are kept and written back as next-round candidates |
 
 🔴 **`blocked` requires an ATTEMPT or a physical impossibility — never a caller-side gate
 alone.** "sglang won't dispatch to it on this arch/dtype" and "no sglang call site exists"
@@ -475,9 +653,19 @@ engagement + A/B + accuracy gates. The only valid terminal states are `applied`,
 after an actual attempt with its evidence. A single TP-sized serving set is normal: run the
 baseline and candidate sequentially on the same GPUs. "No relaunch after hang" forbids retrying
 a server initialization that hung; it does not forbid cleanly stopping a successful baseline
-   and launching the candidate configuration. If this selected entry cannot reach a terminal result,
-   let the call fail. The orchestrator stops later apply-back calls, preserves all earlier terminal
-   wins, and continues Profile.
+and launching the candidate configuration. If this selected entry cannot reach a measured
+result in this call, return it in `retry` (`reason_code` gpu_busy / not_finished /
+not_reached, `measured: false`) after every registered process has finished. The workflow
+re-runs it on a fresh lease (bounded retries) and reports it `unmeasured` — never `blocked` —
+if it still cannot be measured.
+
+🔴 **"Blocked" needs measured data.** Qwen3.5-397B (20261010) returned six entries as
+`rejected` with reasons like "NOT reached a verified terminal measured result in this call" or
+"all 8 serving GPUs are held by the orphaned e03 A/B driver", and the old gate counted them as
+accounted: 05_FUSION_APPLYBACK.md read "已交代 8 / 无交代 0 ✅ pass" over a board where six of
+eight entries had never been measured. The harness now classifies such a record as
+`unmeasured` (by `measured: false`, a non-terminal `reason_code`, or that wording) and never
+counts it as accounted.
 
 Run the gate yourself before returning, and fix what it reports rather than working around it:
 
@@ -502,9 +690,11 @@ produced. It goes at the EVAL_DIR root beside `01_SEMANTIC.md` … `04_FUSION_UN
 `fusion_applyback.json` and everything else stays in the working dir.
 
 `--allow-partial-coverage` is required during this serial per-entry loop because later
-entries are legitimately unprocessed. It still prints those gaps loudly. Once the final
-entry returns, complete coverage makes the same report green without weakening any
-per-entry gate. Never invent dispositions for entries owned by later calls.
+entries are legitimately unprocessed. It still prints those gaps loudly, and it can NOT turn
+an unmeasured or never-re-gated stack-pending row into an accounted one. After the last call
+(and greedy stacking) the workflow itself runs the same harness WITHOUT
+`--allow-partial-coverage` over the full aggregate; that is the published final report. Never
+invent dispositions for entries owned by later calls.
 
 ## CURATE `knowledge/learned/` — make this run's fusions reproducible next time
 

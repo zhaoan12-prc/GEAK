@@ -160,30 +160,40 @@ class FusionCaptureManifestContractTest(unittest.TestCase):
 
     def test_applyback_runs_one_execution_entry_per_agent_call(self):
         source = self._workflow_source()
-        # Every final Top-K entry from fusion_screen is applied; there is no budget cut.
-        self.assertIn("const fusionApplyEntries = fusionExecutionList.slice();", source)
+        # Every final Top-K entry from fusion_screen is applied, in confidence-weighted order; only the
+        # KernelFusion time budget's stacking reserve may stop it (recorded as deferred_budget).
+        self.assertIn("const fusionApplyEntries = fusionApplyOrder(fusionExecutionList.filter(", source)
+        # One pass over every entry, then bounded retry passes over the unmeasured ones
+        # (GPU busy / not finished / not reached are not dispositions -- B.9).
+        self.assertIn("let applyQueue = fusionApplyEntries.slice();", source)
         self.assertIn(
-            "for (let applyIndex = 0; applyIndex < fusionApplyEntries.length; applyIndex++)",
+            "for (let pass = 0; pass <= FUSION_APPLY_RETRIES && applyQueue.length; pass++)",
             source,
         )
+        self.assertIn("const out = await runSlot(entry, pass, { fallback: fallbackMode });", source)
+        self.assertIn("if (out === 'retry') again.push(entry);", source)
         self.assertIn("roleAgent('fusion_integrator', 'apply_one'", source)
-        self.assertIn("TARGET_EXEC_ID: applyEntry.exec_id", source)
+        self.assertIn("TARGET_EXEC_ID: rungEntry.exec_id", source)
         self.assertIn("PRIOR_APPLY_RESULT: applyState", source)
         self.assertNotIn("roleAgent('fusion_integrator', 'apply_back'", source)
     def test_applyback_commits_each_terminal_win_before_the_next_call(self):
         source = self._workflow_source()
+        # The checkpoint helper records the accepted-fusion count the catch block restores.
+        helper = source.index("const checkpointApply = () => {")
+        self.assertLess(helper, source.index(
+            "fusionRecoveryState.acceptedFusionCount = acceptedFusions.length;", helper))
         call = source.index("roleAgent('fusion_integrator', 'apply_one'")
-        failure = source.index("if (!step) {", call)
-        stop = source.index("break;", failure)
+        # A call that returned nothing is queued for retry, not a reason to stop the loop.
+        failure = source.index("if (!step) return markRetry(execId, 'not_finished'", call)
         commit = source.index(
-            "for (const accepted of newlyAccepted) acceptedFusions.push(accepted);", stop)
-        checkpoint = source.index(
-            "fusionRecoveryState.acceptedFusionCount = acceptedFusions.length;", commit)
-        stack = source.index("roleAgent('fusion_integrator', 'apply_stack'", checkpoint)
+            "for (const accepted of newlyAccepted) acceptedFusions.push(accepted);", failure)
+        checkpoint = source.index("checkpointApply();", commit)
+        stack = source.index(
+            "roleAgent('fusion_integrator', isConfirm ? 'apply_stack_confirm' : 'apply_stack_step'",
+            checkpoint)
         strategize = source.index("phase('Strategize');", stack)
         self.assertLess(call, failure)
-        self.assertLess(failure, stop)
-        self.assertLess(stop, commit)
+        self.assertLess(failure, commit)
         self.assertLess(commit, checkpoint)
         self.assertLess(checkpoint, stack)
         self.assertLess(stack, strategize)
@@ -229,9 +239,15 @@ class FusionCaptureManifestContractTest(unittest.TestCase):
         block = source[screen:applyback]
         self.assertIn("FUSION_INPUTS.FUSION_TOPK_JSON = screened.fusion_topk_json;", block)
         self.assertIn("fusionExecutionList = Array.isArray(screened.execution_list)", block)
-        self.assertNotIn("fusion_unit_validator", source)
+        # Phase 3.0 runs over that same execution_list, between the screen and apply-back
+        # (B.8: on Qwen3.5-397B 20261010 it never ran at all).
+        self.assertIn("for (const entry of fusionExecutionList) {", block)
+        self.assertIn("roleAgent('fusion_unit_validator', 'validate_one'", block)
+        self.assertIn("roleAgent('fusion_unit_validator', 'aggregate'", block)
     def test_screen_board_is_the_only_applyback_gate(self):
-        """Apply-back is gated on the screen's Top-K, not on a unit-side aggregate."""
+        """Apply-back is gated on the screen's Top-K; the unit-side result can only close an
+        entry it MEASURED as a loss on every side (no serving A/B is spent on it), it never
+        removes an entry for a missing or undiagnosed unit verdict."""
         source = self._workflow_source()
         screen = source.index("label: 'fusion-screen'")
         applyback = source.index("roleAgent('fusion_integrator', 'apply_one'", screen)
@@ -240,7 +256,9 @@ class FusionCaptureManifestContractTest(unittest.TestCase):
             "if (FUSION_INPUTS.FUSION_TOPK_JSON && fusionExecutionList.length) {",
             apply_block,
         )
-        self.assertNotIn("FUSION_INPUTS.FUSION_UNITSIDE_JSON = ", source)
+        self.assertIn(
+            "statuses.every((s) => s === 'fail' || s === 'equivalent_fail')", source)
+        self.assertIn("blocked_evidence: 'unit_fail'", source)
     def test_applyback_failure_preserves_prefusion_state_and_continues_profile(self):
         source = self._workflow_source()
         fallback = source.index(

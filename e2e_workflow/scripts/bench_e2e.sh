@@ -678,6 +678,14 @@ if [ "$REUSE_SERVER" != "1" ]; then
   # Freeze the server's process identity NOW (pid, pgid, /proc start time) so the
   # EXIT teardown never has to ask "who owns this pid?" after the pid may be gone.
   server_record_identity "$SERVER_PID"
+  # Persist the frozen identity next to the output. If this bench is interrupted and its
+  # server outlives it (a caller reusing it with REUSE_SERVER=1, or a kill the EXIT trap
+  # never saw), the workflow can still stop exactly this server at a phase boundary
+  # (fusion_gpu_lease.py reap-recorded) instead of waiting out the serving-GPU lock the
+  # server inherited. pgid is recorded only when the launch proved pgid == pid.
+  printf '{"pid":%s,"pgid":%s,"start_ticks":"%s","port":"%s","backend":"%s","log":"%s"}\n' \
+    "$SERVER_PID" "${SERVER_PGID:-null}" "${SERVER_START_TICKS:-}" "$PORT" "$BACKEND" "$LOG" \
+    > "$OUT_DIR/server_identity.json" 2>/dev/null || true
 
   echo ">>> Waiting for server health (stall window ${STALL_WINDOW_SEC}s, backstop ${CEILING}s) ..."
   _t0=$SECONDS; _last_tok=""; _last_change=$SECONDS

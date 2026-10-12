@@ -542,9 +542,17 @@ def map_args(
         ps_args["runtime_image"] = str(h.get("runtime_image") or h.get("image"))
     for key in ("fusion_discovery", "fusion_top_k", "fusion_budget",
                 "fusion_unitside_budget", "fusion_applyback_mode",
-                "fusion_combined_ab_repeats"):
+                "fusion_combined_ab_repeats", "fusion_budget_s",
+                "fusion_item_minutes", "fusion_min_landed"):
         if h.get(key) is not None:
             ps_args[key] = h[key]
+    # Re-run KernelFusion from an existing run's semantic result (trace manifest +
+    # layer table) instead of re-capturing. The workflow copies the artifacts into
+    # this run's eval dir and records where they came from.
+    for key in ("fusion_reuse_semantics_dir", "fusion_reuse_semantic_table_json",
+                "fusion_reuse_trace_manifest_json"):
+        if h.get(key):
+            ps_args[key] = str(h[key])
     if h.get("semantics_shape_capture") is not None:
         ps_args["semantics_shape_capture"] = h["semantics_shape_capture"]
     if isinstance(h.get("semantics_shape_capture_setup"), dict):

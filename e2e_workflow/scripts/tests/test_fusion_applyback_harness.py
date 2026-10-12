@@ -88,6 +88,47 @@ class FusionApplyBackTest(unittest.TestCase):
             self.assertEqual(disp["e03"], "blocked")
             self.assertEqual(disp["e04"], "deferred_with_reason")
 
+    def test_skip_mode_reports_unguarded_accuracy_with_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            apply = self._apply(
+                rejected=[{"exec_id": "e03", "measured": True, "blocked_evidence": "e2e_no_gain",
+                           "reason": "flat"}],
+                deferred=[{"exec_id": "e04", "reason": "prefill 收益 0.07%"}])
+            apply["accepted_fusions"][0]["accuracy"] = {
+                "mode": "skipped", "reason": "calibration_unusable",
+                "calibration_json": "/eval/fusion/accuracy_calibration/calibration.json"}
+            res = self._run(tmp, apply=apply, accuracy_mode="skip",
+                            calibration_json="/eval/fusion/accuracy_calibration/calibration.json")
+            self.assertEqual(res["status"], "pass")
+            self.assertEqual(res["accuracy_gate"]["mode"], "skip")
+            self.assertFalse(res["accuracy_gate"]["e2e_accuracy_gated"])
+            self.assertEqual(res["accuracy_gate"]["statement"], "e2e 精度未把关")
+            md = open(os.path.join(tmp, "out.md")).read()
+            self.assertIn("e2e 精度未把关", md)
+            self.assertIn("/eval/fusion/accuracy_calibration/calibration.json", md)
+
+    def test_gate_mode_report_does_not_claim_unguarded_accuracy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            res = self._run(tmp)
+            self.assertTrue(res["accuracy_gate"]["e2e_accuracy_gated"])
+            self.assertNotIn("e2e 精度未把关", open(os.path.join(tmp, "out.md")).read())
+
+    def test_on_demand_rung_records_are_reported_and_need_no_verdict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            apply = self._apply(
+                rejected=[{"exec_id": "e03", "measured": True, "rung": 1,
+                           "candidate_ids": ["e03.r1"], "blocked_evidence": "e2e_no_gain",
+                           "reason": "flat"}],
+                deferred=[{"exec_id": "e04", "reason": "prefill 收益 0.07%"}],
+                rung_attempts=[{"exec_id": "e03", "rung": 0, "blocked_evidence": "unit_fail",
+                                "reason": "0.9x"}],
+                unit_on_demand=[{"exec_id": "e03", "candidate_id": "e03.r1", "rung": 1,
+                                 "status": "pass"}])
+            res = self._run(tmp, apply=apply)
+            self.assertEqual(res["status"], "pass", res["errors"])
+            self.assertEqual(res["unit_on_demand"][0]["candidate_id"], "e03.r1")
+            self.assertIn("`e03.r1` r1 → pass", open(os.path.join(tmp, "out.md")).read())
+
     def test_a_blocked_row_without_a_reason_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             res = self._run(tmp, apply=self._apply(
@@ -333,6 +374,163 @@ class FusionApplyBackTest(unittest.TestCase):
             self.assertIn("候选 5 条", md)
             self.assertIn("1234.5 tok/s", md)
             self.assertEqual(res["region_coverage"]["regions_total"], 3)
+
+
+    # ---- "blocked" needs measured evidence (Qwen3.5-397B 20261010, B.9) ------
+    def _qwen35_like(self):
+        return self._apply(
+            rejected=[
+                {"exec_id": "e02", "measured": True, "blocked_evidence": "e2e_no_gain",
+                 "reason": "A/B -0.01%, overlapping, inside the noise band"},
+                {"exec_id": "e03", "measured": False, "engaged": True,
+                 "reason": "the interleaved A/B was still on its first ref leg at return"},
+                {"exec_id": "e04", "reason": "PHYSICAL BLOCK: all 8 serving GPUs 0-7 are held "
+                                             "by the orphaned e03 A/B driver"}])
+
+    def test_unmeasured_rows_are_never_accounted_even_with_partial_coverage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            res = self._run(tmp, apply=self._qwen35_like(), require_coverage=False)
+            disp = {r["exec_id"]: r["disposition"] for r in res["results"]}
+            self.assertEqual(disp["e02"], "blocked")
+            self.assertEqual(disp["e03"], "unmeasured")
+            self.assertEqual(disp["e04"], "unmeasured")       # by its non-terminal wording
+            self.assertEqual(res["coverage"]["unmeasured_exec_ids"], ["e03", "e04"])
+            self.assertEqual(res["coverage"]["accounted"], 2)  # e01 applied + e02 blocked
+            self.assertFalse(res["coverage"]["complete"])
+            md = open(os.path.join(tmp, "out.md")).read()
+            self.assertIn("未测", md)
+            self.assertIn("`e03`", md)
+
+    def test_the_final_report_fails_on_unmeasured_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            res = self._run(tmp, apply=self._qwen35_like())
+            self.assertEqual(res["status"], "fail")
+
+    def test_reason_code_and_retry_queue_are_unmeasured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            res = self._run(tmp, require_coverage=False, apply=self._apply(
+                rejected=[{"exec_id": "e02", "reason_code": "gpu_busy",
+                           "reason": "lease held by apply_e01"}],
+                retry=[{"exec_id": "e03", "reason_code": "not_finished",
+                        "reason": "A/B still running when the call returned"}],
+                unmeasured=[{"exec_id": "e04", "reason_code": "gpu_busy",
+                             "reason": "retries exhausted"}]))
+            disp = {r["exec_id"]: r["disposition"] for r in res["results"]}
+            self.assertEqual([disp[e] for e in ("e02", "e03", "e04")], ["unmeasured"] * 3)
+
+    def test_a_measured_retry_supersedes_the_unmeasured_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            res = self._run(tmp, apply=self._apply(
+                rejected=[{"exec_id": "e02", "measured": False, "reason": "gpu busy"},
+                          {"exec_id": "e02", "measured": True,
+                           "blocked_evidence": "accuracy_fail",
+                           "reason": "calibrated gsm8k drop p=0.001"},
+                          {"exec_id": "e03", "measured": True,
+                           "blocked_evidence": "unit_fail", "reason": "0.8x"},
+                          {"exec_id": "e04", "measured": True,
+                           "blocked_evidence": "e2e_regression", "reason": "-3%"}]))
+            disp = {r["exec_id"]: r["disposition"] for r in res["results"]}
+            self.assertEqual(disp["e02"], "blocked")
+            self.assertEqual(res["status"], "pass")
+
+    def test_unknown_blocked_evidence_is_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            res = self._run(tmp, require_coverage=False, apply=self._apply(
+                rejected=[{"exec_id": "e03", "measured": True,
+                           "blocked_evidence": "felt_slow", "reason": "?"}]))
+            self.assertTrue(any("blocked_evidence" in e for e in res["errors"]))
+
+    def test_a_legacy_block_without_evidence_warns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            res = self._run(tmp, require_coverage=False, apply=self._apply(
+                rejected=[{"exec_id": "e03", "reason": "kernel not built"}]))
+            self.assertTrue(any("without declared measured evidence" in w
+                                for w in res["warnings"]))
+
+    def test_stack_pending_is_accounted_only_after_the_stack_measured_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pending = {"exec_id": "e03", "measured": True, "stack_pending": True,
+                       "overlay_path": "/ov/e03", "reason": "in-noise solo"}
+            res = self._run(tmp, require_coverage=False, apply=self._apply(
+                rejected=[pending], deferred=[{"exec_id": "e04", "reason": "r2"}]))
+            disp = {r["exec_id"]: r["disposition"] for r in res["results"]}
+            self.assertEqual(disp["e03"], "stack_pending")
+            self.assertFalse(res["coverage"]["complete"])
+            res = self._run(tmp, apply=self._apply(
+                rejected=[dict(pending, stack_result={"decision": "reject", "delta_pct": 0.2})],
+                deferred=[{"exec_id": "e04", "reason": "r2"}]))
+            disp = {r["exec_id"]: r["disposition"] for r in res["results"]}
+            self.assertEqual(disp["e03"], "blocked")
+            self.assertEqual(res["status"], "pass")
+
+    def test_the_best_unit_side_of_a_candidate_is_its_status(self):
+        """An entry is benched on two sides (existing kernel + self-authored)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            unit = self._write(tmp, "unit.json", {"results": [
+                {"candidate_id": "dc_nq", "unit_side_status": "fail", "reason": "existing 0.9x"},
+                {"candidate_id": "dc_nq", "unit_side_status": "pass", "reason": "self 1.4x"}]})
+            res = self._run(tmp, unitside_path=unit, require_coverage=False)
+            row = next(r for r in res["results"] if r["exec_id"] == "e03")
+            self.assertEqual(row["unit_side_statuses"], ["pass"])
+            self.assertEqual(row["disposition"], "unaccounted")
+
+    def test_a_time_budget_deferral_is_accounted_even_for_a_unit_pass(self):
+        """Apply-back stopped at the stacking reserve: deferred_budget, not a hole."""
+        with tempfile.TemporaryDirectory() as tmp:
+            unit = self._write(tmp, "unit.json", {"results": [
+                {"candidate_id": "dc_nq", "unit_side_status": "pass", "reason": "1.4x"}]})
+            res = self._run(tmp, unitside_path=unit, apply=self._apply(
+                deferred=[{"exec_id": "e03", "deferred_budget": True,
+                           "reason_code": "budget_reserve",
+                           "reason": "KernelFusion budget reserved for greedy stacking"},
+                          {"exec_id": "e04", "reason": "r2"}]))
+            disp = {r["exec_id"]: r["disposition"] for r in res["results"]}
+            self.assertEqual(disp["e03"], "deferred_budget")
+            self.assertEqual(res["status"], "pass")
+
+    def test_stack_harmful_is_measured_blocked_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            res = self._run(tmp, apply=self._apply(
+                rejected=[{"exec_id": "e03", "measured": True, "stack_pending": True,
+                           "blocked_evidence": "stack_harmful", "reason": "stack_harmful: -0.9%",
+                           "stack_result": {"decision": "drop", "delta_pct": -0.9}}],
+                deferred=[{"exec_id": "e04", "reason": "r2"}]))
+            disp = {r["exec_id"]: r["disposition"] for r in res["results"]}
+            self.assertEqual(disp["e03"], "blocked")
+            self.assertEqual(res["status"], "pass")
+            self.assertEqual(res["errors"], [])
+
+    def test_below_the_landing_target_every_entry_names_its_stop_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            res = self._run(tmp, min_landed=2, apply=self._apply(
+                rejected=[{"exec_id": "e03", "measured": True, "blocked_evidence": "wire_failure",
+                           "wire_cause": "not_engaged", "reason": "never ENGAGED",
+                           "evidence": "/ab/e03.json"}],
+                deferred=[{"exec_id": "e04", "deferred_budget": True,
+                           "reason_code": "budget_reserve", "reason": "reserve"}],
+                wire_failures=[{"exec_id": "e03", "wire_cause": "not_engaged"}]))
+            self.assertEqual(res["landed"], {"count": 1, "min": 2, "met": False})
+            stages = {r["exec_id"]: r["stage"] for r in res["stop_stages"]}
+            self.assertEqual(stages, {"e02": "exclusion", "e03": "wire", "e04": "budget"})
+            md = open(os.path.join(tmp, "out.md")).read()
+            self.assertIn("逐项止步环节", md)
+            self.assertIn("下一轮最高优先级", md)
+            self.assertIn("🔴 未达标", md)
+
+    def test_landing_target_met_counts_pool_items_and_lists_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            res = self._run(tmp, min_landed=2, apply=self._apply(
+                pool_accepted=[{"exec_id": "p01"}],
+                rejected=[{"exec_id": "e03", "reason": "x", "measured": True,
+                           "blocked_evidence": "unit_fail"}],
+                deferred=[{"exec_id": "e04", "reason": "r2"}]))
+            self.assertEqual(res["landed"]["count"], 2)
+            self.assertTrue(res["landed"]["met"])
+            self.assertEqual(res["stop_stages"], [])
+            self.assertEqual(
+                ab.stop_stage("blocked", {"blocked_evidence": "accuracy_fail"}), "accuracy")
+            self.assertEqual(ab.stop_stage("blocked", {"blocked_evidence": "stack_harmful"}), "stack")
+            self.assertEqual(ab.stop_stage("blocked", {}, "unitside"), "unit")
 
 
 if __name__ == "__main__":

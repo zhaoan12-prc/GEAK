@@ -336,6 +336,24 @@ class TestMapArgs(_RunE2ECase):
         self.assertIs(ps["semantics_shape_capture"], False)
         self.assertNotIn("semantics_shape_capture_setup", ps)
 
+    def test_fusion_semantic_reuse_keys_are_forwarded(self):
+        src = str(self.tmp / "prior_run")
+        ps = rx.map_args(self._handoff(
+            eval_dir=str(self.tmp / "e2e_x"), framework="sglang",
+            fusion_reuse_semantics_dir=src))
+        self.assertEqual(ps["fusion_reuse_semantics_dir"], src)
+        self.assertNotIn("fusion_reuse_semantic_table_json", ps)
+        plain = rx.map_args(self._handoff(eval_dir=str(self.tmp / "e2e_y"), framework="sglang"))
+        self.assertNotIn("fusion_reuse_semantics_dir", plain)
+
+    def test_fusion_budget_and_landing_target_are_forwarded(self):
+        ps = rx.map_args(self._handoff(
+            eval_dir=str(self.tmp / "e2e_x"), framework="sglang",
+            fusion_budget_s=64800, fusion_item_minutes=40, fusion_min_landed=2))
+        self.assertEqual(ps["fusion_budget_s"], 64800)
+        self.assertEqual(ps["fusion_item_minutes"], 40)
+        self.assertEqual(ps["fusion_min_landed"], 2)
+
     def test_budget_omitted_when_unknown(self):
         """No timeout => the workflow stays budget-unaware (byte-identical to a
         direct, non-interface invocation)."""

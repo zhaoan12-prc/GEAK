@@ -24,6 +24,21 @@ class DecideTest(unittest.TestCase):
         self.assertGreater(out["delta_pct"], 29.0)
         self.assertLess(out["gsm8k_z"], 2.0)
 
+    def test_an_uncalibrated_gsm8k_drop_does_not_reject_with_a_calibrated_decision(self):
+        # Qwen3.5-397B 20261010: the base-vs-base control itself failed gsm8k n=200;
+        # fusion_accuracy_gate.py passes an fp8-equivalent stack on unit evidence.
+        out = cd.decide(self.BASE, self.CAND, (0.555, 200), (0.420, 200),
+                        accuracy_decision={"verdict": "pass", "test_used": "unit_equivalence"})
+        self.assertTrue(out["accuracy_pass"])
+        self.assertEqual(out["decision"], "accept")
+        self.assertEqual(out["accuracy_test"], "unit_equivalence")
+
+    def test_an_inconclusive_calibrated_decision_does_not_accept(self):
+        out = cd.decide(self.BASE, self.CAND, (0.97, 200), (0.97, 200),
+                        accuracy_decision={"verdict": "inconclusive", "reason": "n too small"})
+        self.assertEqual(out["decision"], "reject")
+        self.assertIn("inconclusive", out["reason"])
+
     def test_overlap_rejects(self):
         out = cd.decide([200.0, 201.5, 200.8], [201.0, 202.0, 201.2], (0.97, 200), (0.97, 200))
         self.assertFalse(out["nonoverlap"])
@@ -49,6 +64,17 @@ class DecideTest(unittest.TestCase):
         out = cd.decide(self.BASE, self.CAND, None, (0.965, 200))
         self.assertEqual(out["decision"], "reject")
         self.assertIn("base", out["reason"])
+
+    def test_skip_mode_does_not_fail_missing_gsm8k(self):
+        out = cd.decide(self.BASE, self.CAND, None, None, accuracy_mode="skip")
+        self.assertTrue(out["accuracy_pass"])
+        self.assertEqual(out["decision"], "accept")
+        self.assertEqual(out["accuracy"]["mode"], "skipped")
+        self.assertIn("e2e accuracy not gated", out["reason"])
+
+    def test_skip_mode_does_not_rescue_a_throughput_reject(self):
+        out = cd.decide([200.0, 201.5], [201.0, 202.0], None, None, accuracy_mode="skip")
+        self.assertEqual(out["decision"], "reject")
 
     def test_missing_rounds_reject(self):
         self.assertEqual(cd.decide([], self.CAND, (0.97, 200), (0.97, 200))["decision"], "reject")

@@ -9,7 +9,13 @@ warm_server, REPEATS timed rounds, then gsm8k on the same live server):
 
   throughput  accept iff min(cand) > max(base) AND delta > noise band
               delta = (median(cand) / median(base) - 1) * 100
-  accuracy    reject iff the gsm8k drop is significant: two-proportion z >= --max-z
+  accuracy    reject iff the gsm8k drop is significant: two-proportion z >= --max-z;
+              with --accuracy-decision (a fusion_accuracy_gate.py `decide` JSON) the
+              CALIBRATED verdict replaces the raw z-test: an uncalibrated gsm8k (one
+              whose base-vs-base control failed) may not reject the stack;
+              with --accuracy-mode skip (the round's calibration found no usable e2e
+              accuracy test, so none was run) accuracy rests on unit-side numerical
+              equivalence and does not fail the decision
   engagement  every --expect-banner tag must print "[overlay-<tag>] ENGAGED" on all
               TP ranks of the cand server log; a tag that does not is reported in
               not_engaged (it ran nothing, so it is blocked, not credited)
@@ -79,7 +85,7 @@ def accuracy_z(base, cand):
 
 
 def decide(base_tps, cand_tps, base_acc=None, cand_acc=None, noise_band_pct=0.5,
-           max_z=2.0, engaged=None, tp=1):
+           max_z=2.0, engaged=None, tp=1, accuracy_decision=None, accuracy_mode="gate"):
     out = {"noise_band_pct": noise_band_pct, "max_z": max_z,
            "base_tok_s": [round(v, 4) for v in base_tps],
            "cand_tok_s": [round(v, 4) for v in cand_tps]}
@@ -102,7 +108,19 @@ def decide(base_tps, cand_tps, base_acc=None, cand_acc=None, noise_band_pct=0.5,
                            % (nonoverlap, delta, noise_band_pct))
 
     acc_ok = True
-    if base_acc is None or cand_acc is None:
+    skipped = str(accuracy_mode or "gate").lower() == "skip"
+    if accuracy_decision is None and skipped:
+        out.update(accuracy_verdict="skipped", accuracy_test="skipped",
+                   accuracy={"mode": "skipped", "reason": "calibration_unusable"})
+    elif accuracy_decision is not None:
+        verdict = str(accuracy_decision.get("verdict") or "")
+        acc_ok = verdict == "pass"
+        out.update(accuracy_verdict=verdict,
+                   accuracy_test=accuracy_decision.get("test_used"))
+        if not acc_ok:
+            reasons.append("accuracy: calibrated gate %s (%s)"
+                           % (verdict or "missing", accuracy_decision.get("reason", "")))
+    elif base_acc is None or cand_acc is None:
         acc_ok = False
         reasons.append("accuracy: gsm8k missing on %s"
                        % ("both sides" if base_acc is None and cand_acc is None
@@ -124,7 +142,10 @@ def decide(base_tps, cand_tps, base_acc=None, cand_acc=None, noise_band_pct=0.5,
     out["accuracy_pass"] = acc_ok
     out["decision"] = "accept" if perf_ok and acc_ok else "reject"
     out["reason"] = "; ".join(reasons) if reasons else (
-        "throughput +%.3f%% non-overlapping, gsm8k within noise" % out["delta_pct"])
+        "throughput +%.3f%% non-overlapping, %s" % (
+            out["delta_pct"], "e2e accuracy not gated (calibration unusable; unit-side "
+            "equivalence only)" if skipped and accuracy_decision is None
+            else "gsm8k within noise"))
     return out
 
 
@@ -140,12 +161,19 @@ def main(argv=None):
     ap.add_argument("--tp", type=int, default=1, help="ENGAGED lines required per tag")
     ap.add_argument("--noise-band-pct", type=float, default=0.5)
     ap.add_argument("--max-z", type=float, default=2.0)
+    ap.add_argument("--accuracy-decision", default="",
+                    help="fusion_accuracy_gate.py decide --out JSON; replaces the z-test")
+    ap.add_argument("--accuracy-mode", choices=("gate", "skip"), default="gate",
+                    help="skip: no e2e accuracy test this round (calibration unusable); "
+                         "missing gsm8k does not fail the decision")
     ap.add_argument("--out", default="", help="also write the JSON here")
     a = ap.parse_args(argv)
     out = decide(load_throughputs(a.base_summary), load_throughputs(a.cand_summary),
                  load_gsm8k(a.base_gsm8k), load_gsm8k(a.cand_gsm8k),
                  a.noise_band_pct, a.max_z,
-                 engaged_counts(a.cand_server_log, a.expect_banner), a.tp)
+                 engaged_counts(a.cand_server_log, a.expect_banner), a.tp,
+                 json.load(open(a.accuracy_decision)) if a.accuracy_decision else None,
+                 a.accuracy_mode)
     text = json.dumps(out, sort_keys=True)
     if a.out:
         with open(a.out, "w") as fh:

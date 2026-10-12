@@ -25,6 +25,16 @@ driven through `bench_e2e.sh` with `BACKEND=<backend>` so the stack stays a swap
 - All work happens under `EVAL_DIR`. The launch+bench scripts, overlays, profiles, and per-kernel
   task dirs all live there.
 - The original launch/bench script is COPIED into `EVAL_DIR`; never mutate the user's file.
+- **A call that reuses a server stops it before returning.** If you run any `bench_e2e.sh` leg
+  with `REUSE_SERVER=1` (a warm server already up at HOST:PORT — bench_e2e.sh then neither
+  launches nor kills it), you own that server's shutdown for this call: before you return, stop
+  it by its RECORDED identity — the `server_identity.json` (pid, pgid, /proc start time) that
+  `bench_e2e.sh` wrote next to the output of the leg that launched it — with
+  `python3 "$SKILL_DIR/scripts/fusion_gpu_lease.py" reap-recorded --lease-dir "$EVAL_DIR/fusion/gpu_lease" --eval-dir <that leg's output dir> --grace-s 15`
+  (or `server_teardown.sh` with that recorded pid). Stop it never by name or pattern, and leave it
+  alone if its recorded start time no longer matches (the pid was recycled; it is not ours). A
+  server left up holds the serving-GPU lock and stalls the next phase's launch. Everything else in
+  PROCESS SAFETY still holds.
 
 ---
 

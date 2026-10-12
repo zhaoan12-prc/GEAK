@@ -50,33 +50,47 @@ make the degradation explicit per candidate.
 
 ## PHASE=screen
 
-Run the deterministic screen. Do not invent chains, ranks, or speedups.
+Run the deterministic screen. Do not invent chains, ranks, gains or speedups.
 
 ```bash
 mkdir -p "$EVAL_DIR/fusion_capture/fusion"
 python3 "$SKILL_DIR/scripts/fusion_catalog.py" \
-  --out "$EVAL_DIR/fusion_capture/fusion/available_fusion_kernels.json" || true
+  --out "$EVAL_DIR/fusion_capture/fusion/available_fusion_kernels.json" \
+  --semantic-table "$SEMANTIC_TABLE_JSON" || true
 python3 "$SKILL_DIR/scripts/fusion_screen.py" \
   --semantic-table "$SEMANTIC_TABLE_JSON" \
   --catalog "$EVAL_DIR/fusion_capture/fusion/available_fusion_kernels.json" \
   --out-dir "$EVAL_DIR/fusion_capture/fusion" \
   --gfx "${GFX:-gfx942}" \
   --top-k "$TOP_K" \
+  --fusion-budget-s "${FUSION_BUDGET_S:-}" --item-minutes "${ITEM_MINUTES:-45}" \
   --passes "${PASSES:-2}" \
   --isl "${WORKLOAD_ISL:-}" --osl "${WORKLOAD_OSL:-}" --conc "${WORKLOAD_CONC:-}" \
+  --model "${MODEL_NAME:-}" \
+  --noise-band-pct "${NOISE_BAND_PCT:-1.0}" \
   --md "$EVAL_DIR/03_FUSION_TOPK.md"
 ```
 
-Return the script's JSON as StructuredOutput: `status`, `fusion_candidates_json`, `fusion_topk_json`, `fusion_topk_md`, `execution_list`, `candidate_count`. Copy `execution_list` from the printed JSON. Do not rerank it.
+`--model` is optional (the model family is otherwise read from the table's structural context). The measured priors default to the repository copies (`knowledge/fusion/measured_priors.json`, `knowledge/learned/INDEX.md`); `--measured-priors ''` / `--priors-index ''` disable them. `--fusion-budget-s` (KernelFusion budget in seconds) turns on the adaptive K = clamp(floor(budget x 0.7 / item), 8, 16) with `--item-minutes` per apply-back item (default 45); without it K is `--top-k` (default 8). Measured bandwidth / peaks, when known, go in `--hbm-tbps` / `--peak-tflops-bf16` / `--peak-tflops-fp8` (or `GEAK_HBM_TBPS` / `GEAK_PEAK_TFLOPS_BF16` / `GEAK_PEAK_TFLOPS_FP8`); otherwise datasheet values per gfx are used.
 
-`fusion_candidates.json` is the initial board (every chain that passed the gates, ordered by estimated time saved). `fusion_topk.json` is the final board, K=8. Each pass ranks by Score = time saved / difficulty (decode time saved for a decode chain, otherwise the chain's own saving). The passes are merged: chains in both passes come first, then smaller rank sum, with a missing pass counted as K+1; overlapping chains keep the better merged rank, and every shorter sub-chain is its own candidate. Difficulty is 1.0 for a chain with an existing fusion kernel, otherwise the hardest compute member: elementwise/quant/cast/RoPE/act_and_mul 1.3, norm 1.5, layout/KV-cache write 1.8, topk/sort/gather 2.2, collective/large GEMM/attention 5. Every entry in `execution_list` is optimized.
+Return the script's JSON as StructuredOutput: `status`, `fusion_candidates_json`, `fusion_topk_json`, `fusion_topk_md`, `execution_list`, `candidate_count` (plus `candidate_pool_count`, `k_effective`, `phase_blind`, `region_coverage_ok`). Copy `execution_list` from the printed JSON. Do not rerank it.
 
-What the screen enforces (read `03_FUSION_TOPK.md` to explain a board, never to override it):
+`fusion_topk.json` is the final board: `execution_list` (K ranked alt groups plus up to 4 positive measured priors forced in beside them, `forced_by_prior`), `candidate_pool` (entries between 0.1% and the gate: stacking fill-ins, not Top-K), `k_effective`, `noise_band_pct`, `phase_blind`, `hardware`, `c0_us`. Every entry carries `expected_e2e_gain_pct`, `lower_bound` (launch-only estimate, no shapes), `alt_group` and `alt_ladder` (rung 0 is the entry itself; apply-back walks the ladder until one rung passes its gate), `negative_prior`, `prior_polarity`, the saving breakdown (`launch_saved_us`, `mem_saved_us`, `eff_saved_us`, `n_before`, `n_after`) and a `seam_descriptor` usable as a measured-prior seam. `fusion_candidates.json` adds the initial board (`candidates`, `pool_candidates`), `seam_entries`, `alt_groups`, `appendix`, `region_coverage`, `seam_coverage`, `inefficient_coverage`, `kernel_efficiency`, `dataflow`, `classification_conflicts`, `catalog_hygiene` and `priors`. Every entry in `execution_list` is optimized.
 
-- Barriers. Attention, collectives and GEMMs never sit inside a chain; at a chain end only when a catalog kernel covers the whole chain (e.g. quant→GEMM prologue). Pure copies (`direct_copy`, contiguous) are timed but not classified or counted.
-- Existing kernel. Chain members are tagged with `fusion_catalog.py`'s op vocabulary (norm, add_residual, quant, rope, kv_cache, activation, ...) and matched against the catalog's `op_tags`/`dtype_tags`. `matched_existing_kernels` lists every covering kernel (aiter first, tightest first); a covered chain may grow to 5 compute kernels so it can reach the kernel's boundary (q_norm+k_norm+RoPE → +KV write).
-- Time gate. ≥3% of the step, ≥1% with an existing kernel. With the workload, the same seam in prefill and decode is gated on its combined request-level share and returned as one entry (`phases`, `partner_row_ids`).
-- Report sections. "Already fused in the baseline" lists trace kernels that already are a catalog fused kernel; `still in candidates` means a separate kernel still follows it (e.g. add_rmsnorm_quant followed by its own group quant). "Below the time gate" lists near misses with the threshold they missed.
+How the board is built (read `03_FUSION_TOPK.md` to explain a board, never to override it):
+
+- Constants. c0 per phase = median of the shortest 5% kernel durations of that phase; HBM bandwidth and dtype peaks from measurement or datasheet. R = request-level kernel time (sum over phases of step time x forwards per request); every gain is a share of R.
+- Dataflow graph. Explicit tensor ids when the table has them; otherwise inferred edges (nearest earlier writer with the same element count and dtype family; argument names decide what a kernel writes, workspace buffers are ignored). Module-wrapper / layer-level shapes are not kernel shapes.
+- Classification and barriers. Stage column and parent operator first (operator wins on a conflict, which is logged), kernel-name tokens last, never substrings. Data movement is timed but never counted. Barriers: attention, collectives, linear-attention / SSM bodies, MoE expert GEMMs and LARGE GEMMs (time share >= 5% and compute share >= 10%); small GEMMs are not barriers.
+- Efficiency. Shaped GEMM / elementwise / quant / norm kernels get bytes, ideal = max(bytes/BW, FLOPs/peak, c0), eff = ideal / measured; eff < 0.3 is inefficient and its headroom is recoverable.
+- Window kinds. `serial` (<= 4 compute kernels, 5 with an existing kernel, 8 inside one code seam), `sibling` (small GEMMs reading the same activation), `parallel` (overlapping small kernels on different streams), `epilogue_forward` (a quant / cast / elementwise / norm consumer folded into its producer's epilogue; the producer may be a barrier such as a fused all-reduce), `fan_out` (one producer read raw by one consumer and through a quant / cast / norm prologue by another: the producer writes every form), `seam_rewrite` (a code seam with >= 3 non-barrier kernels in one step rewritten to 1 GEMM + 1 fused kernel; the sub-module owning an adjacent barrier stays with that barrier), `prior_seam` (a forced measured prior no window covers). Identical member sets found by two kinds are one window (`also_kinds`).
+- Existing kernel. Covered only when every compute member is tagged, a sanitized catalog kernel carries all tags at a compatible dtype, and quant granularity / batched / second-GEMM checks pass. A window holding a kernel that already is a catalog fused kernel keeps only the residual benefit.
+- Saving. launch (n_before - n_after) x c0 + memory (intermediate bytes no longer written / read) / BW + efficiency headroom of inefficient members x rho (0.5 self-authored, 0.8 with an existing kernel), x layers, capped at members' time minus the fused ideal; x forwards per request; / R = `expected_e2e_gain_pct`.
+- Gates. Pass: gain >= 0.3%, or >= 0.15% with an existing kernel, or a positive measured prior hit; and speedup > 1.1x. 0.1% to the gate (or a lower-bound window that cannot prove 1.1x) goes to the candidate pool.
+- Alternative groups. Entries eliminating the same kernel instance (e.g. an expert-input quant folded into the all-reduce epilogue vs into a router chain) are one alt group = one slot; the ladder is ordered by S/D, with the form a measured prior chose as rung 0.
+- Difficulty: existing 1.0, elementwise/quant/RoPE/act 1.3, norm and epilogue_forward/fan_out 1.5, layout/KV write 1.8, sibling/seam_rewrite/small GEMM 2.0, topk/sort/unknown 2.2, barrier 5. A negative measured prior multiplies D by 3, is never forced and sorts last.
+- Passes. Pass 1 = S / D; pass 2 = positive measured priors (gain x seam match, same model family and gfx) then pass-1 order; merged by both passes first, then rank sum. Positive priors with effective gain >= the noise band whose seam is present are forced in without a K slot (<= K+4 rows). On a `phase_blind` table a prior that does not name its phases is not forced, and the board is not evidence of "no opportunity" in the missing phase.
+- Coverage. Every fusible region, every code seam with >= 3 non-barrier kernels and every inefficient kernel is in a candidate or carries a per-item reason; an inefficient kernel no fusion window holds is `handoff:HeadKernel/TuningSkillset`.
 
 ## PHASE=generate_plans
 

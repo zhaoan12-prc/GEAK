@@ -30,13 +30,39 @@ exactly one of:
                               INVALID for an in-budget tier-A/B row whose unit-side
                               status passed: that row must be applied or blocked by an
                               actual apply-back attempt.
-  * `deferred_budget`      -- past `--budget` in board rank order. Legitimate, but
+  * `deferred_budget`      -- past `--budget` in board rank order, or a `deferred`
+                              record with `deferred_budget: true` / reason_code
+                              `budget_reserve` (apply-back stopped at the stacking
+                              reserve of the KernelFusion time budget). Legitimate, but
                               recorded and named. A budget is a decision to stop, and
                               a decision to stop is a thing the reader must SEE.
   * `unaccounted`          -- nobody said anything → the gate FAILS.
+  * `unmeasured`           -- somebody said something, but nothing was MEASURED: GPU
+                              busy, A/B not finished, "not reached in this call".
+                              NOT accounted (see below).
+  * `stack_pending`        -- passed its unit gates, engaged, did not regress, but its
+                              solo A/B sat in the noise band; it is waiting for the
+                              stacked re-gate. Accounted only once that re-gate has
+                              measured it (`stack_result`), otherwise NOT accounted.
 
 `unaccounted` is the whole point. "Not mentioned" is not "skipped"; it is a hole in
 the report, and it must be red.
+
+BLOCKED NEEDS MEASURED EVIDENCE
+-------------------------------
+Qwen3.5-397B (20261010_test_e2e_qwen35): e04..e08 came back `rejected` with reasons
+like "all 8 serving GPUs held by the orphaned e03 A/B driver; NO A/B numbers
+reported" and `measured: false`. The gate counted them as `blocked`, i.e. accounted,
+and 05_FUSION_APPLYBACK.md rendered "已交代 8 / 无交代 0 ✅ pass" over a board where
+six of eight entries had never been measured. "GPU busy" is a fact about US, not about
+the fusion. So a `rejected` record is `blocked` only with measured evidence -- a unit
+failure, an e2e A/B regression / no gain, an accuracy failure, a measured engagement
+failure, a wire/launch failure that actually ran -- and is `unmeasured` when it says
+`measured: false`, carries a non-terminal `reason_code` (gpu_busy / not_finished /
+not_reached), sits in the integrator's `retry` / `unmeasured` lists, or its reason is
+one of the non-terminal phrasings. `--allow-partial-coverage` keeps an unmeasured row
+from failing an INTERMEDIATE report (the workflow re-runs it from its retry queue),
+but it never turns it into an accounted row: it stays listed, counted and red.
 
 BUDGET TRUNCATION
 -----------------
@@ -51,7 +77,13 @@ Usage:
   python3 fusion_applyback_harness.py --topk fusion_topk.json \
       --apply apply_result.json [--unitside fusion_unitside.json] \
       --out-md FUSION_APPLYBACK.md --out-json fusion_applyback.json \
-      [--budget 6] [--allow-partial-coverage] [--waive <exec_id>=<reason> ...]
+      [--budget 6] [--allow-partial-coverage] [--waive <exec_id>=<reason> ...] \
+      [--accuracy-mode skip --calibration-json <calibration.json>]
+
+--accuracy-mode skip records that the round ran no e2e accuracy test because its
+base-vs-base calibration found no usable one; accuracy then rests on unit-side numerical
+equivalence, rows without an accuracy measurement are not failed for it, and the report
+states 「e2e 精度未把关」 with the calibration evidence path.
 """
 import argparse
 import json
@@ -61,8 +93,30 @@ import sys
 
 ACCOUNTED = {"applied", "blocked", "blocked_by_exclusion",
              "deferred_with_reason", "deferred_budget"}
-EXPLICIT = {"applied", "blocked", "deferred_with_reason"}
+EXPLICIT = {"applied", "blocked", "deferred_with_reason", "deferred_budget", "unmeasured",
+            "stack_pending"}
 APPLYBACK_ELIGIBLE = {"pass", "equivalent_pass", "subsumed_pass"}
+# Statuses that mean "we did not get a measurement", never a verdict on the fusion.
+NON_TERMINAL_CODES = {"gpu_busy", "not_finished", "not_reached", "retry", "deferred_retry",
+                      "lease_busy", "timeout", "agent_failed"}
+# Measured evidence a `blocked` record may stand on.
+BLOCKED_EVIDENCE = {"unit_fail", "unit_parity_fail", "e2e_regression", "e2e_no_gain",
+                    "ab_reject", "accuracy_fail", "not_engaged", "wire_failure",
+                    "kernel_unavailable", "stack_reject", "stack_harmful"}
+# A deferred record carrying one of these was stopped by the KernelFusion TIME budget (the
+# apply-back loop keeps >= 30% of the budget for greedy stacking): a recorded decision to
+# stop, accounted like a rank-budget cut, and written back as next-round candidate input.
+BUDGET_DEFERRED_CODES = {"budget_reserve", "budget_exhausted", "deferred_budget"}
+# Order a unit-side row is preferred in when one candidate carries several sides
+# (existing kernel + self-authored): the best measured side is the candidate's status.
+UNIT_STATUS_RANK = {"pass": 0, "equivalent_pass": 0, "subsumed_pass": 0, "fail": 1,
+                    "equivalent_fail": 1, "blocked": 2, "equivalent_blocked": 2,
+                    "needs_diagnosis": 3, "equivalent_needs_diagnosis": 3}
+_UNMEASURED_PHRASES = (
+    "not reached a verified terminal", "not reach a terminal", "no a/b or gsm8k numbers",
+    "no a/b throughput", "gpu busy", "gpus busy", "gpus are held", "gpus 0-7 are held",
+    "serving gpus (0-", "still on its first", "still running at return",
+    "measurement not finished", "not measured")
 
 
 def _load(path):
@@ -126,10 +180,26 @@ def _collect_records(apply_payload, errors):
                 return val
         return ""
 
+    def _rejected_disposition(rec):
+        """blocked only with measured evidence; otherwise unmeasured / stack_pending."""
+        if _is_unmeasured(rec):
+            return "unmeasured"
+        if rec.get("stack_pending") and not rec.get("stack_result"):
+            return "stack_pending"
+        evidence = rec.get("blocked_evidence")
+        if evidence and str(evidence) not in BLOCKED_EVIDENCE:
+            errors.append(
+                "rejected record %r declares blocked_evidence %r; must be one of %s"
+                % (rec.get("exec_id") or rec.get("fusion"), evidence,
+                   sorted(BLOCKED_EVIDENCE)))
+        return "blocked"
+
     for rec in apply_payload.get("dispositions") or []:
         disp = str(rec.get("disposition") or "").strip().lower()
         if disp in ("deferred", "defer"):
             disp = "deferred_with_reason"
+        if disp == "blocked":
+            disp = _rejected_disposition(rec)
         if disp not in EXPLICIT:
             errors.append(
                 "dispositions[] entry %r has disposition %r; must be one of %s"
@@ -140,9 +210,19 @@ def _collect_records(apply_payload, errors):
     for rec in apply_payload.get("accepted_fusions") or []:
         records.append(("applied", _reason(rec) or "integrated and kept", rec))
     for rec in apply_payload.get("rejected") or []:
-        records.append(("blocked", _reason(rec), rec))
+        records.append((_rejected_disposition(rec), _reason(rec), rec))
     for rec in apply_payload.get("deferred") or []:
-        records.append(("deferred_with_reason", _reason(rec), rec))
+        if rec.get("deferred_budget") or str(rec.get("reason_code") or "").lower() \
+                in BUDGET_DEFERRED_CODES:
+            records.append(("deferred_budget", _reason(rec) or "KernelFusion time budget", rec))
+            continue
+        records.append(("unmeasured" if _is_unmeasured(rec) else "deferred_with_reason",
+                        _reason(rec), rec))
+    # The workflow's retry queue and the entries it exhausted: never a verdict.
+    for field in ("retry", "unmeasured"):
+        for rec in apply_payload.get(field) or []:
+            records.append(("unmeasured", _reason(rec) or (
+                "not measured (%s)" % (rec.get("reason_code") or field)), rec))
 
     # A blocked/deferred row without a reason is the failure mode this gate exists to
     # stop, just one level down: "we looked at it" with nothing behind it.
@@ -155,14 +235,74 @@ def _collect_records(apply_payload, errors):
     return records
 
 
+def _is_unmeasured(rec):
+    """True when a record reports that nothing was measured (never a verdict)."""
+    if rec.get("measured") is False:
+        return True
+    code = str(rec.get("reason_code") or rec.get("status") or "").strip().lower()
+    if code in NON_TERMINAL_CODES:
+        return True
+    if rec.get("measured") is True or rec.get("blocked_evidence"):
+        return False
+    reason = " ".join(str(rec.get(f) or "") for f in ("reason", "why", "notes")).lower()
+    return any(p in reason for p in _UNMEASURED_PHRASES)
+
+
+# Where an entry stopped (二.10.6d), read off its measured evidence.
+_STAGE_BY_EVIDENCE = {
+    "unit_fail": "unit", "unit_parity_fail": "unit",
+    "wire_failure": "wire", "not_engaged": "wire", "kernel_unavailable": "wire",
+    "e2e_regression": "e2e", "e2e_no_gain": "e2e", "ab_reject": "e2e",
+    "accuracy_fail": "accuracy",
+    "stack_harmful": "stack", "stack_reject": "stack",
+}
+_STAGE_BY_DISPOSITION = {
+    "applied": "landed", "stack_pending": "stack", "unmeasured": "unmeasured",
+    "deferred_budget": "budget", "deferred_with_reason": "deferred",
+    "blocked_by_exclusion": "exclusion", "unaccounted": "none",
+}
+
+
+def stop_stage(disposition, rec, source=""):
+    """unit / wire / e2e / accuracy / stack (or landed / budget / unmeasured / ...)."""
+    if disposition == "blocked":
+        if source == "unitside":
+            return "unit"
+        evidence = str((rec or {}).get("blocked_evidence") or "")
+        if evidence in _STAGE_BY_EVIDENCE:
+            return _STAGE_BY_EVIDENCE[evidence]
+        if (rec or {}).get("stack_result"):
+            return "stack"
+        return "e2e" if (rec or {}).get("throughput_delta_pct") is not None else "unknown"
+    return _STAGE_BY_DISPOSITION.get(disposition, disposition or "unknown")
+
+
+def _stage_evidence(rec):
+    rec = rec or {}
+    for key in ("evidence", "evidence_path", "ab_json", "applyback_json", "overlay_path"):
+        if rec.get(key):
+            return str(rec[key])
+    sr = rec.get("stack_result") or {}
+    if sr.get("evidence"):
+        return str(sr["evidence"])
+    if rec.get("unit_side_statuses"):
+        return "unit-side: " + ", ".join(str(s) for s in rec["unit_side_statuses"])
+    if rec.get("throughput_delta_pct") is not None:
+        return "A/B delta %s%%" % rec["throughput_delta_pct"]
+    return ""
+
+
 def _unitside_index(unitside_payload):
-    """candidate_id -> (unit_side_status, reason)."""
+    """candidate_id -> (unit_side_status, reason) of its BEST measured side."""
     index = {}
     for row in (unitside_payload or {}).get("results") or []:
         cid = row.get("candidate_id")
-        if cid:
-            index[cid] = (str(row.get("unit_side_status") or ""),
-                          str(row.get("reason") or ""))
+        if not cid:
+            continue
+        cur = (str(row.get("unit_side_status") or ""), str(row.get("reason") or ""))
+        prev = index.get(cid)
+        if prev is None or UNIT_STATUS_RANK.get(cur[0], 9) < UNIT_STATUS_RANK.get(prev[0], 9):
+            index[cid] = cur
     return index
 
 
@@ -223,8 +363,21 @@ def _budget_cutoff_rank(execution_list, unit_index, budget):
     return None
 
 
+def accuracy_gate_record(accuracy_mode=None, calibration_json=None):
+    mode = str(accuracy_mode or "gate").lower()
+    rec = {"mode": mode, "e2e_accuracy_gated": mode != "skip",
+           "calibration_json": os.path.abspath(calibration_json) if calibration_json else ""}
+    if mode == "skip":
+        rec["statement"] = "e2e 精度未把关"
+        rec["reason"] = ("calibration_unusable: no e2e accuracy test (gsm8k / deterministic "
+                         "probe) passed the base-vs-base control; accuracy rests on unit-side "
+                         "numerical equivalence")
+    return rec
+
+
 def validate(topk_path, apply_path, unitside_path=None, budget=None,
-             require_coverage=True, waivers=None):
+             require_coverage=True, waivers=None, min_landed=None,
+             accuracy_mode=None, calibration_json=None):
     topk = _load(topk_path)
     apply_payload = _load(apply_path)
     unitside = _load(unitside_path) if unitside_path else None
@@ -292,13 +445,16 @@ def validate(topk_path, apply_path, unitside_path=None, budget=None,
             any(status in APPLYBACK_ELIGIBLE for status in unit_statuses)
         )
         disposition, reason, source = None, "", ""
+        chosen = None
 
         if hits:
             # An explicit record wins. If the loop said several things about one row,
             # 'applied' is the strongest claim and the rest are its history.
-            order = {"applied": 0, "blocked": 1, "deferred_with_reason": 2}
+            order = {"applied": 0, "blocked": 1, "stack_pending": 2,
+                     "deferred_with_reason": 3, "deferred_budget": 3, "unmeasured": 4}
             _i, disposition, reason, rec = sorted(
                 hits, key=lambda h: order.get(h[1], 9))[0]
+            chosen = rec
             source = "integrator"
             if len({d for _i, d, _r, _rec in hits}) > 1:
                 warnings.append(
@@ -350,6 +506,14 @@ def validate(topk_path, apply_path, unitside_path=None, budget=None,
                           + unit_note)
                 source = "none"
 
+        if disposition == "blocked" and source == "integrator":
+            rec = sorted(hits, key=lambda h: order.get(h[1], 9))[0][3]
+            if rec.get("measured") is not True and not rec.get("blocked_evidence"):
+                warnings.append(
+                    "%s is blocked without declared measured evidence (set measured:true "
+                    "and blocked_evidence ∈ %s); a block must stand on a measurement"
+                    % (exec_id, sorted(BLOCKED_EVIDENCE)))
+
         if disposition == "deferred_with_reason" and applyback_required:
             errors.append(
                 "%s is an in-budget tier-%s row with passing unit-side evidence (%s), "
@@ -376,9 +540,13 @@ def validate(topk_path, apply_path, unitside_path=None, budget=None,
             "disposition": disposition,
             "reason": reason,
             "source": source,
+            "stop_stage": stop_stage(disposition, chosen, source),
+            "stage_evidence": _stage_evidence(chosen),
         })
 
     unaccounted = [r["exec_id"] for r in results if r["disposition"] == "unaccounted"]
+    unmeasured = [r["exec_id"] for r in results if r["disposition"] == "unmeasured"]
+    stack_waiting = [r["exec_id"] for r in results if r["disposition"] == "stack_pending"]
     waived_unknown = sorted(
         set(waivers) - {e.get("exec_id") for e in execution_list})
     for exec_id in waived_unknown:
@@ -412,7 +580,33 @@ def validate(topk_path, apply_path, unitside_path=None, budget=None,
             % (budget, len(execution_list), cutoff_rank,
                len(execution_list) - cutoff_rank, len(truncated)))
 
-    coverage_fail = bool(require_coverage and unaccounted)
+    # Landing target (二.10.6): landed = applied execution-list rows (solo accepts and members of
+    # a landed greedy stack) + candidate-pool items the landed stack carried.
+    landed_count = (sum(1 for r in results if r["disposition"] == "applied")
+                    + len(apply_payload.get("pool_accepted") or []))
+    landed = {"count": landed_count, "min": min_landed,
+              "met": None if min_landed is None else landed_count >= int(min_landed)}
+    if landed["met"] is False:
+        warnings.append(
+            "only %d fusion(s) landed, below the landing target %s; every entry's stop stage "
+            "(unit / wire / e2e / accuracy / stack) is listed in the report"
+            % (landed_count, min_landed))
+
+    accuracy_gate = accuracy_gate_record(accuracy_mode, calibration_json)
+    if not accuracy_gate["e2e_accuracy_gated"]:
+        warnings.append(
+            "e2e 精度未把关: the round's accuracy calibration found no usable test%s; "
+            "accuracy rests on unit-side numerical equivalence"
+            % (" (%s)" % accuracy_gate["calibration_json"]
+               if accuracy_gate["calibration_json"] else ""))
+        for r in results:
+            if r["disposition"] == "blocked" and str(
+                    (r.get("stop_stage") or "")) == "accuracy":
+                warnings.append(
+                    "%s is blocked on accuracy although no e2e accuracy test ran this round"
+                    % r["exec_id"])
+
+    coverage_fail = bool(require_coverage and (unaccounted or unmeasured or stack_waiting))
     accounted = sum(1 for r in results if r["disposition"] in ACCOUNTED)
     result = {
         "schema_version": 1,
@@ -429,7 +623,13 @@ def validate(topk_path, apply_path, unitside_path=None, budget=None,
             "accounted": accounted,
             "unaccounted": len(unaccounted),
             "unaccounted_exec_ids": unaccounted,
-            "complete": not unaccounted,
+            # Said something, measured nothing. Never accounted, with or without
+            # --allow-partial-coverage.
+            "unmeasured": len(unmeasured),
+            "unmeasured_exec_ids": unmeasured,
+            "stack_pending": len(stack_waiting),
+            "stack_pending_exec_ids": stack_waiting,
+            "complete": not (unaccounted or unmeasured or stack_waiting),
         },
         "coverage_ok": not coverage_fail,
         "applyback_completion": {
@@ -440,6 +640,16 @@ def validate(topk_path, apply_path, unitside_path=None, budget=None,
             "complete": not incomplete_applyback,
         },
         "budget": budget_record,
+        "landed": landed,
+        "stop_stages": ([{"exec_id": r["exec_id"], "stage": r["stop_stage"],
+                          "evidence": r["stage_evidence"], "reason": r["reason"]}
+                         for r in results if r["disposition"] != "applied"]
+                        if landed["met"] is False else []),
+        "wire_failures": apply_payload.get("wire_failures") or [],
+        "accuracy_gate": accuracy_gate,
+        # Alternative-group rungs unit-tested on demand during apply-back (outside the
+        # Top-K coverage denominator; recorded for the report only).
+        "unit_on_demand": apply_payload.get("unit_on_demand") or [],
         "counts": counts,
         "results": results,
         # The board's own coverage travels one more hop, so the FINAL report carries
@@ -472,6 +682,8 @@ _DISP_LABEL = {
     "deferred_with_reason": "⏸ 延后",
     "deferred_budget": "⏸ 超预算",
     "unaccounted": "🔴 无交代",
+    "unmeasured": "⏳ 未测（不算交代）",
+    "stack_pending": "⏸ 待叠加（未复测）",
 }
 
 
@@ -482,12 +694,21 @@ def render_markdown(result):
         "「没提到」不是「跳过」，是报告的漏洞——它会被标成 🔴 无交代并让本 gate fail。")
     lines.append("")
 
+    acc_gate = result.get("accuracy_gate") or {}
+    if acc_gate.get("mode") == "skip":
+        lines.append("> ⚠ **e2e 精度未把关**：本轮基线对基线校准中，gsm8k 与确定性检查都未通过"
+                     "（基线本身不可信），apply-back 与叠加步骤均未跑 e2e 精度测试，精度只靠单测"
+                     "数值等价把关。校准证据：`%s`"
+                     % _esc(acc_gate.get("calibration_json") or "(未提供)"))
+        lines.append("")
     cov = result.get("coverage") or {}
     lines.append("## 交代覆盖率（先看这里）")
     lines.append("")
-    lines.append("执行清单 **%d** 条：已交代 **%d** / 无交代 **%d**。"
+    lines.append("执行清单 **%d** 条：已交代 **%d** / 无交代 **%d** / 未测 **%d** / "
+                 "待叠加 **%d**。"
                  % (cov.get("execution_list_size", 0), cov.get("accounted", 0),
-                    cov.get("unaccounted", 0)))
+                    cov.get("unaccounted", 0), cov.get("unmeasured", 0),
+                    cov.get("stack_pending", 0)))
     completion = result.get("applyback_completion") or {}
     if completion.get("required"):
         lines.append("")
@@ -496,6 +717,33 @@ def render_markdown(result):
                      % (completion.get("required", 0),
                         completion.get("completed", 0),
                         completion.get("incomplete", 0)))
+    landed = result.get("landed") or {}
+    if landed.get("min") is not None:
+        lines.append("")
+        lines.append("落地数 **%d** / 目标 N_min **%s**：%s。"
+                     % (landed.get("count", 0), landed.get("min"),
+                        "✅ 达标" if landed.get("met") else "🔴 未达标"))
+    if result.get("stop_stages"):
+        lines.append("")
+        lines.append("### 未达落地目标：逐项止步环节")
+        lines.append("")
+        lines.append("| exec_id | 止步环节 | 证据 | 原因 |")
+        lines.append("|---|---|---|---|")
+        for row in result["stop_stages"]:
+            lines.append("| `%s` | %s | %s | %s |" % (
+                _esc(row["exec_id"]), _esc(row["stage"]), _esc(row["evidence"])[:160],
+                _esc(row["reason"])[:200]))
+        if result.get("wire_failures"):
+            lines.append("")
+            lines.append("接入失败（wire_failure，已排查并重测一次）的项为下一轮最高优先级：" + ", ".join(
+                "`%s`" % _esc(w.get("exec_id")) for w in result["wire_failures"]) + "。")
+    on_demand = result.get("unit_on_demand") or []
+    if on_demand:
+        lines.append("")
+        lines.append("按需单测的备选级（前一级 unit_fail 或被实测否决后才测）：" + "、".join(
+            "`%s` r%s → %s" % (_esc(u.get("candidate_id")), _esc(u.get("rung")),
+                              _esc(u.get("status")))
+            for u in on_demand) + "。")
     c = result.get("counts") or {}
     lines.append("")
     lines.append("去向分布：" + " / ".join(
@@ -537,6 +785,22 @@ def render_markdown(result):
             "`--waive <exec_id>=<理由>`。"
             % (cov.get("unaccounted"),
                "、".join("`%s`" % e for e in cov.get("unaccounted_exec_ids") or [])))
+        lines.append("")
+    if cov.get("unmeasured"):
+        lines.append(
+            "> 🔴 **%d 条未测**：%s。它们有一条记录，但没有任何实测数据（GPU 被占 / "
+            "测量没跑完 / 本次调用没跑到）。「被挡」只允许用于有实测数据支撑的拒绝"
+            "（单测不过、e2e 退化、精度不过），这些条目必须重试到有测量为止，"
+            "不能算作已交代。"
+            % (cov.get("unmeasured"),
+               "、".join("`%s`" % e for e in cov.get("unmeasured_exec_ids") or [])))
+        lines.append("")
+    if cov.get("stack_pending"):
+        lines.append(
+            "> ⏸ **%d 条待叠加，尚未叠加复测**：%s。单测和接入都过、没有退化、只是单项收益"
+            "落在噪声带里；叠加复测跑完之前它们不算已交代。"
+            % (cov.get("stack_pending"),
+               "、".join("`%s`" % e for e in cov.get("stack_pending_exec_ids") or [])))
         lines.append("")
     if completion.get("incomplete"):
         lines.append(
@@ -630,9 +894,12 @@ def _parse_waivers(pairs):
 
 
 def run(topk_path, apply_path, out_md, out_json, unitside_path=None, budget=None,
-        require_coverage=True, waivers=None):
+        require_coverage=True, waivers=None, min_landed=None, accuracy_mode=None,
+        calibration_json=None):
     result = validate(topk_path, apply_path, unitside_path, budget,
-                      require_coverage=require_coverage, waivers=waivers)
+                      require_coverage=require_coverage, waivers=waivers,
+                      min_landed=min_landed, accuracy_mode=accuracy_mode,
+                      calibration_json=calibration_json)
     os.makedirs(os.path.dirname(os.path.abspath(out_json)), exist_ok=True)
     with open(out_json, "w") as fh:
         json.dump(result, fh, indent=2, ensure_ascii=False)
@@ -657,19 +924,34 @@ def main():
                         help="FUSION_BUDGET actually applied, counted over 单侧-eligible "
                              "rows; excuses rows ranked after the N-th one "
                              "(recorded and named, never silent)")
-    parser.add_argument("--allow-partial-coverage", action="store_true")
+    parser.add_argument("--allow-partial-coverage", action="store_true",
+                        help="intermediate reports only: unaccounted / unmeasured / "
+                             "stack_pending rows do not fail the status, but they are never "
+                             "counted as accounted and stay listed")
     parser.add_argument("--waive", action="append", metavar="EXEC_ID=REASON", default=[])
+    parser.add_argument("--min-landed", type=int, default=None,
+                        help="landing target N_min; below it the report lists every entry's "
+                             "stop stage (unit / wire / e2e / accuracy / stack) with evidence")
+    parser.add_argument("--accuracy-mode", choices=("gate", "skip"), default="gate",
+                        help="skip: the round ran no e2e accuracy test (calibration unusable); "
+                             "the report states it with --calibration-json as evidence")
+    parser.add_argument("--calibration-json", default="",
+                        help="the round's accuracy calibration.json (evidence path)")
     args = parser.parse_args()
     result = run(args.topk, args.apply, args.out_md, args.out_json,
                  unitside_path=args.unitside, budget=args.budget,
                  require_coverage=not args.allow_partial_coverage,
-                 waivers=_parse_waivers(args.waive))
+                 waivers=_parse_waivers(args.waive), min_landed=args.min_landed,
+                 accuracy_mode=args.accuracy_mode, calibration_json=args.calibration_json)
     cov = result.get("coverage") or {}
     print(json.dumps({"status": result["status"], "counts": result["counts"],
                       "errors": len(result["errors"]),
                       "coverage": {k: cov.get(k) for k in
                                    ("execution_list_size", "accounted",
-                                    "unaccounted", "complete")}},
+                                    "unaccounted", "unmeasured", "unmeasured_exec_ids",
+                                    "stack_pending", "complete")},
+                      "landed": result.get("landed"),
+                      "accuracy_gate": result.get("accuracy_gate")},
                      indent=2, ensure_ascii=False))
     return 0 if result["status"] == "pass" else 1
 
