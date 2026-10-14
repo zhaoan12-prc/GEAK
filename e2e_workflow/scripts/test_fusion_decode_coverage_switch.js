@@ -88,6 +88,27 @@ if (helper) {
     'no mapper result -> covers nothing');
 }
 
+// 3b) complete_table is not cut off by the generic 120-minute hung-agent guard: the donor/replay
+//     is a full model load plus a capture window, and a timed-out agent keeps running unread.
+const tmo = src.match(/const FUSION_COMPLETE_TABLE_TIMEOUT_MS = parseInt\(\s*A\.semantics_completion_timeout_ms != null \? A\.semantics_completion_timeout_ms : (\d+), 10\);/);
+ok(!!tmo && tmo[1] === '0', 'complete_table timeout defaults to 0 (outer workflow bound only)');
+ok(/label: 'semantics-mapper:shape-completion', schema: SEMANTICS_SCHEMA,\s*\n\s*timeoutMs: FUSION_COMPLETE_TABLE_TIMEOUT_MS \}/.test(src),
+  'complete_table call passes its own timeoutMs');
+ok(/fusionCompletionOutcome = completed \? 'returned' : 'no_result'/.test(src) &&
+   /fusionCoverage\.decode_completion_outcome = fusionCompletionOutcome/.test(src),
+  'a complete_table that returned nothing is recorded as no_result in the coverage verdict');
+const bounded = src.match(/function agentBounded[\s\S]*?\n\}\n/);
+if (bounded) {
+  const mk = new Function('withProcessSafety', 'AGENT_TIMEOUT_MS', 'agentTimeoutFor', 'agent', 'log', 'setTimeout',
+    bounded[0] + '\nreturn agentBounded;');
+  let armed = 0;
+  const ab = mk((p) => p, 7200000, () => 7200000, async () => 'r', () => {}, () => { armed++; return 0; });
+  ab('p', { timeoutMs: 0 });
+  ok(armed === 0, 'timeoutMs: 0 arms no hung-agent guard');
+  ab('p', {});
+  ok(armed === 1, 'default call still arms the generic guard');
+}
+
 // 4) The verdict reaches the disposition (and therefore the report).
 ok(/fusionCoverage = semanticsPhaseCoverage\(semantics, FUSION_COMPLETE_TABLE_ON\)/.test(src),
   'KernelFusion computes coverage from the final semantics result');

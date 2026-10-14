@@ -1710,6 +1710,13 @@ const AGENT_TIMEOUT_MS = parseInt(A.agent_timeout_ms != null ? A.agent_timeout_m
 // outer workflow timeout; callers may still set an explicit per-entry bound.
 const FUSION_APPLY_TIMEOUT_MS = parseInt(
   A.fusion_apply_timeout_ms != null ? A.fusion_apply_timeout_ms : 0, 10);
+// Same reasoning for PHASE=complete_table: it launches the decode boundary donor (vLLM) or the
+// Shape replay (sglang), each a full model load plus a capture window, and a retry after a busy
+// GPU or a mis-sized window doubles that. Under the 120-minute guard the workflow went on to
+// screen the prefill-only table while the un-cancelled agent finished the decode table minutes
+// later, unread. Zero delegates the bound to the outer workflow timeout.
+const FUSION_COMPLETE_TABLE_TIMEOUT_MS = parseInt(
+  A.semantics_completion_timeout_ms != null ? A.semantics_completion_timeout_ms : 0, 10);
 // Process-safety rule prepended to EVERY agent prompt. It is injected at this funnel
 // (the one place `agent()` is ever called) rather than in roleAgent(), because several
 // prompts are built inline and would otherwise never see it — and any future call site
@@ -2792,6 +2799,8 @@ const acceptedFusions = (ST.accepted_fusions || []).slice();
 let fusionDisposition = ST.fusion_disposition || null;
 // Phase coverage of this run's fusion tables; folded into fusionDisposition when KernelFusion ends.
 let fusionCoverage = null;
+// complete_table outcome: skipped (switch off / table failed) | returned | no_result (timeout, failure).
+let fusionCompletionOutcome = 'skipped';
 // Flag/env levers found by fusion ranking (tier A). They are configuration changes, not
 // fusions, so they go to the config tuner -- or, when this run may not tune config, back
 // to the caller as config_recommendations.
@@ -3835,7 +3844,9 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON && FUSION_BACKENDS.has(BACKEND)) {
               SHAPE_CAPTURE_SETUP: SEMANTICS_SHAPE_CAPTURE_SETUP, SKILL_DIR: WORKFLOW_DIR,
               ...FUSION_RUNTIME_INPUTS,
             }),
-          { phase: 'KernelFusion', label: 'semantics-mapper:shape-completion', schema: SEMANTICS_SCHEMA }, 1);
+          { phase: 'KernelFusion', label: 'semantics-mapper:shape-completion', schema: SEMANTICS_SCHEMA,
+            timeoutMs: FUSION_COMPLETE_TABLE_TIMEOUT_MS }, 1);
+        fusionCompletionOutcome = completed ? 'returned' : 'no_result';
         if (completed) semantics = completed;
       }
     } else {
@@ -3855,12 +3866,16 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON && FUSION_BACKENDS.has(BACKEND)) {
     // whole track (decode is most of a serving cycle), so it travels in the disposition to the
     // report instead of living only in the run log.
     fusionCoverage = semanticsPhaseCoverage(semantics, FUSION_COMPLETE_TABLE_ON);
+    fusionCoverage.decode_completion_outcome = fusionCompletionOutcome;
     if (fusionCoverage.decode_covered === false) {
       log(`WARNING: KernelFusion decode coverage MISSING — the fusion tables hold ` +
           `[${(fusionCoverage.phases_in_tables || []).join(', ') || 'none'}] only, so no decode fusion ` +
-          'can be discovered this round. ' + (FUSION_COMPLETE_TABLE_ON
-            ? 'Decode boundary completion ran and did not resolve it (see 01_SEMANTIC.md).'
-            : `Decode boundary completion is disabled (${FUSION_COMPLETE_TABLE_SWITCH}=false).`));
+          'can be discovered this round. ' + (!FUSION_COMPLETE_TABLE_ON
+            ? `Decode boundary completion is disabled (${FUSION_COMPLETE_TABLE_SWITCH}=false).`
+            : (fusionCompletionOutcome === 'no_result'
+              ? 'Decode boundary completion returned no result (timeout or failure); its agent may ' +
+                'still be writing a table this round will not read.'
+              : 'Decode boundary completion ran and did not resolve it (see 01_SEMANTIC.md).')));
     } else if (fusionCoverage.decode_covered == null) {
       log('WARNING: the semantics mapper did not report phase coverage; KernelFusion decode ' +
           'coverage is unknown (check quality_json phase_coverage).');

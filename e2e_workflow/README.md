@@ -126,6 +126,8 @@ Workflow({
     semantics_layer_donor: "true",   // KernelFusion decode layer boundaries on VLLM (CUDA-graph-off donor
                           //   capture; roles/semantics_mapper.md). "false" => fusion tables hold prefill
                           //   only; the disposition reports coverage_gaps:["decode"].
+    semantics_completion_timeout_ms: 0, // hung-agent bound for that completion step; 0 (default) = only
+                          //   the outer workflow bound (it is a full model load + capture window, often retried).
     gpu_ids: "0",         // comma-separated
     isl: 1024, osl: 1024, conc: 64,  // workload (profile + bench use the SAME)
     task: "focus on ...", // optional steer
