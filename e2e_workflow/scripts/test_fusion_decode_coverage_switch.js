@@ -1,0 +1,100 @@
+#!/usr/bin/env node
+// Regression guard for KernelFusion decode coverage (no GPU, no model needed).
+//
+// Incident: a vLLM run passed semantics_shape_capture=false to skip the sglang-only Shape replay.
+// That same switch gated PHASE=complete_table, which on vLLM is the CUDA-graph-off layer-boundary
+// donor, so the fusion tables held prefill only and the run said so in one log line.
+//
+// Invariants under test, on the ACTUAL code extracted from the workflow script:
+//   (a) complete_table is gated per backend: semantics_shape_capture on sglang, semantics_layer_donor
+//       on vllm, and neither switch reaches the other backend;
+//   (b) the complete_table call site uses that per-backend gate;
+//   (c) semanticsPhaseCoverage never reports "covered" without evidence: a missing decode is false,
+//       an unreported coverage is null (unknown), a failed table covers nothing;
+//   (d) the coverage verdict is folded into the fusion disposition as coverage_gaps.
+//
+// Run:  node e2e_workflow/scripts/test_fusion_decode_coverage_switch.js
+'use strict';
+const fs = require('fs');
+const path = require('path');
+
+const ROOT = path.resolve(__dirname, '..', '..');            // .../GEAK
+const FILE = path.join(ROOT, 'e2e_workflow', 'e2e_workflow.js');
+
+let failures = 0;
+const ok = (cond, msg) => { if (!cond) { console.error('  FAIL:', msg); failures++; } else console.log('  ok:', msg); };
+
+console.log(`\n# ${path.relative(ROOT, FILE)}`);
+const src = fs.readFileSync(FILE, 'utf8');
+
+// 1) The switch blocks, probed with controlled module-scope deps.
+const shape = src.match(/const SEMANTICS_SHAPE_CAPTURE_ON = [\s\S]*?const FUSION_SHAPE_CAPTURE_ON = [\s\S]*?=== 'true';/);
+const donor = src.match(/const FUSION_LAYER_DONOR_ON = [\s\S]*?const FUSION_COMPLETE_TABLE_SWITCH = [^\n]*\n/);
+const helper = src.match(/function semanticsPhaseCoverage\([\s\S]*?\n\}\n/);
+ok(!!shape, 'semantics_shape_capture switch block found');
+ok(!!donor, 'per-backend complete_table switch block found');
+ok(!!helper, 'semanticsPhaseCoverage helper found');
+
+if (shape && donor) {
+  const make = new Function('A', 'BACKEND',
+    shape[0] + '\n' + donor[0] +
+    '\nreturn { FUSION_COMPLETE_TABLE_ON, FUSION_COMPLETE_TABLE_SWITCH };');
+  const gate = (backend, a) => make(a, backend);
+
+  ok(gate('vllm', {}).FUSION_COMPLETE_TABLE_ON === true, 'vllm: decode donor ON by default');
+  ok(gate('vllm', { semantics_shape_capture: 'false' }).FUSION_COMPLETE_TABLE_ON === true,
+    'vllm: semantics_shape_capture=false does NOT turn the donor off (the incident)');
+  ok(gate('vllm', { semantics_layer_donor: 'false' }).FUSION_COMPLETE_TABLE_ON === false,
+    'vllm: semantics_layer_donor=false turns the donor off');
+  ok(gate('vllm', {}).FUSION_COMPLETE_TABLE_SWITCH === 'semantics_layer_donor',
+    'vllm: the switch named in warnings is semantics_layer_donor');
+
+  ok(gate('sglang', {}).FUSION_COMPLETE_TABLE_ON === true, 'sglang: Shape replay ON by default');
+  ok(gate('sglang', { semantics_shape_capture: 'false' }).FUSION_COMPLETE_TABLE_ON === false,
+    'sglang: semantics_shape_capture=false turns the replay off');
+  ok(gate('sglang', { semantics_layer_donor: 'false' }).FUSION_COMPLETE_TABLE_ON === true,
+    'sglang: semantics_layer_donor has no effect');
+  ok(gate('sglang', {}).FUSION_COMPLETE_TABLE_SWITCH === 'semantics_shape_capture',
+    'sglang: the switch named in warnings is semantics_shape_capture');
+}
+
+// 2) The complete_table call site uses the per-backend gate, not the sglang switch.
+const site = src.match(/if \((\w+) && semantics &&\s*\n\s*semantics\.status !== 'failed'[\s\S]{0,400}?'complete_table'/);
+ok(!!site, 'complete_table call site found');
+if (site) ok(site[1] === 'FUSION_COMPLETE_TABLE_ON', `complete_table gated by FUSION_COMPLETE_TABLE_ON (found ${site[1]})`);
+
+// 3) Coverage verdicts.
+if (helper) {
+  const cov = new Function('FUSION_COMPLETE_TABLE_SWITCH',
+    helper[0] + '\nreturn semanticsPhaseCoverage;')('semantics_layer_donor');
+  const table = { semantic_table_json: '/t.json' };
+
+  const both = cov({ ...table, status: 'pass', phases_in_tables: ['decode', 'prefill'], missing_required_phases: [] }, true);
+  ok(both.decode_covered === true, 'pass with decode in tables -> covered');
+
+  const prefillOnly = cov({ ...table, status: 'partial', phases_in_tables: ['prefill'], missing_required_phases: ['decode'] }, false);
+  ok(prefillOnly.decode_covered === false, 'partial with decode missing -> NOT covered');
+  ok(prefillOnly.decode_completion_enabled === false && prefillOnly.decode_completion_switch === 'semantics_layer_donor',
+    'records whether completion ran and which switch controls it');
+
+  const unreported = cov({ ...table, status: 'pass' }, true);
+  ok(unreported.decode_covered === null, 'coverage not reported -> unknown (null), never covered');
+
+  const tablesOnly = cov({ ...table, status: 'pass', phases_in_tables: ['prefill'] }, true);
+  ok(tablesOnly.decode_covered === false, 'phases_in_tables without decode -> NOT covered');
+
+  ok(cov({ status: 'failed', notes: 'x' }, true).decode_covered === false, 'failed table -> covers nothing');
+  ok(cov(null, true).decode_covered === false && cov(null, true).semantics_status === 'missing',
+    'no mapper result -> covers nothing');
+}
+
+// 4) The verdict reaches the disposition (and therefore the report).
+ok(/fusionCoverage = semanticsPhaseCoverage\(semantics, FUSION_COMPLETE_TABLE_ON\)/.test(src),
+  'KernelFusion computes coverage from the final semantics result');
+ok(/phase_coverage: fusionCoverage,\s*\n\s*coverage_gaps:/.test(src),
+  'coverage is folded into fusionDisposition as phase_coverage + coverage_gaps');
+ok(/phases_in_tables: arrStr, missing_required_phases: arrStr/.test(src),
+  'SEMANTICS_SCHEMA accepts the mapper coverage fields');
+
+console.log(failures ? `\n${failures} FAILURE(S)` : '\nALL OK');
+process.exit(failures ? 1 : 0);

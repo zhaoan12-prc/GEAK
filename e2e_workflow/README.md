@@ -121,6 +121,11 @@ Workflow({
     use_expert_skills: "false", // consult perf_knowledge/expert_skills (advisory priors) on/off (default OFF, opt-in);
                           //   set "true" to enable. When OFF (default) nothing is injected -> behavior is
                           //   byte-identical to a run without the feature. Threaded down to the kernel layer too.
+    semantics_shape_capture: "true", // KernelFusion decode/Shape completion on SGLANG (graph-construction
+                          //   replay; run_semantic_shape_capture.py). No effect on vLLM.
+    semantics_layer_donor: "true",   // KernelFusion decode layer boundaries on VLLM (CUDA-graph-off donor
+                          //   capture; roles/semantics_mapper.md). "false" => fusion tables hold prefill
+                          //   only; the disposition reports coverage_gaps:["decode"].
     gpu_ids: "0",         // comma-separated
     isl: 1024, osl: 1024, conc: 64,  // workload (profile + bench use the SAME)
     task: "focus on ...", // optional steer

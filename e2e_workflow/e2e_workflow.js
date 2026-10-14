@@ -79,6 +79,8 @@ const SEMANTICS_MAPPING_ON = String(
 // Phase 1.2 performs one extra, instrumented Shape-only replay after the clean
 // representative tables exist. Preserve the original opt-in behavior outside
 // KernelFusion; fusion discovery defaults its own shape completion on.
+// Inside KernelFusion this switch reaches sglang only; on vllm the decode boundary
+// donor has its own switch (see FUSION_COMPLETE_TABLE_ON below BACKEND).
 const SEMANTICS_SHAPE_CAPTURE_ON = String(
   A.semantics_shape_capture != null ? A.semantics_shape_capture : 'false') === 'true';
 const FUSION_SHAPE_CAPTURE_ON = String(
@@ -198,6 +200,29 @@ const RUNTIME_IMAGE = String(A.runtime_image || A.image || '');
 const EXEC_PREFIX = String(A.exec_prefix || '');
 const FUSION_RUNTIME_INPUTS = EXEC_PREFIX ? { EXEC_PREFIX } : {};
 const BACKEND = String(A.backend != null ? A.backend : 'sglang').trim() || 'sglang';  // serving adapter
+// ---- KernelFusion decode coverage -------------------------------------------
+// On a graph-capturing backend a decode step is ONE graph replay with no per-layer host ops, so the
+// Clean Trace cannot cut it into layers; the boundaries come from a second capture in
+// PHASE=complete_table. Those captures are different programs per backend: the graph-construction
+// Shape replay on sglang (run_semantic_shape_capture.py), the CUDA-graph-off boundary donor on vllm
+// (roles/semantics_mapper.md). So each has its own switch, and neither switch reaches the other
+// backend: `semantics_shape_capture` configures the sglang replay, `semantics_layer_donor` the vllm
+// donor. With a single shared switch, a vllm run that turned off the sglang-only replay also turned
+// off its decode coverage, and its fusion tables silently held prefill only.
+const FUSION_LAYER_DONOR_ON = String(
+  A.semantics_layer_donor != null ? A.semantics_layer_donor : 'true') === 'true';
+const FUSION_COMPLETE_TABLE_ON = BACKEND === 'vllm' ? FUSION_LAYER_DONOR_ON : FUSION_SHAPE_CAPTURE_ON;
+const FUSION_COMPLETE_TABLE_SWITCH = BACKEND === 'vllm' ? 'semantics_layer_donor' : 'semantics_shape_capture';
+if (FUSION_DISCOVERY_ON && BACKEND === 'vllm' && A.semantics_shape_capture != null) {
+  log(`Note: semantics_shape_capture=${A.semantics_shape_capture} has no effect on BACKEND=vllm (it configures ` +
+      `the sglang Shape replay). vLLM decode coverage is controlled by semantics_layer_donor ` +
+      `(${FUSION_LAYER_DONOR_ON ? 'on' : 'off'}).`);
+}
+if (FUSION_DISCOVERY_ON && !FUSION_COMPLETE_TABLE_ON) {
+  log(`WARNING: KernelFusion decode coverage is OFF (${FUSION_COMPLETE_TABLE_SWITCH}=false): ` +
+      'decode layer boundaries will not be completed, so the fusion tables hold prefill only and no ' +
+      'decode fusion can be discovered. The disposition will record this as a coverage gap.');
+}
 // Fallback for a vLLM build that emits NO step annotation (pre-0.27, or a fork that dropped
 // annotate_profile). Arms scripts/vllm_phase_annotate.py in the fusion capture overlay so the
 // trace carries sglang-dialect step[...] spans. OFF by default: current vLLM annotates natively,
@@ -866,6 +891,8 @@ const SEMANTICS_SCHEMA = obj({
   shape_log_jsonl: { type: 'string' }, op_coverage_manifest: { type: 'string' },
   kernel_semantic_evidence_jsonl: { type: 'string' },
   shape_type_verification_json: { type: 'string' },
+  // quality_json phase_coverage, verbatim: the workflow reports a missing decode as a coverage gap.
+  phases_in_tables: arrStr, missing_required_phases: arrStr,
   notes: { type: 'string' },
 }, ['status']);
 
@@ -1597,6 +1624,29 @@ function fusionApplyBudgetEntries(list, eligibleIds, budget) {
     if ((entry.candidate_ids || []).some((cid) => eligible.has(String(cid)))) used += 1;
   }
   return out;
+}
+
+// Phase coverage of a semantics_mapper result, from the mapper's own phase_coverage verdict
+// (`phases_in_tables` / `missing_required_phases`, copied from quality_json). A failed or absent
+// table covers nothing; a result that does not report coverage is `null` (unknown), never covered.
+function semanticsPhaseCoverage(sem, completionEnabled) {
+  const strs = (v) => (Array.isArray(v) ? v.map(String) : null);
+  const failed = !sem || !sem.semantic_table_json ||
+    (sem.status !== 'pass' && sem.status !== 'partial');
+  const inTables = failed ? [] : strs(sem.phases_in_tables);
+  const missing = failed ? null : strs(sem.missing_required_phases);
+  let decodeCovered = null;
+  if (failed) decodeCovered = false;
+  else if (missing) decodeCovered = !missing.includes('decode');
+  else if (inTables) decodeCovered = inTables.includes('decode');
+  return {
+    semantics_status: sem ? String(sem.status || '') : 'missing',
+    phases_in_tables: inTables,
+    missing_required_phases: missing,
+    decode_covered: decodeCovered,
+    decode_completion_enabled: !!completionEnabled,
+    decode_completion_switch: FUSION_COMPLETE_TABLE_SWITCH,
+  };
 }
 
 function roleAgent(role, phase, intro, inputs) {
@@ -2740,6 +2790,8 @@ let curOverlay = ST.overlay || '';
 let curTput = ST.throughput || 0;
 const acceptedFusions = (ST.accepted_fusions || []).slice();
 let fusionDisposition = ST.fusion_disposition || null;
+// Phase coverage of this run's fusion tables; folded into fusionDisposition when KernelFusion ends.
+let fusionCoverage = null;
 // Flag/env levers found by fusion ranking (tier A). They are configuration changes, not
 // fusions, so they go to the config tuner -- or, when this run may not tune config, back
 // to the caller as config_recommendations.
@@ -3769,7 +3821,7 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON && FUSION_BACKENDS.has(BACKEND)) {
             ...FUSION_RUNTIME_INPUTS,
           }),
         { phase: 'KernelFusion', label: 'semantics-mapper:fusion', schema: SEMANTICS_SCHEMA }, 1);
-      if (FUSION_SHAPE_CAPTURE_ON && semantics &&
+      if (FUSION_COMPLETE_TABLE_ON && semantics &&
           semantics.status !== 'failed' && semantics.status !== 'fail') {
         fusionFailureStage = 'shape_completion';
         const completed = await safeAgent(
@@ -3798,6 +3850,20 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON && FUSION_BACKENDS.has(BACKEND)) {
     if (semanticsUsable && semantics.status === 'partial') {
       log('KernelFusion: semantic table is partial; screening the phases it resolved. ' +
           'Chains in unresolved phases cannot be discovered this round (see 01_SEMANTIC.md).');
+    }
+    // Which phases the fusion tables actually hold. A missing decode is a coverage gap of the
+    // whole track (decode is most of a serving cycle), so it travels in the disposition to the
+    // report instead of living only in the run log.
+    fusionCoverage = semanticsPhaseCoverage(semantics, FUSION_COMPLETE_TABLE_ON);
+    if (fusionCoverage.decode_covered === false) {
+      log(`WARNING: KernelFusion decode coverage MISSING — the fusion tables hold ` +
+          `[${(fusionCoverage.phases_in_tables || []).join(', ') || 'none'}] only, so no decode fusion ` +
+          'can be discovered this round. ' + (FUSION_COMPLETE_TABLE_ON
+            ? 'Decode boundary completion ran and did not resolve it (see 01_SEMANTIC.md).'
+            : `Decode boundary completion is disabled (${FUSION_COMPLETE_TABLE_SWITCH}=false).`));
+    } else if (fusionCoverage.decode_covered == null) {
+      log('WARNING: the semantics mapper did not report phase coverage; KernelFusion decode ' +
+          'coverage is unknown (check quality_json phase_coverage).');
     }
     if (semanticsUsable) {
       // Policy after the captured trace has been turned into a kernel table:
@@ -4359,6 +4425,15 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON && FUSION_BACKENDS.has(BACKEND)) {
     };
     log(`ERROR: KernelFusion ${fusionFailureStage} raised an unexpected exception: ${message}. ` +
         'Restored the latest terminal Fusion checkpoint and continuing to Strategize.');
+  }
+  // Every exit path above rebuilds fusionDisposition, so the coverage verdict is attached here,
+  // once. coverage_gaps is what the report reads: a phase listed there had no fusion candidates.
+  if (fusionCoverage) {
+    fusionDisposition = Object.assign({}, fusionDisposition || {}, {
+      phase_coverage: fusionCoverage,
+      coverage_gaps: fusionCoverage.decode_covered === false ? ['decode']
+        : (fusionCoverage.decode_covered == null ? ['decode:unknown'] : []),
+    });
   }
 }
 
@@ -6325,7 +6400,9 @@ if (want('final')) {
       'and a never-recorded page are the same 404, so the address asked is the finding, and a reader ' +
       'who cannot see it cannot tell "no prior art" from "prior art one segment away". Zero candidates ' +
       'is NOT the same as an empty page: report KB_RECALL.e2e.curation (scanned/retired/' +
-      'same_direction_collapsed/below_min_speedup, and its own read_plane) with both floors.', {
+      'same_direction_collapsed/below_min_speedup, and its own read_plane) with both floors. ' +
+      'When FUSION_DISPOSITION.coverage_gaps is non-empty, the KernelFusion section MUST say which ' +
+      'phase had no fusion candidates and why, from FUSION_DISPOSITION.phase_coverage.', {
       EVAL_DIR, HISTORY: history, BASELINE_THROUGHPUT: BASELINE_TPUT, FINAL_THROUGHPUT: finalTput,
       KB_RECALL,
       ACCEPTED_CONFIG: { flags: curFlags, env: curEnv }, ACCEPTED_KERNELS: allAccepted,

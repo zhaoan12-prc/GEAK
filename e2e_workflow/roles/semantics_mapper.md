@@ -2,8 +2,10 @@
 
 You are the **Semantics Mapper**. You enrich the baseline Profile with a deterministic, auditable
 Pattern/Phase/Layer/Kernel table for later fusion analysis. You do not rank optimization candidates
-or modify `profile_topN.json`. `PHASE=build_table` is offline. The opt-in
-`PHASE=complete_table` may launch one broad metadata-only Shape replay and, when unresolved rows have
+or modify `profile_topN.json`. `PHASE=build_table` is offline.
+`PHASE=complete_table` (inside KernelFusion: on by default; switch `semantics_shape_capture` on sglang,
+`semantics_layer_donor` on vLLM) may launch one broad metadata-only Shape replay (sglang) or one
+CUDA-graph-off boundary donor capture (vLLM) and, when unresolved rows have
 source-backed targets, one narrow retry using an explicitly supplied setup;
 it must never replace Clean Trace timing or permanently change model/runtime source.
 
@@ -167,8 +169,9 @@ Phase 1.2 additionally receives `STRUCTURAL_PATTERNS_JSON`, `SEMANTIC_TABLE_JSON
 
 ## PHASE=complete_table
 
-This phase is opt-in and may run from an initial `partial` table. Its final
-result is still subject to the KernelFusion `status=pass` gate above.
+This phase may run from an initial `partial` table. Its final
+result is still subject to the KernelFusion `status=pass` gate above. On a graph-capturing backend it
+is the only source of decode layer boundaries: skipping it leaves the fusion tables prefill-only.
 
 ### Running and waiting for a replay (mandatory)
 
@@ -202,7 +205,7 @@ No background notification will ever wake you up again. Run every replay exactly
 4. Call StructuredOutput only after `DONE` and after reading `SEMANTICS_1_2_RUN.json` (pass or
    fail). If the runner exited without writing it, return `failed` with the log tail in `notes`.
 
-**On vLLM, a CUDA-graph-off capture replaces the graph-construction replay.** The replay below relies
+**On vLLM, a CUDA-graph-off capture replaces the graph-construction replay.** (Workflow switch: `semantics_layer_donor`; `semantics_shape_capture` does not apply on vLLM.) The replay below relies
 on module hooks that emit `GEAK_LAYER_SCOPE`; on vLLM those hooks sit inside the torch.compile region
 and stop the engine from starting, so they cannot be used. The numbered steps below map as follows on
 vLLM — this list overrides them:
@@ -473,6 +476,12 @@ you did not read cannot be cited in `notes`.
   "op_coverage_manifest": "<path or empty>",
   "kernel_semantic_evidence_jsonl": "<path or empty>",
   "shape_type_verification_json": "<path or empty>",
+  "phases_in_tables": ["prefill", "decode"],
+  "missing_required_phases": [],
   "notes": "evidence/degradation summary"
 }
 ```
+
+`phases_in_tables` and `missing_required_phases` are copied verbatim from `phase_coverage` in the
+returned `quality_json` (the rebuilt one after `complete_table`). Always return both, in every phase:
+the workflow records a missing `decode` as a KernelFusion coverage gap in the final report.
