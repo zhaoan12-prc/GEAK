@@ -240,13 +240,15 @@ vLLM — this list overrides them:
     timed rounds, and with graph replay off one 160-prompt round at ISL 8192 takes hours.
   - **Land the window on the recipient's decode batch.** Transfer only matches a donor pass whose
     bucket equals the Clean Trace decode step it cuts (`phase_coverage.analysis_steps.decode` in the
-    `build_table` quality JSON: `batch_size`, normally `CONC`). The window opens at load start, where
-    the client warmup decodes a smaller batch for about `OSL` steps and the timed load then ramps up
-    through `ceil(CONC*ISL/max_num_batched_tokens)` prefill steps. A window there captures `bs<CONC`
-    (Kimi-K2.5: `bs=8`, the warmup) and transfer fails with `no_validated_stable_projection`. Set
-    `GEAK_FUSION_DELAY_ITERS` past both with margin: `2*OSL + ceil(CONC*ISL/max_num_batched_tokens)`
-    engine steps (`2060` at 8192/1024/16, the value that captured 48 `bs=16` decode passes), raise `GEAK_FUSION_WINDOW_SEC` so the delayed window can
-    still finish (graph-off decode steps are slow), and keep `GEAK_FUSION_MAX_ITERS` small (`48`).
+    `build_table` quality JSON: `batch_size`, normally `CONC`). `bench_e2e.sh` arms the window only
+    after the background client reports its warmup done (`profile_bg_load.log`; before that change a
+    window opened on the warmup's `bs=8` decode and transfer failed with
+    `no_validated_stable_projection`). From there the load still ramps up through
+    `ceil(CONC*ISL/max_num_batched_tokens)` prefill steps while decode grows to `bs=CONC`, so set
+    `GEAK_FUSION_DELAY_ITERS` past the ramp with margin, about
+    `2*ceil(CONC*ISL/max_num_batched_tokens) + 16` engine steps, raise `GEAK_FUSION_WINDOW_SEC` so the
+    delayed window can still finish (graph-off decode steps are slow), and keep
+    `GEAK_FUSION_MAX_ITERS` small (`48`).
   - **Check the serving GPUs are free before launching.** Another process holding memory makes the
     server die at startup (`Free memory on device ... is less than desired GPU memory utilization`).
     Read per-GPU used VRAM (`rocm-smi --showmemuse`); if a process outside this run holds the serving

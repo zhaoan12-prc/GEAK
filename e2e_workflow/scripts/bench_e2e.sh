@@ -557,6 +557,26 @@ PROFILE_TARGET_STEPS=$(python3 -c "import math;print(math.ceil($CONC*$ISL/max(${
 PROFILE_MAX_ITERS=${PROFILE_MAX_ITERS:-$(( PROFILE_TARGET_STEPS < PROFILE_NUM_STEPS_MAX ? PROFILE_TARGET_STEPS : PROFILE_NUM_STEPS_MAX ))}
 PROFILE_DELAY_ITERS=${PROFILE_DELAY_ITERS:-0}       # steps to skip before arming; 0 keeps the prefill burst
 PROFILE_WARMUP_SEC=${PROFILE_WARMUP_SEC:-0}         # 0 = arm at load start so prefill is captured too
+# The load start the window opens on is AFTER the client's own warmup requests (see the profiling
+# block below). Upper bound on that wait; past it the window opens anyway, with a warning.
+PROFILE_CLIENT_WARMUP_WAIT_SEC=${PROFILE_CLIENT_WARMUP_WAIT_SEC:-1800}
+# _profile_wait_client_warmup LOG PID — return once the background client has finished its warmup
+# requests and started the real load. Markers: InferenceX "Warmup completed." then "Traffic request
+# rate" (printed immediately when it has no warmup); vllm bench "Warmup run completed." then
+# "Starting main benchmark run". Returns early if the client exits; warns and returns on timeout.
+_profile_wait_client_warmup() {
+  local log="$1" pid="$2" waited=0
+  local ready='Warmup completed|Warmup run completed|Traffic request rate|Starting main benchmark run'
+  while [ "$waited" -lt "$PROFILE_CLIENT_WARMUP_WAIT_SEC" ]; do
+    if grep -qE "$ready" "$log" 2>/dev/null; then
+      [ "$waited" -gt 0 ] && echo ">>> client warmup done after ${waited}s; arming the profile window on the real load"
+      return 0
+    fi
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 2; waited=$((waited + 2))
+  done
+  echo "!!! client warmup not reported done after ${PROFILE_CLIENT_WARMUP_WAIT_SEC}s; arming the window anyway (it may capture warmup batches)" >&2
+}
 PROFILE_NUM_PROMPTS=${PROFILE_NUM_PROMPTS:-$((CONC * 4))}   # >CONC so the queue stays saturated
 PROFILE_REQUEST_RATE=${PROFILE_REQUEST_RATE:-}      # optional req/s to stagger arrivals; empty = inf
 PROFILE_WINDOW_TIMEOUT=${PROFILE_WINDOW_TIMEOUT:-180}      # max wait for the trace file to land
@@ -952,18 +972,24 @@ PY
     # sustained, replenishing background load (>CONC prompts, realistic prefill+decode mix; NOT timed, NOT
     # profiled). With PROFILE_WARMUP_SEC=0 the profiler is armed at load start so the capture includes the
     # initial prefill burst (prefill shapes stay visible for head selection).
-    # The sglang fusion window opens at load start. The client's own warmup requests
-    # (NUM_WARMUPS, 8 by default) would then be what the window captures:
-    # Qwen3.5 NEXTN recorded 16/16 verify steps at bs=8 instead of 64. The timed
-    # run above already warmed the server, so the profiled load skips warmup.
-    # vllm places its window by iteration delay (GEAK_FUSION_DELAY_ITERS), tuned
-    # with the client warmup in place, so it keeps NUM_WARMUPS.
+    # The window must open on the real load, never on the client's own warmup requests
+    # (NUM_WARMUPS, 8 by default): those decode at bs=NUM_WARMUPS for about OSL steps, and a
+    # window opened at process start captures that instead of bs=CONC (Qwen3.5 NEXTN: 16/16
+    # verify steps at bs=8 instead of 64; Kimi-K2.5 vLLM: profile and boundary donor at bs=8
+    # instead of 16). So the window is armed only once the client reports its warmup done.
+    # The warmup still runs first, so the server is warm (aiter/Triton JIT) when the window
+    # opens, and the window still starts with the load's prefill burst and decode ramp.
+    # sglang fusion captures skip the client warmup outright (the timed run above already
+    # warmed that server); the wait below is then immediate.
     _BG_WARMUPS="${NUM_WARMUPS:-}"
     [ "$_GEAK_FUSION_CAPTURE" = "1" ] && [ "$BACKEND" = "sglang" ] && \
       _BG_WARMUPS="${GEAK_FUSION_PROFILE_WARMUPS:-0}"
-    NUM_WARMUPS="$_BG_WARMUPS" REQUEST_RATE="${PROFILE_REQUEST_RATE}" \
-      adapter_bench "$PROFILE_NUM_PROMPTS" "$CONC" 0 >/dev/null 2>&1 &
+    _BG_LOG="$OUT_DIR/profile_bg_load.log"
+    # Unbuffered so the warmup markers reach the log while the client is still running.
+    NUM_WARMUPS="$_BG_WARMUPS" REQUEST_RATE="${PROFILE_REQUEST_RATE}" PYTHONUNBUFFERED=1 \
+      adapter_bench "$PROFILE_NUM_PROMPTS" "$CONC" 0 >"$_BG_LOG" 2>&1 &
     _bg_load=$!
+    _profile_wait_client_warmup "$_BG_LOG" "$_bg_load"
     sleep "$PROFILE_WARMUP_SEC"
     if kill -0 "$_bg_load" 2>/dev/null; then
       adapter_profile_window || echo "!!! profile window failed"
