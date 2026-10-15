@@ -714,6 +714,30 @@ class PhaseCoverageTest(unittest.TestCase):
         self.assertEqual(scopes, [])
         self.assertEqual(diag["status"], "no_usable_step")
 
+    def test_flow_linked_rows_in_a_dispatch_cut_keep_dispatch_provenance(self):
+        """Graph-replay kernels reach a python-frame dispatch cut only through ac2g
+        flows; they must still count as dispatch-cut rows, or the P_i>P_j segment
+        tables drop them."""
+        frame = "vllm/models/deepseek_v41/attention.py(985): _sparse_indexer_and_attn"
+        doc = self._hybrid_pattern_doc(linear_branch=frame, full_branch=frame)
+        events = self._step_and_anchors(doc)
+        for event in events:
+            if event["name"] == frame:
+                event["cat"] = "python_function"
+                event["dur"] = 5
+        for layer in range(8):
+            host = 1000 + 10 * (layer + 1) + 2
+            device = host + 3
+            events.append({"ph": "s", "id": layer, "ts": host, "cat": "ac2g"})
+            events.append({"ph": "f", "id": layer, "ts": device, "cat": "ac2g"})
+            events.append({"cat": "kernel", "name": "graph_kernel_%d" % layer,
+                           "ts": device, "dur": 1, "args": {}})
+        rows = mapping._event_rows(events, doc)[0]
+        body = [row for row in rows if row.get("layer_id") is not None]
+        self.assertEqual(len(body), 8)
+        self.assertTrue(all(row["layer_evidence"] == "declared_dispatch_op_span"
+                            for row in body))
+
     @staticmethod
     def _valid_structure():
         return {"num_hidden_layers_main": 4,
