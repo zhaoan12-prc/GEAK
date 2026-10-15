@@ -204,9 +204,34 @@ adapter_profile_window() {
   local deadline=$(( $(date +%s) + ${PROFILE_WINDOW_TIMEOUT:-180} ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
     after=$(ls "$PROFILE_DIR"/*.trace.json* 2>/dev/null | wc -l)
-    [ "$after" -gt "$before" ] && { sleep 2; return 0; }   # +2s for the write to flush
+    [ "$after" -gt "$before" ] && break
     sleep 3
   done
   after=$(ls "$PROFILE_DIR"/*.trace.json* 2>/dev/null | wc -l)
-  [ "$after" -gt "$before" ]
+  [ "$after" -gt "$before" ] || return 1
+  # The file appears when the write STARTS. A large with-stack trace (an eager
+  # cudagraph-off donor is several hundred MB of gzip) is still being written for
+  # minutes; tearing the server down now truncates it (gzip CRC failure). Wait
+  # until every trace stops growing.
+  _vllm_wait_traces_settled
+}
+
+# Block until the trace files in $PROFILE_DIR stop growing (size unchanged for
+# GEAK_TRACE_SETTLE_SEC), bounded by GEAK_TRACE_FLUSH_TIMEOUT.
+_vllm_wait_traces_settled() {
+  local settle="${GEAK_TRACE_SETTLE_SEC:-10}"
+  local deadline=$(( $(date +%s) + ${GEAK_TRACE_FLUSH_TIMEOUT:-1200} ))
+  local last="" now stable_since
+  stable_since=$(date +%s)
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    now=$(stat -c '%n:%s' "$PROFILE_DIR"/*.trace.json* 2>/dev/null | sort | tr '\n' ' ')
+    if [ "$now" != "$last" ]; then
+      last="$now"; stable_since=$(date +%s)
+    elif [ $(( $(date +%s) - stable_since )) -ge "$settle" ]; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "!!! trace files still growing after ${GEAK_TRACE_FLUSH_TIMEOUT:-1200}s" >&2
+  return 1
 }
