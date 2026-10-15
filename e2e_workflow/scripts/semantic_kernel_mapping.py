@@ -1026,7 +1026,14 @@ def _event_rows(events, pattern_doc):
             layer_id = flow_scope["layer_id"]
             layer_instance_id = flow_scope["layer_instance_id"]
             module_scope = flow_scope
-            layer_evidence = "python_module_span_ac2g_flow"
+            # Same provenance rule as above: a graph-replay launch linked by flow
+            # into a dispatch-op cut is still a dispatch-op cut. Mislabelled, the
+            # segment re-keying (_segment_pattern_doc) skipped it and dropped most
+            # of each P_i>P_j body from its table.
+            layer_evidence = (
+                "declared_dispatch_op_span"
+                if flow_scope.get("scope_source") == "declared_dispatch_op"
+                else "python_module_span_ac2g_flow")
         elif (parent or {}).get("layer_id") is not None:
             layer_id = parent["layer_id"]
             layer_evidence = "cpu_op_external_id"
