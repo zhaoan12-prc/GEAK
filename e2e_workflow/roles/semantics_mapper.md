@@ -73,6 +73,17 @@ Phase 1.2 additionally receives `STRUCTURAL_PATTERNS_JSON`, `SEMANTIC_TABLE_JSON
      * **A wrong name is caught, not believed.** The mapper checks that the i-th anchor's op is the
        one the Pattern owning layer i declared, and declines the whole step if not. Write the name
        you verified in the source; do not guess a plausible one.
+     * **Breakable CUDA graphs (no torch.compile).** Some vLLM models are not torch-compiled and
+       replay *breakable* CUDA graphs instead (`VLLM_USE_BREAKABLE_CUDAGRAPH=1`, recognizable in a
+       trace by `vllm/compilation/breakable_cudagraph.py` frames; e.g. DeepSeek-V4.1). The layer
+       body replays inside the graph and the only per-layer CPU event left is the python frame of the
+       graph break each layer runs eagerly, which is a `python_function`, not a `cpu_op`. In that
+       case declare that frame's exact trace name as `runtime_dispatch_branch`
+       (e.g. `vllm/models/deepseek_v41/attention.py(985): _sparse_indexer_and_attn`) — verify the
+       file/line in the imported source and that every main layer passes through it in prefill.
+       Layers that bypass the break in some phase (e.g. a fused whole-layer decode kernel) are not a
+       reason to omit it: those steps stay `boundary_unresolved` and the Phase-1.2 donor resolves
+       them through the layer anchor (see *On vLLM* under `complete_table`).
    - Put first/last position, model entry/exit, terminal postprocess, collective/residual handoff,
      and pre/post-layer loop behavior in `instance_context`. These facts never participate in the
      Pattern hash. A last layer with the same core body as an interior layer remains in that Pattern.
@@ -164,7 +175,9 @@ Phase 1.2 additionally receives `STRUCTURAL_PATTERNS_JSON`, `SEMANTIC_TABLE_JSON
      representative integrity, exact layer order, and conservation.
    - `partial`: config/runtime Patterns are valid and useful phase data exists, but a phase still
      needs graph-construction boundary or Shape completion. `partial` may enter `complete_table`, but
-     it may not enter Fusion Discovery.
+     it may not enter Fusion Discovery. This includes the case where NO phase has a table yet because
+     every step is graph-replayed (`phase_coverage.requires_boundary_donor` is set): report it as
+     `partial`, not `failed` — the Patterns are valid and the boundary donor is the remedy.
    - `failed`: no trustworthy representative-layer table was produced or completion failed.
 
 ## PHASE=complete_table
@@ -223,7 +236,10 @@ vLLM — this list overrides them:
 - **Step 4 (donor capture).** Run `EVAL_DIR/bench_e2e.sh` again with the SAME workload, `CONC`, flags,
   env and overlay as the Clean Trace, plus `--compilation-config.cudagraph_mode=NONE` (dotted form —
   a JSON `--compilation-config` replaces the object and drops the platform defaults) and a separate
-  `OUT_DIR`; pass `SKILL_DIR` too so the capture writes its trace manifest. Graph replay off keeps torch.compile, so the kernel set stays the production one, and the
+  `OUT_DIR`; pass `SKILL_DIR` too so the capture writes its trace manifest. The same flag applies to a
+  model that replays breakable CUDA graphs without torch.compile: keep `VLLM_USE_BREAKABLE_CUDAGRAPH`
+  as in the Clean Trace and let `cudagraph_mode=NONE` turn replay off; its `DecoderLayer.forward`
+  frames then carry the donor cut (Step 5). Graph replay off keeps torch.compile, so the kernel set stays the production one, and the
   CPU walks the model on every step, so every decode step carries the Patterns' declared dispatch ops.
   Never use `--enforce-eager`: it also disables torch.compile and describes a different graph. This
   capture supplies layer cuts (and later Shape evidence) only; its timing is never used.
@@ -255,10 +271,16 @@ vLLM — this list overrides them:
   recipient's batch size (count `execute_context_*_generation_<CONC>(<CONC>)` annotations). If it
   does not, re-capture with a larger delay instead of running a transfer that cannot match.
 - **Step 5 (transfer).** Run `semantic_layer_boundary_transfer.py` with the donor capture's rank-0
-  trace. With no `GEAK_LAYER_SCOPE` markers it builds donor layer scopes from the declared
-  `runtime_dispatch_branch` ops and applies the same exact / stable-projection rules; the map records
-  `donor.scope_source=declared_dispatch_op_span`. Steps already cut by dispatch ops in the Clean Trace
-  (normally prefill) are skipped as authoritative.
+  trace. With no `GEAK_LAYER_SCOPE` markers it first builds donor layer scopes from the per-layer
+  anchor frames (the `DecoderLayer` module span, or `layer_anchor_regexes`); the map records
+  `donor.scope_source=layer_anchor_span`. This is the path for a model that is not torch-compiled
+  (breakable CUDA graphs): with graph replay off its python `DecoderLayer.forward` runs on every
+  step and encloses the whole layer, including fused whole-layer decode kernels that never reach the
+  dispatch op. If no complete anchor pass exists (torch.compile erased the frames), it falls back to
+  the declared `runtime_dispatch_branch` ops; the map then records
+  `donor.scope_source=declared_dispatch_op_span`. Either way the same exact / stable-projection rules
+  apply. Steps already cut by dispatch ops in the Clean Trace (normally prefill) are skipped as
+  authoritative.
 - **Step 6** is unchanged.
 - **Steps 7–9 (Shape).** Graph replay records no `Input Dims`, so the rebuilt table's decode rows are
   `unresolved`. Instead of a shape log, project Shape and parent operator from the donor over the

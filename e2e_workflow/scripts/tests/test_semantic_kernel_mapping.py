@@ -685,6 +685,66 @@ class PhaseCoverageTest(unittest.TestCase):
             self.assertEqual(earlier["end"], later["ts"])
         self.assertTrue(all(s["scope_source"] == "declared_dispatch_op" for s in scopes))
 
+    def test_dispatch_anchors_accept_breakable_cudagraph_python_frames(self):
+        """vLLM breakable CUDA graphs: the per-layer graph break is a python frame."""
+        frame = "vllm/models/deepseek_v41/attention.py(985): _sparse_indexer_and_attn"
+        doc = self._hybrid_pattern_doc(linear_branch=frame, full_branch=frame)
+        events = self._step_and_anchors(doc)
+        for event in events:
+            if event["name"] == frame:
+                event["cat"] = "python_function"
+        # Unrelated python frames (the graph-break lambda) must not count as anchors.
+        events.append({"cat": "python_function", "ts": 1015, "dur": 1,
+                       "name": "vllm/compilation/breakable_cudagraph.py(118): <lambda>"})
+        spans = mapping._collect_step_spans(events)
+        scopes, diag = mapping._dispatch_anchor_scopes(events, spans, doc)
+
+        self.assertEqual(diag["status"], "mapped")
+        self.assertEqual([s["layer_id"] for s in scopes], list(range(8)))
+        self.assertTrue(all(s["scope_source"] == "declared_dispatch_op" for s in scopes))
+
+    def test_dispatch_anchors_ignore_other_event_categories(self):
+        doc = self._hybrid_pattern_doc()
+        events = self._step_and_anchors(doc)
+        for event in events:
+            if event["cat"] == "cpu_op":
+                event["cat"] = "cuda_runtime"
+        spans = mapping._collect_step_spans(events)
+        scopes, diag = mapping._dispatch_anchor_scopes(events, spans, doc)
+        self.assertEqual(scopes, [])
+        self.assertEqual(diag["status"], "no_usable_step")
+
+    @staticmethod
+    def _valid_structure():
+        return {"num_hidden_layers_main": 4,
+                "coverage_check": {"total_main_layers": 4, "covered": 4,
+                                   "full_coverage": True},
+                "quality": {"status": "pass"}}
+
+    def test_boundary_only_failure_can_be_completed_by_a_donor(self):
+        """Valid Patterns, every step graph-replayed: partial, not fail."""
+        diags = [{"step_id": "legacy-0", "status": "boundary_unresolved"},
+                 {"step_id": "legacy-1", "status": "boundary_unresolved"},
+                 {"status": "no_anchor_match"}]
+        self.assertTrue(mapping._boundary_donor_can_complete(
+            self._valid_structure(), diags))
+
+    def test_real_failures_are_not_reclassified_as_boundary_only(self):
+        unresolved = [{"step_id": "s", "status": "boundary_unresolved"}]
+        doc = self._valid_structure()
+        doc["coverage_check"]["full_coverage"] = False
+        self.assertFalse(mapping._boundary_donor_can_complete(doc, unresolved))
+        doc = self._valid_structure()
+        doc["quality"]["status"] = "fail"
+        self.assertFalse(mapping._boundary_donor_can_complete(doc, unresolved))
+        # A step that partitioned and then failed a gate is a real failure.
+        self.assertFalse(mapping._boundary_donor_can_complete(
+            self._valid_structure(),
+            unresolved + [{"step_id": "t", "status": "fail"}]))
+        # No analysed step at all says nothing about boundaries.
+        self.assertFalse(mapping._boundary_donor_can_complete(
+            self._valid_structure(), [{"status": "no_anchor_match"}]))
+
     def test_dispatch_cuts_are_keyed_by_successor_pattern(self):
         """A dispatch cut holds the NEXT layer's head, so its table key includes it.
 

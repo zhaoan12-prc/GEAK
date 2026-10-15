@@ -132,6 +132,77 @@ class SemanticLayerBoundaryTransferTest(unittest.TestCase):
             self.assertEqual(
                 result["mapped_groups"][0]["layer_start_positions"], [1, 3])
 
+    LAYER_FRAME = "vllm/models/deepseek_v41/amd/model.py(272): forward"
+
+    def _layer_anchor_donor(self, root, dispatch_layers=()):
+        """A breakable-cudagraph vLLM donor with graph replay off: no markers, every
+        layer's python forward frame encloses its launches. `dispatch_layers` also
+        carry the attention dispatch frame (a mono decode layer bypasses it)."""
+        events = [
+            {"cat": "user_annotation", "name": "step[DECODE bs=4]", "pid": 1, "tid": 2,
+             "ts": 5, "dur": 80},
+            {"cat": "gpu_user_annotation", "name": "step[DECODE bs=4]",
+             "ts": 5, "dur": 120},
+        ]
+        correlation = 0
+        for layer_id in (0, 1):
+            base = 10 + layer_id * 30
+            events.append({"cat": "python_function", "name": self.LAYER_FRAME,
+                           "pid": 1, "tid": 2, "ts": base, "dur": 20})
+            if layer_id in dispatch_layers:
+                events.append({"cat": "python_function", "name": "attn_break",
+                               "pid": 1, "tid": 2, "ts": base + 1, "dur": 1})
+            for offset, name in enumerate(("layer%d_a" % layer_id,
+                                           "layer%d_b" % layer_id)):
+                correlation += 1
+                events.append({
+                    "cat": "hip_runtime", "pid": 1, "tid": 2,
+                    "name": "hipLaunchKernel", "ts": base + 2 + offset,
+                    "dur": 0.1, "args": {"correlation": correlation}})
+                events.append({
+                    "cat": "kernel", "name": name, "ts": 100 + correlation,
+                    "dur": 1, "args": {"correlation": correlation}})
+        path = os.path.join(root, "layer_anchor_donor.json")
+        with open(path, "w") as fh:
+            json.dump({"traceEvents": events}, fh)
+        return path
+
+    def _layer_anchor_patterns(self, root, branch=""):
+        path = self._patterns(root)
+        with open(path) as fh:
+            doc = json.load(fh)
+        doc["layer_anchor_regexes"] = [r"deepseek_v41/amd/model\.py\(272\): forward$"]
+        if branch:
+            doc["patterns"][0]["structural_signature"] = {
+                "runtime_dispatch_branch": branch}
+        with open(path, "w") as fh:
+            json.dump(doc, fh)
+        return path
+
+    def test_layer_anchor_donor_transfers_cuts_without_markers(self):
+        # Not torch-compiled: with graph replay off the layer's python forward frame
+        # is present on every step and is the donor cut.
+        with tempfile.TemporaryDirectory() as tmp:
+            result = transfer.transfer(
+                self._layer_anchor_donor(tmp), self._recipient(tmp),
+                self._layer_anchor_patterns(tmp), os.path.join(tmp, "b.json"))
+            self.assertEqual(result["status"], "pass")
+            self.assertEqual(result["donor"]["scope_source"], "layer_anchor_span")
+            self.assertEqual(
+                result["mapped_groups"][0]["layer_start_positions"], [1, 3])
+
+    def test_layer_anchor_wins_when_a_layer_bypasses_the_dispatch_op(self):
+        # Layer 0 runs a fused whole-layer decode kernel and never reaches the
+        # attention dispatch frame, so dispatch ops alone cannot cut this step.
+        with tempfile.TemporaryDirectory() as tmp:
+            result = transfer.transfer(
+                self._layer_anchor_donor(tmp, dispatch_layers=(1,)),
+                self._recipient(tmp),
+                self._layer_anchor_patterns(tmp, branch="attn_break"),
+                os.path.join(tmp, "b.json"))
+            self.assertEqual(result["status"], "pass")
+            self.assertEqual(result["donor"]["scope_source"], "layer_anchor_span")
+
     def test_donor_without_markers_or_dispatch_ops_fails_explicitly(self):
         with tempfile.TemporaryDirectory() as tmp:
             result = transfer.transfer(
