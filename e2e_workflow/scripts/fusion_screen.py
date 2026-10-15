@@ -331,14 +331,35 @@ def phase_weights(rows, workload):
     isl, osl = workload.get("isl"), workload.get("osl")
     if not isl or not osl:
         return {}
-    weights = {"prefill": 1.0, "decode": float(max(int(osl) - 1, 0))}
+    # Under speculative decoding the generation forward is TARGET_VERIFY (phase
+    # "verify" on SGLang; vLLM keeps calling it "decode"), and one forward emits
+    # accept_length tokens per request. Without a known accept length the
+    # non-speculative OSL-1 is kept as an explicit upper bound -- never the
+    # neutral weight 1, which made verify-phase seams ~1000x too small to pass
+    # the gate.
+    generation_forwards = float(max(int(osl) - 1, 0))
+    accept_length = _accept_length(workload)
+    if accept_length:
+        generation_forwards = float(math.ceil(generation_forwards / accept_length))
+    weights = {"prefill": 1.0, "decode": generation_forwards}
+    if any(row.get("phase") == "verify" for row in rows):
+        weights["verify"] = generation_forwards
     for row in rows:
         phase = row.get("phase")
         if phase == "prefill" and row.get("step_input_tokens"):
             weights["prefill"] = float(isl) / float(row["step_input_tokens"])
-        elif phase == "decode" and row.get("step_batch_size"):
-            weights["decode"] = float(max(int(osl) - 1, 0)) / float(row["step_batch_size"])
+        elif phase in ("decode", "verify") and row.get("step_batch_size"):
+            weights[phase] = generation_forwards / float(row["step_batch_size"])
     return weights
+
+
+def _accept_length(workload):
+    """Mean tokens one generation forward emits per request, or None."""
+    try:
+        value = float((workload or {}).get("spec_accept_length") or 0)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 1.0 else None
 
 
 def _effective_weights(rows, e2e_us, weights):
@@ -3235,6 +3256,9 @@ def main(argv=None):
                         help="expected minutes per apply-back item (unit test + A/B)")
     parser.add_argument("--passes", type=int, default=SCREEN_PASSES)
     parser.add_argument("--isl", default="")
+    parser.add_argument("--spec-accept-length", default="",
+                        help="mean tokens per TARGET_VERIFY forward (speculative decoding); "
+                             "empty keeps the OSL-1 upper bound")
     parser.add_argument("--osl", default="")
     parser.add_argument("--conc", default="")
     parser.add_argument("--md", default="")
@@ -3257,7 +3281,8 @@ def main(argv=None):
         with open(args.catalog) as handle:
             catalog = json.load(handle)
     workload = {"isl": _int_or_none(args.isl), "osl": _int_or_none(args.osl),
-                "conc": _int_or_none(args.conc)}
+                "conc": _int_or_none(args.conc),
+                "spec_accept_length": args.spec_accept_length or None}
     k_effective = adaptive_k(args.fusion_budget_s, args.item_minutes, args.top_k)
     hw = hardware(args.gfx, args.hbm_tbps, args.peak_tflops_bf16, args.peak_tflops_fp8)
     priors = load_all_priors(args.measured_priors, args.priors_index)

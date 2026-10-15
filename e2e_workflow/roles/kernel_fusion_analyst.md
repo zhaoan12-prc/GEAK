@@ -66,10 +66,19 @@ python3 "$SKILL_DIR/scripts/fusion_screen.py" \
   --fusion-budget-s "${FUSION_BUDGET_S:-}" --item-minutes "${ITEM_MINUTES:-45}" \
   --passes "${PASSES:-2}" \
   --isl "${WORKLOAD_ISL:-}" --osl "${WORKLOAD_OSL:-}" --conc "${WORKLOAD_CONC:-}" \
+  --spec-accept-length "${SPEC_ACCEPT_LENGTH:-}" \
   --model "${MODEL_NAME:-}" \
   --noise-band-pct "${NOISE_BAND_PCT:-1.0}" \
   --md "$EVAL_DIR/03_FUSION_TOPK.md"
 ```
+
+**Speculative decoding (MTP / EAGLE / DSpark).** The generation forward is TARGET_VERIFY and emits
+the mean accept length (AL) per request, so the generation phase weight is ceil((OSL-1)/AL), not
+OSL-1. Set `SPEC_ACCEPT_LENGTH` to the AL measured on the TRUE baseline server log (SGLang
+`accept len:` decode lines, vLLM `SpecDecoding metrics: Mean acceptance length:`; a synthetic /
+simulated AL from the launch config, e.g. `SGLANG_SIMULATE_ACC_LEN` or
+`synthetic_acceptance_length`, is the exact value). Leave it empty only when the model does not
+speculate; the screen then keeps OSL-1 as an explicit upper bound.
 
 `--model` is optional (the model family is otherwise read from the table's structural context). The measured priors default to the repository copies (`knowledge/fusion/measured_priors.json`, `knowledge/learned/INDEX.md`); `--measured-priors ''` / `--priors-index ''` disable them. `--fusion-budget-s` (KernelFusion budget in seconds) turns on the adaptive K = clamp(floor(budget x 0.7 / item), 8, 16) with `--item-minutes` per apply-back item (default 45); without it K is `--top-k` (default 8). Measured bandwidth / peaks, when known, go in `--hbm-tbps` / `--peak-tflops-bf16` / `--peak-tflops-fp8` (or `GEAK_HBM_TBPS` / `GEAK_PEAK_TFLOPS_BF16` / `GEAK_PEAK_TFLOPS_FP8`); otherwise datasheet values per gfx are used.
 

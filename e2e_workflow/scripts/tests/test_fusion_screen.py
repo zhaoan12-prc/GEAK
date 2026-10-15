@@ -1,5 +1,6 @@
 """Gates in fusion_screen.py."""
 import json
+import math
 import os
 import sys
 import unittest
@@ -43,6 +44,38 @@ def _table(rows, layer_total):
             "rows": rows,
         }]
     }
+
+
+class SpeculativePhaseWeightTest(unittest.TestCase):
+    """Generation-phase weights under speculative decoding (TARGET_VERIFY)."""
+
+    @staticmethod
+    def _rows(generation_phase):
+        return [{"phase": "prefill", "step_input_tokens": 8192},
+                {"phase": generation_phase, "step_batch_size": 4}]
+
+    def test_verify_phase_gets_the_generation_weight(self):
+        weights = screen.phase_weights(self._rows("verify"), {"isl": 8192, "osl": 1024})
+        # never the neutral 1.0: that made verify seams ~1000x too small to pass the gate
+        self.assertEqual(weights["verify"], 1023 / 4)
+        self.assertEqual(weights["prefill"], 1.0)
+
+    def test_accept_length_divides_generation_forwards(self):
+        workload = {"isl": 8192, "osl": 1024, "spec_accept_length": 3.51}
+        self.assertEqual(screen.phase_weights(self._rows("verify"), workload)["verify"],
+                         math.ceil(1023 / 3.51) / 4)
+        # vLLM labels TARGET_VERIFY "decode"; the same accept length applies.
+        self.assertEqual(screen.phase_weights(self._rows("decode"), workload)["decode"],
+                         math.ceil(1023 / 3.51) / 4)
+
+    def test_without_speculation_weights_are_unchanged(self):
+        weights = screen.phase_weights(self._rows("decode"), {"isl": 8192, "osl": 1024})
+        self.assertEqual(weights, {"prefill": 1.0, "decode": 1023 / 4})
+        for bad in ("", None, "x", 0.5):
+            self.assertEqual(
+                screen.phase_weights(self._rows("decode"),
+                                     {"isl": 8192, "osl": 1024, "spec_accept_length": bad}),
+                {"prefill": 1.0, "decode": 1023 / 4})
 
 
 class ScreenTest(unittest.TestCase):
