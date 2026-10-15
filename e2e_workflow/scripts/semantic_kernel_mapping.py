@@ -18,6 +18,8 @@ import sglang_step_modes
 
 
 DEVICE_CATEGORIES = ("kernel", "gpu_memcpy", "gpu_memset")
+# Trace categories a declared `runtime_dispatch_branch` may name (see _dispatch_anchor_scopes).
+DISPATCH_ANCHOR_CATEGORIES = ("cpu_op", "python_function")
 LAYER_RE = re.compile(r"(?:layers?|h|blocks?)[./_\[](\d+)", re.IGNORECASE)
 MODULE_LAYER_RE = re.compile(
     r"^nn\.Module:\s+.*DecoderLayer_(\d+)$", re.IGNORECASE)
@@ -720,6 +722,26 @@ def _module_layer_scopes(events, spans, pattern_doc, draft_windows=()):
     return scopes, diagnostics
 
 
+def _boundary_donor_can_complete(pattern_doc, partition_diagnostics):
+    """True when the only thing missing is layer boundaries.
+
+    The config/runtime Patterns cover every main layer and validated, and every
+    analysed step stayed `boundary_unresolved`: the trace was walked, it simply has
+    no CPU-side per-layer cut. A boundary donor (graph replay off) can supply it.
+    Anything else -- invalid Patterns, a step that partitioned but failed a gate --
+    is a real failure and stays one.
+    """
+    coverage = pattern_doc.get("coverage_check") or {}
+    if not coverage.get("full_coverage"):
+        return False
+    if (pattern_doc.get("quality") or {}).get("status") not in ("pass", "partial"):
+        return False
+    step_diags = [item for item in (partition_diagnostics or [])
+                  if isinstance(item, dict) and item.get("step_id")]
+    return bool(step_diags) and all(
+        item.get("status") == "boundary_unresolved" for item in step_diags)
+
+
 def _declared_dispatch_branches(pattern_doc):
     """{op_name: [pattern_id, ...]} from the AGENT's structural signatures.
 
@@ -792,7 +814,12 @@ def _dispatch_anchor_scopes(events, spans, pattern_doc):
         cpu_spans, span_starts = spans, [span[0] for span in spans]
     by_step = {}
     for event in events:
-        if not isinstance(event, dict) or event.get("cat") != "cpu_op":
+        # A registered custom op (torch.compile splitting op) is a cpu_op. A breakable
+        # CUDA graph breaks at a python callable instead (vLLM
+        # VLLM_USE_BREAKABLE_CUDAGRAPH, e.g. DeepSeek-V4.1's sparse indexer+attention):
+        # its frame is the only per-layer CPU event left in a graph-replayed step, so
+        # the declared branch may name that python frame verbatim.
+        if not isinstance(event, dict) or event.get("cat") not in DISPATCH_ANCHOR_CATEGORIES:
             continue
         name = event.get("name")
         if not isinstance(name, str) or name not in branches:
@@ -2762,7 +2789,17 @@ def build(trace_path, pattern_path, out_dir, table_phases=None,
         # capture before it has authoritative layer boundaries. Preserve any
         # trustworthy phase tables and request completion; never publish the
         # missing phase as if sequence inference had recovered it.
-        quality["status"] = "partial" if tables else "fail"
+        boundary_only = (not tables and _boundary_donor_can_complete(
+            pattern_doc, partition_diagnostics))
+        quality["status"] = "partial" if (tables or boundary_only) else "fail"
+        if boundary_only:
+            # Every phase is graph-replayed end to end (e.g. vLLM breakable CUDA
+            # graphs: prefill AND target verify replay a graph), so no phase has a
+            # CPU-side layer cut yet. The Patterns themselves are valid; this is
+            # exactly the state the Phase-1.2 boundary donor exists for. Calling it
+            # `fail` would gate that donor out and drop the whole fusion track.
+            coverage["requires_boundary_donor"] = list(
+                coverage["missing_required_phases"])
         quality.setdefault("failures", []).append(
             "phase coverage: required phase(s) %s absent from the tables; "
             "traces analysed: %s" % (

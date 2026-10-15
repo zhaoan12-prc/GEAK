@@ -240,8 +240,11 @@ def project(table_path, boundary_map_path, recipient_trace, donor_trace,
     expected_layers = int(pattern_doc.get("num_hidden_layers_main", 0) or 0)
 
     donor_events = semantic_kernel_mapping._load_events(donor_trace)
-    if boundary["donor"].get("scope_source") == "declared_dispatch_op_span":
+    scope_source = boundary["donor"].get("scope_source")
+    if scope_source == "declared_dispatch_op_span":
         markers = transfer._dispatch_scope_markers(donor_events, pattern_doc)
+    elif scope_source == "layer_anchor_span":
+        markers = transfer._layer_anchor_scope_markers(donor_events, pattern_doc)
     else:
         markers = None
     _, donor_passes = transfer._complete_donor_passes(

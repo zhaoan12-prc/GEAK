@@ -167,6 +167,58 @@ def _dispatch_scope_markers(events, pattern_doc):
     return markers
 
 
+def _layer_anchor_scope_markers(events, pattern_doc):
+    """Donor layer scopes from the per-layer anchor frames (DecoderLayer module span
+    or the pattern document's `layer_anchor_regexes`).
+
+    A model that is NOT torch-compiled but replays breakable CUDA graphs in
+    production (vLLM VLLM_USE_BREAKABLE_CUDAGRAPH, e.g. DeepSeek-V4.1) walks every
+    layer's python `forward` once graph replay is off. That frame encloses the whole
+    layer -- including fused whole-layer decode kernels that never pass through the
+    attention dispatch op -- so it is a stronger donor cut than a dispatch op.
+    Only the module-span path is used here (no dispatch fallback), so these markers
+    always mean "a full layer frame was observed".
+    """
+    spans = semantic_kernel_mapping._collect_step_spans(events)
+    by_step = {span[5]: span for span in spans}
+    scopes = _module_scopes_without_fallback(events, spans, pattern_doc)
+    markers = []
+    for index, scope in enumerate(scopes):
+        raw = events[scope["event_index"]] if 0 <= scope.get(
+            "event_index", -1) < len(events) else {}
+        step = by_step.get(scope.get("step_id"))
+        if not isinstance(raw, dict) or step is None:
+            continue
+        markers.append({
+            "event_index": index,
+            "name": scope["name"],
+            "phase": _phase(scope.get("phase")),
+            "batch_size": _integer(step[4]),
+            "input_tokens": _integer(step[3]),
+            "layer_id": scope["layer_id"],
+            "source": "eager",
+            "op_path": scope["name"],
+            "pid": raw.get("pid"),
+            "tid": raw.get("tid"),
+            "ts": float(scope["ts"]),
+            "end": float(scope["end"]),
+            "entries": [],
+        })
+    return markers
+
+
+def _module_scopes_without_fallback(events, spans, pattern_doc):
+    """`_module_layer_scopes` minus its dispatch-op fallback."""
+    doc = dict(pattern_doc)
+    doc["patterns"] = [
+        dict(pattern, structural_signature={
+            key: value for key, value in (pattern.get("structural_signature") or {}).items()
+            if key != "runtime_dispatch_branch"})
+        for pattern in pattern_doc.get("patterns", [])]
+    scopes, _ = semantic_kernel_mapping._module_layer_scopes(events, spans, doc)
+    return [scope for scope in scopes if scope.get("scope_source") != "declared_dispatch_op"]
+
+
 def _attach_device_entries(events, markers):
     """Attach the kernels launched inside each layer scope.
 
@@ -957,10 +1009,17 @@ def transfer(donor_trace, recipient_traces, pattern_path, out_path=""):
         donor_events, expected_layers)
     donor_scope_source = "geak_layer_scope_markers"
     if not markers:
+        # No GEAK_LAYER_SCOPE markers: prefer whole-layer anchor frames, then the
+        # declared dispatch ops (which miss layers that bypass the dispatch op).
         markers, donor_passes = _complete_donor_passes(
             donor_events, expected_layers,
-            _dispatch_scope_markers(donor_events, pattern_doc))
-        donor_scope_source = "declared_dispatch_op_span"
+            _layer_anchor_scope_markers(donor_events, pattern_doc))
+        donor_scope_source = "layer_anchor_span"
+        if not donor_passes:
+            markers, donor_passes = _complete_donor_passes(
+                donor_events, expected_layers,
+                _dispatch_scope_markers(donor_events, pattern_doc))
+            donor_scope_source = "declared_dispatch_op_span"
     recipient_events = semantic_kernel_mapping._load_events_multi(
         recipient_traces)
     rows, spans, _, _, _ = semantic_kernel_mapping._event_rows(
