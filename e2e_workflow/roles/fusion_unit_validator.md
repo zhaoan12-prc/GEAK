@@ -160,6 +160,7 @@ python3 "$SKILL_DIR/scripts/fusion_unitside_harness.py" \
   --topk       "$FUSION_TOPK_JSON" \
   --verdicts   "$EVAL_DIR/verdict" \
   --semantic-table "$SEMANTIC_TABLE_JSON" \
+  --shape-envelope "$SHAPE_ENVELOPE_JSON" \
   --out-md     "$EVAL_DIR/04_FUSION_UNITSIDE.md" \
   --out-json   "$FUSION_DIR/fusion_unitside.json" \
   --equivalent "<id>=<representative_candidate_id>" \
@@ -364,8 +365,22 @@ Read the candidate object for `CANDIDATE_ID` from `FUSION_CANDIDATES_JSON`:
      new inputs with the parity `tol`. This catches host syncs (`.item()`, CPU tensors),
      value-dependent allocation, and python-side state (stashes, caches) that is decided at
      capture and is wrong at replay.
+   - `shape_envelope`: the server does not only run the captured shape. At startup it
+     captures a graph for EVERY capture size, and prefill chunks span the whole chunk
+     budget. Read `SHAPE_ENVELOPE_JSON` (`serving_shape_envelope.py` output:
+     `phases.graph` covers decode/verify, `phases.prefill` covers prefill/extend) and run
+     the patched entry, inside inference_mode, at the `min_tokens` and `max_tokens` of this
+     candidate's phase (add a midpoint if the kernel has a size-dependent path). At each
+     point the overlay must either ENGAGE and match the live chain (`pass`) or DECLINE via
+     its guard and leave the live path's output unchanged (`declined`). A crash, fault or
+     mismatch is `fail` — fix the overlay (usually: add the token-range guard it is
+     missing) instead of reporting it. vLLM DSv4.1 e02, 2026-10-19: passed both checks
+     above at M=24, then faulted while the apply-back server captured the M=1008 graph.
+     Record `{"status": "pass|fail", "points": [{"tokens": N, "result":
+     "pass|declined|fail", "error": ""}]}`. With `SHAPE_ENVELOPE_JSON` set, the harness
+     fails the candidate (`failure_kind=integration`) when either end is missing.
    Record `{"status": "pass|fail|skipped", "error": "<first line on fail / why skipped>"}`
-   per check. `fail` fails THIS candidate only (`failure_kind=integration`, not eligible
+   per check (`shape_envelope` adds `points`). `fail` fails THIS candidate only (`failure_kind=integration`, not eligible
    for apply-back) and never blocks the other candidates; `skipped` (no CUDA graphs on
    this path, collective that cannot be captured standalone, ...) is a warning — say why.
 6. **Write `EVAL_DIR/verdict/<CANDIDATE_ID>.json`** (rank0 only) with EXACTLY:
@@ -378,7 +393,9 @@ Read the candidate object for `CANDIDATE_ID` from `FUSION_CANDIDATES_JSON`:
     "parity_diagnosis": "<REQUIRED iff parity != pass: what you eliminated>",
     "engaged": true, "tp": 8,
     "integration_checks": {"inference_mode": {"status": "pass|fail|skipped", "error": ""},
-                           "graph_replay": {"status": "pass|fail|skipped", "error": ""}},
+                           "graph_replay": {"status": "pass|fail|skipped", "error": ""},
+                           "shape_envelope": {"status": "pass|fail", "points": [
+                             {"tokens": 1, "result": "pass|declined|fail", "error": ""}]}},
     "notes": "how ref+cand were called; how engaged detected"}
    ```
    From this the harness derives **two independent axes** — read them, because they
