@@ -28,8 +28,9 @@ correct measurement of the wrong quantity gets closed as a refutation:
     is no fused execution to judge at this shape.
   * integration — parity passed in eager isolation, but the patched path failed an
     `integration_checks` probe (torch.inference_mode() or CUDA-graph capture/replay)
-    that the serving engine imposes. Fails this candidate only; a missing check is a
-    warning, never a gate failure.
+    that the serving engine imposes, or was not run at the ends of the serving
+    token envelope (`shape_envelope`, --shape-envelope). Fails this candidate only;
+    a missing inference_mode/graph_replay check is a warning, never a gate failure.
 
 `unit_side_status` ∈ {pass, fail, blocked, needs_diagnosis} is DERIVED from the pair
 and kept for the board/apply-back consumers:
@@ -113,13 +114,17 @@ Usage:
       --verdicts <dir-of-*.json | combined.json> \
       --out-md FUSION_UNITSIDE.md --out-json fusion_unitside.json \
       [--min-speedup 1.0] [--allow-partial-coverage] \
-      [--waive <candidate_id>=<reason> ...]
+      [--waive <candidate_id>=<reason> ...] \
+      [--shape-envelope serving_shape_envelope.json]
 """
 import argparse
 import glob
 import json
 import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import serving_shape_envelope as sse  # noqa: E402
 
 
 REQUIRED_VERDICT_FIELDS = (
@@ -440,6 +445,62 @@ def _integration_check_state(verdict):
     return failed, missing
 
 
+# shape_envelope -- the steady-state shape is not the only one the server feeds the
+# patched seam. At startup it captures a graph per capture size, and prefill chunks span
+# the chunk budget. vLLM DSv4.1 e02 (2026-10-19) passed both checks above at M=24, then
+# wrote out of bounds while the apply-back server captured the M=1008 graph. So the
+# patched entry must also be run at the ends of the serving envelope
+# (serving_shape_envelope.py), where each point either engages with parity ("pass") or
+# is declined by the overlay's guard and matches the live path ("declined").
+SHAPE_ENVELOPE_CHECK = "shape_envelope"
+SHAPE_POINT_OK = ("pass", "declined")
+
+
+def _shape_envelope_state(verdict, phase, envelope):
+    """(failed descriptions, warning or None) for the shape_envelope check.
+
+    With an envelope that pins this phase's range, an endpoint that was not run fails
+    the candidate (it is untested where the server will run it). Without one, only
+    failed points fail; an envelope that leaves this phase unpinned is a warning.
+    """
+    checks = verdict.get(INTEGRATION_FIELD)
+    entry = checks.get(SHAPE_ENVELOPE_CHECK) if isinstance(checks, dict) else None
+    entry = entry if isinstance(entry, dict) else {}
+    points = [p for p in (entry.get("points") or []) if isinstance(p, dict)]
+    failed, ok = [], set()
+    for p in points:
+        try:
+            tokens = int(p.get("tokens"))
+        except (TypeError, ValueError):
+            continue
+        result = str(p.get("result") or "").strip().lower()
+        if result in SHAPE_POINT_OK:
+            ok.add(tokens)
+        else:
+            failed.append("M=%d %s%s" % (tokens, result or "no result",
+                                         (": %s" % p["error"]) if p.get("error") else ""))
+    if str(entry.get("status") or "").strip().lower() == "fail" and not failed:
+        failed.append(entry.get("error") or "status fail")
+    failures = (["shape_envelope check failed at %s" % "; ".join(failed)]
+                if failed else [])
+    required = sse.required_points(envelope, phase)
+    if required is None:
+        warning = None if (entry or not envelope) else (
+            "shape_envelope: the serving envelope does not pin phase %r, so the "
+            "patched seam is proven only at tested_shape" % phase)
+        return failures, warning
+    untested = [n for n in required if n not in ok
+                and not any(f.startswith("M=%d " % n) for f in failed)]
+    if untested:
+        rng = envelope["phases"][sse.phase_class(phase)]
+        failures.append(
+            "patched entry not run at serving token counts %s (phase %s serves %d..%d, "
+            "%s); the server captures/chunks those shapes, so the overlay must engage "
+            "with parity or decline there" % (untested, phase, rng["min_tokens"],
+                                              rng["max_tokens"], rng.get("source")))
+    return failures, None
+
+
 def _row(cid, candidate, status, reason, **extra):
     """One result row with a uniform schema, so coverage rows (which have no
     measurement) render alongside verdict rows without KeyErrors."""
@@ -520,8 +581,10 @@ def validate(candidates_path, verdicts_path, min_speedup=1.0,
              phase_waivers=None, require_phase_generalization=True,
              allow_shapeless_candidate="", topk_path=None,
              subsumed=None, equivalent=None, budget_skipped=None,
-             semantic_table_path=None):
+             semantic_table_path=None, shape_envelope=None):
     payload = _load(candidates_path)
+    if isinstance(shape_envelope, str):
+        shape_envelope = _load(shape_envelope) if shape_envelope else None
     rows_by_id = load_semantic_rows(semantic_table_path)
     candidate_list = [normalize_screen_candidate(c, rows_by_id)
                       for c in payload.get("candidates", [])]
@@ -741,6 +804,11 @@ def validate(candidates_path, verdicts_path, min_speedup=1.0,
                 "graphs; an overlay that breaks there passes 单侧 and then crashes the "
                 "apply-back server (vLLM e01 `tensor._version`, 2026-10-15)."
                 % (vp, "/".join(integration_missing)))
+        envelope_failures, envelope_warning = _shape_envelope_state(
+            verdict, candidate.get("phase"), shape_envelope)
+        integration_failures = integration_failures + envelope_failures
+        if envelope_warning:
+            warnings.append("%s %s" % (vp, envelope_warning))
         is_collective = family.startswith("collective")
         engaged = verdict.get("engaged")
         status, reason = "pass", ""
@@ -1293,7 +1361,7 @@ def run(candidates_path, verdicts_path, out_md, out_json, min_speedup=1.0,
         phase_waivers=None, require_phase_generalization=True,
         allow_shapeless_candidate="", topk_path=None,
         subsumed=None, equivalent=None, budget_skipped=None,
-        semantic_table_path=None):
+        semantic_table_path=None, shape_envelope_path=None):
     result = validate(candidates_path, verdicts_path, min_speedup,
                       require_coverage=require_coverage, waivers=waivers,
                       legacy_schema_ok=legacy_schema_ok,
@@ -1303,7 +1371,10 @@ def run(candidates_path, verdicts_path, out_md, out_json, min_speedup=1.0,
                       topk_path=topk_path, subsumed=subsumed,
                       equivalent=equivalent,
                       budget_skipped=budget_skipped,
-                      semantic_table_path=semantic_table_path)
+                      semantic_table_path=semantic_table_path,
+                      shape_envelope=shape_envelope_path)
+    if shape_envelope_path:
+        result["shape_envelope"] = _load(shape_envelope_path)
     os.makedirs(os.path.dirname(os.path.abspath(out_json)), exist_ok=True)
     with open(out_json, "w") as fh:
         json.dump(result, fh, indent=2, ensure_ascii=False)
@@ -1368,6 +1439,10 @@ def main():
                              "check. Requires a REASON. This re-opens the exact "
                              "hole that cost 08-31 two fusions worth +20.6%% and "
                              "+14.0%% e2e — fix the semantic capture instead")
+    parser.add_argument("--shape-envelope", default=None,
+                        help="serving_shape_envelope.py output; every candidate must "
+                             "run its patched entry at the ends of its phase's "
+                             "serving token range (integration_checks.shape_envelope)")
     args = parser.parse_args()
     if args.allow_shapeless_candidate and not args.allow_shapeless_candidate.strip():
         raise SystemExit("--allow-shapeless-candidate requires a non-empty reason")
@@ -1384,7 +1459,8 @@ def main():
                  equivalent=_parse_waivers(args.equivalent, "--equivalent"),
                  budget_skipped=_parse_waivers(
                      args.budget_skipped, "--budget-skipped"),
-                 semantic_table_path=args.semantic_table)
+                 semantic_table_path=args.semantic_table,
+                 shape_envelope_path=args.shape_envelope)
     cov = result.get("coverage") or {}
     pg = result.get("phase_generalization") or {}
     print(json.dumps({"status": result["status"], "counts": result["counts"],

@@ -223,6 +223,80 @@ class IntegrationCheckTest(_UnitsideFixture, unittest.TestCase):
         self.assertEqual(self._result(res)["failure_kind"], "functional")
 
 
+class ShapeEnvelopeTest(_UnitsideFixture, unittest.TestCase):
+    """The patched seam must be run at the ends of the serving token envelope, not only
+    at the captured steady-state shape (vLLM DSv4.1 e02, 2026-10-19: unit-tested at M=24,
+    faulted while the server captured the M=1008 graph)."""
+
+    ENV = {"backend": "vllm", "phases": {
+        "graph": {"min_tokens": 1, "max_tokens": 1024,
+                  "source": "max-cudagraph-capture-size"}}, "notes": []}
+    BASE = {"inference_mode": {"status": "pass"}, "graph_replay": {"status": "pass"}}
+
+    def _checks(self, points):
+        return dict(self.BASE, shape_envelope={"status": "pass", "points": points})
+
+    def _row(self, res, cid="dc_ar"):
+        return [r for r in res["results"] if r["candidate_id"] == cid][0]
+
+    def test_both_ends_engaged_or_declined_keep_the_pass(self):
+        pts = [{"tokens": 1, "result": "declined"}, {"tokens": 1024, "result": "pass"}]
+        res = self._run(self._candidates(),
+                        [self._verdict(integration_checks=self._checks(pts))],
+                        shape_envelope=self.ENV)
+        self.assertEqual(self._status(res, "dc_ar"), "pass")
+
+    def test_untested_max_fails_only_that_candidate(self):
+        nq = self._verdict(candidate_id="dc_nq", family="norm_quant",
+                           fused_fn="aiter add_rmsnorm_quant", tested_shape=[4, 7168],
+                           ref_ops=["rms_norm"], integration_checks=self._checks(
+                               [{"tokens": 1, "result": "pass"},
+                                {"tokens": 1024, "result": "declined"}]))
+        res = self._run(self._candidates(),
+                        [self._verdict(integration_checks=self.BASE), nq],
+                        shape_envelope=self.ENV)
+        row = self._row(res)
+        self.assertEqual(row["unit_side_status"], "fail")
+        self.assertEqual(row["failure_kind"], "integration")
+        self.assertIn("[1, 1024]", row["reason"])
+        self.assertEqual(self._status(res, "dc_nq"), "pass")
+        self.assertEqual(res["status"], "pass")
+
+    def test_a_crashing_point_fails_even_without_an_envelope(self):
+        pts = [{"tokens": 1008, "result": "fail",
+                "error": "HSA_STATUS_ERROR_MEMORY_FAULT"}]
+        res = self._run(self._candidates(),
+                        [self._verdict(integration_checks=self._checks(pts))])
+        row = self._row(res)
+        self.assertEqual(row["failure_kind"], "integration")
+        self.assertIn("M=1008", row["reason"])
+        self.assertIn("MEMORY_FAULT", row["reason"])
+
+    def test_no_envelope_keeps_old_verdicts_passing_silently(self):
+        res = self._run(self._candidates(),
+                        [self._verdict(integration_checks=self.BASE)])
+        self.assertEqual(self._status(res, "dc_ar"), "pass")
+        self.assertFalse(any("shape_envelope" in w for w in res["warnings"]))
+
+    def test_an_unpinned_phase_only_warns(self):
+        env = {"backend": "vllm", "phases": {"prefill": {
+            "min_tokens": 1, "max_tokens": 16384}}, "notes": []}
+        res = self._run(self._candidates(),
+                        [self._verdict(integration_checks=self.BASE)], shape_envelope=env)
+        self.assertEqual(self._status(res, "dc_ar"), "pass")
+        self.assertTrue(any("shape_envelope" in w for w in res["warnings"]))
+
+    def test_the_cli_reads_the_envelope_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            epath = os.path.join(tmp, "env.json")
+            with open(epath, "w") as fh:
+                json.dump(self.ENV, fh)
+            res = self._run(self._candidates(),
+                            [self._verdict(integration_checks=self.BASE)],
+                            shape_envelope=epath)
+        self.assertEqual(self._row(res)["failure_kind"], "integration")
+
+
 class RefScopeTest(_UnitsideFixture, unittest.TestCase):
     """ref_ops must cover every removable member, judged per member: a member is covered
     when either its parent_operator or its kernel name appears in ref_ops."""
