@@ -348,6 +348,26 @@ Read the candidate object for `CANDIDATE_ID` from `FUSION_CANDIDATES_JSON`:
 5. **Timing**: `ref_ms = time_op(ref_call)` and `cand_ms = time_op(cand_call)` (device
    time, cache-flush on — the harness_lib defaults). `isolated_speedup = ref_ms/cand_ms`.
    For a distributed microbench, time on every rank and report rank0's medians.
+5b. **Integration checks** (self_authored candidates; also existing ones whose apply-back
+   needs an overlay). Parity and timing prove the kernel in eager isolation; the serving
+   engine does not run it that way. Run the candidate through the SAME entry the overlay
+   patches (the rebound function / method with the overlay loaded, not the bare kernel)
+   and record each result:
+   - `inference_mode`: rerun the parity call inside `with torch.inference_mode():`.
+     Inference tensors have no version counter or autograd state, so an overlay that reads
+     `tensor._version`, `requires_grad`, or writes in place to an inference tensor fails
+     here (vLLM DSv4.1 e01, 2026-10-15: passed 单侧, then crashed the apply-back server
+     during CUDA-graph memory profiling).
+   - `graph_replay`: inside inference_mode, warm the call up, capture it with
+     `torch.cuda.graph(g)` into static input/output buffers, copy a DIFFERENT set of
+     inputs into the static inputs, `g.replay()`, and compare against an eager call on the
+     new inputs with the parity `tol`. This catches host syncs (`.item()`, CPU tensors),
+     value-dependent allocation, and python-side state (stashes, caches) that is decided at
+     capture and is wrong at replay.
+   Record `{"status": "pass|fail|skipped", "error": "<first line on fail / why skipped>"}`
+   per check. `fail` fails THIS candidate only (`failure_kind=integration`, not eligible
+   for apply-back) and never blocks the other candidates; `skipped` (no CUDA graphs on
+   this path, collective that cannot be captured standalone, ...) is a warning — say why.
 6. **Write `EVAL_DIR/verdict/<CANDIDATE_ID>.json`** (rank0 only) with EXACTLY:
    ```json
    {"candidate_id": "...", "family": "...", "fused_fn": "<existing_apis[].name>",
@@ -356,7 +376,10 @@ Read the candidate object for `CANDIDATE_ID` from `FUSION_CANDIDATES_JSON`:
     "parity": "pass|fail", "ref_ms": 0.0, "cand_ms": 0.0, "isolated_speedup": 0.0,
     "ref_ops": ["<every op the ref leg ran>"], "outside_work_removed": [],
     "parity_diagnosis": "<REQUIRED iff parity != pass: what you eliminated>",
-    "engaged": true, "tp": 8, "notes": "how ref+cand were called; how engaged detected"}
+    "engaged": true, "tp": 8,
+    "integration_checks": {"inference_mode": {"status": "pass|fail|skipped", "error": ""},
+                           "graph_replay": {"status": "pass|fail|skipped", "error": ""}},
+    "notes": "how ref+cand were called; how engaged detected"}
    ```
    From this the harness derives **two independent axes** — read them, because they
    are what the board and the apply-back gate now consume:
@@ -365,7 +388,7 @@ Read the candidate object for `CANDIDATE_ID` from `FUSION_CANDIDATES_JSON`:
    |---|---|---|
    | `correctness_status` | 它算对了吗 | `pass` / `fail` / `not_engaged` |
    | `perf_status` | 它更快吗 | `win` / `no_win` / `undefined` |
-   | `failure_kind` | **失败是哪一种** | `none` / `performance` / `functional` / `unmeasured` / `not_engaged` |
+   | `failure_kind` | **失败是哪一种** | `none` / `performance` / `functional` / `unmeasured` / `not_engaged` / `integration` |
 
    `perf_status` is `undefined` — and `isolated_speedup` is **nulled** — whenever
    `correctness_status != pass`. That is not bookkeeping: a mis-fed kernel takes a
