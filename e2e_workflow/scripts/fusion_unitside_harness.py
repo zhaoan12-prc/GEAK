@@ -17,7 +17,7 @@ correct measurement of the wrong quantity gets closed as a refutation:
     branch and a wrong tile config, so its `cand_ms` timed something that was never
     the candidate. "parity failed AND it was slow" is ONE fault counted twice.
 
-  failure_kind ∈ {none, performance, functional, unmeasured, not_engaged} — and this
+  failure_kind ∈ {none, performance, functional, unmeasured, not_engaged, integration} — and this
   is the field a human should read first, because it names WHICH KIND of failure:
   * performance — 功能失败? no. It computed the right answer and simply is not
     faster. This is the only verdict that may be closed on the spot.
@@ -26,6 +26,10 @@ correct measurement of the wrong quantity gets closed as a refutation:
   * unmeasured  — it diverged and nobody looked. NOT a result. The gate fails.
   * not_engaged — a collective whose size guard fell back to the split path; there
     is no fused execution to judge at this shape.
+  * integration — parity passed in eager isolation, but the patched path failed an
+    `integration_checks` probe (torch.inference_mode() or CUDA-graph capture/replay)
+    that the serving engine imposes. Fails this candidate only; a missing check is a
+    warning, never a gate failure.
 
 `unit_side_status` ∈ {pass, fail, blocked, needs_diagnosis} is DERIVED from the pair
 and kept for the board/apply-back consumers:
@@ -404,6 +408,38 @@ def _op_covered(needle, haystack):
     return False
 
 
+INTEGRATION_FIELD = "integration_checks"
+# Each check runs the candidate through its PATCHED entry point (the overlay, not the
+# bare kernel) under a condition the serving engine imposes and eager parity does not:
+#   inference_mode -- the model forward runs under torch.inference_mode(); inference
+#                     tensors have no version counter / autograd state.
+#   graph_replay   -- capture with torch.cuda.graph() after warmup, copy NEW inputs into
+#                     the static buffers, replay, compare against eager.
+INTEGRATION_CHECKS = ("inference_mode", "graph_replay")
+
+
+def _integration_check_state(verdict):
+    """(failed descriptions, missing check names) for a verdict's integration_checks.
+
+    A failed check fails that candidate only. A missing / skipped check is a warning:
+    older verdicts and backends where a check cannot run must not block the gate.
+    """
+    checks = verdict.get(INTEGRATION_FIELD)
+    if not isinstance(checks, dict):
+        return [], list(INTEGRATION_CHECKS)
+    failed, missing = [], []
+    for name in INTEGRATION_CHECKS:
+        entry = checks.get(name)
+        status = (entry.get("status") if isinstance(entry, dict) else entry)
+        status = str(status or "").strip().lower()
+        if status == "fail":
+            detail = entry.get("error") if isinstance(entry, dict) else ""
+            failed.append("%s check failed%s" % (name, (": %s" % detail) if detail else ""))
+        elif status != "pass":
+            missing.append(name)
+    return failed, missing
+
+
 def _row(cid, candidate, status, reason, **extra):
     """One result row with a uniform schema, so coverage rows (which have no
     measurement) render alongside verdict rows without KeyErrors."""
@@ -697,6 +733,14 @@ def validate(candidates_path, verdicts_path, min_speedup=1.0,
             errors.append("%s isolated_speedup is not a number" % vp)
             continue
         parity = str(verdict.get("parity")).lower()
+        integration_failures, integration_missing = _integration_check_state(verdict)
+        if integration_missing:
+            warnings.append(
+                "%s integration_checks %s not run: parity was only proven in eager mode. "
+                "The serving engine runs under torch.inference_mode() and captures CUDA "
+                "graphs; an overlay that breaks there passes 单侧 and then crashes the "
+                "apply-back server (vLLM e01 `tensor._version`, 2026-10-15)."
+                % (vp, "/".join(integration_missing)))
         is_collective = family.startswith("collective")
         engaged = verdict.get("engaged")
         status, reason = "pass", ""
@@ -740,6 +784,16 @@ def validate(candidates_path, verdicts_path, min_speedup=1.0,
                     "group_size, fnuz-vs-fn fp8, two independent fp8 quantizations, "
                     "wrong q_out_dtype). fusion_unit_validator.md:137 requires this; "
                     "it is now enforced." % (vp, DIAGNOSIS_FIELD))
+        elif integration_failures:
+            # Correct and fast in eager isolation, but it cannot run where the server
+            # runs it. The pass would only crash (or silently misbehave in) the
+            # combined apply-back server and take every stacked fusion down with it.
+            status = "fail"
+            correctness, perf, failure_kind = "pass", "undefined", "integration"
+            reason = ("INTEGRATION failure: parity pass in eager isolation, but %s. "
+                      "The serving engine runs this path under that condition; do not "
+                      "apply back until the overlay passes it."
+                      % "; ".join(integration_failures))
         elif speedup <= min_speedup:
             status = "fail"
             # 功能正确，纯性能不划算 — the one failure that is safe to close on the spot.

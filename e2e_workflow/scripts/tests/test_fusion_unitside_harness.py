@@ -172,6 +172,57 @@ class FusionUnitsideTest(_UnitsideFixture, unittest.TestCase):
         self.assertIn("dc_nq", md)
 
 
+class IntegrationCheckTest(_UnitsideFixture, unittest.TestCase):
+    """I10: eager parity is not enough; the server runs under inference_mode + graphs."""
+
+    PASSED = {"inference_mode": {"status": "pass"}, "graph_replay": {"status": "pass"}}
+
+    def _result(self, res, cid="dc_ar"):
+        return [r for r in res["results"] if r["candidate_id"] == cid][0]
+
+    def test_both_checks_pass_keeps_the_pass(self):
+        res = self._run(self._candidates(),
+                        [self._verdict(integration_checks=self.PASSED)])
+        self.assertEqual(self._status(res, "dc_ar"), "pass")
+        self.assertFalse(any("integration_checks" in w for w in res["warnings"]))
+
+    def test_a_failed_check_fails_only_that_candidate(self):
+        checks = {"inference_mode": {"status": "fail", "error":
+                                     "Inference tensors do not track version counter."},
+                  "graph_replay": {"status": "pass"}}
+        nq = self._verdict(candidate_id="dc_nq", family="norm_quant",
+                           fused_fn="aiter add_rmsnorm_quant", tested_shape=[4, 7168],
+                           engaged=True, ref_ops=["rms_norm"],
+                           integration_checks=self.PASSED)
+        res = self._run(self._candidates(),
+                        [self._verdict(integration_checks=checks), nq])
+        row = self._result(res)
+        self.assertEqual(row["unit_side_status"], "fail")
+        self.assertEqual(row["failure_kind"], "integration")
+        self.assertIn("version counter", row["reason"])
+        # never blocks the gate or the other candidate
+        self.assertEqual(res["status"], "pass")
+        self.assertEqual(self._status(res, "dc_nq"), "pass")
+
+    def test_missing_or_skipped_checks_only_warn(self):
+        for checks in (None, {"inference_mode": {"status": "skipped"},
+                              "graph_replay": "pass"}):
+            verdict = self._verdict()
+            if checks is not None:
+                verdict["integration_checks"] = checks
+            res = self._run(self._candidates(), [verdict])
+            self.assertEqual(self._status(res, "dc_ar"), "pass")
+            self.assertEqual(res["status"], "pass")
+            self.assertTrue(any("integration_checks" in w for w in res["warnings"]))
+
+    def test_parity_failure_still_wins_over_integration(self):
+        checks = {"inference_mode": {"status": "fail"}, "graph_replay": {"status": "fail"}}
+        res = self._run(self._candidates(),
+                        [self._verdict(parity="fail", integration_checks=checks,
+                                       parity_diagnosis="eliminated layout/scales")])
+        self.assertEqual(self._result(res)["failure_kind"], "functional")
+
+
 class RefScopeTest(_UnitsideFixture, unittest.TestCase):
     """ref_ops must cover every removable member, judged per member: a member is covered
     when either its parent_operator or its kernel name appears in ref_ops."""
