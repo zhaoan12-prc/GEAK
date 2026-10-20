@@ -23,12 +23,15 @@ STEP_RE = re.compile(
 # generates with TARGET_VERIFY (bs requests x draft tokens), phase "verify".
 TARGET_PREFILL_MODES = ("EXTEND", "MIXED", "SPLIT_PREFILL")
 TARGET_DECODE_MODES = ("DECODE",)
-TARGET_VERIFY_MODES = ("TARGET_VERIFY",)
+# Newer SGLang builds (build_step_span_name) label the target-verify step
+# "VERIFY" and every draft-worker step "DRAFT" (e.g. the DSPARK speculative
+# algorithm emits step[VERIFY bs=N] / step[DRAFT bs=N]).
+TARGET_VERIFY_MODES = ("TARGET_VERIFY", "VERIFY")
 # Draft-model steps run the speculative draft stack (MTP/NEXTN/EAGLE head),
 # not the main decoder layers.  They are recognised so they can be excluded
 # from main-layer tables and reported, never mapped onto main layers.
-DRAFT_MODES = ("DRAFT_EXTEND", "DRAFT_EXTEND_V2")
-SPECULATIVE_MODES = ("TARGET_VERIFY",) + DRAFT_MODES
+DRAFT_MODES = ("DRAFT_EXTEND", "DRAFT_EXTEND_V2", "DRAFT")
+SPECULATIVE_MODES = TARGET_VERIFY_MODES + DRAFT_MODES
 
 PHASE_BY_MODE = dict(
     [(mode, "prefill") for mode in TARGET_PREFILL_MODES]
@@ -90,5 +93,6 @@ def canonical_phase(value):
     lower = value.lower()
     return {"extend": "prefill", "prompt": "prefill",
             "generation": "decode", "target_verify": "verify",
-            "draft_extend": "draft", "draft_extend_v2": "draft"}.get(
+            "draft_extend": "draft", "draft_extend_v2": "draft",
+            "verify": "verify", "draft": "draft"}.get(
                 lower, lower)

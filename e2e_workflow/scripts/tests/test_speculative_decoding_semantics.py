@@ -89,6 +89,18 @@ class StepModeParsingTest(unittest.TestCase):
         self.assertIsNone(sglang_step_modes.parse_step("step[IDLE bs=0]"))
         self.assertIsNone(sglang_step_modes.parse_step("execute_context_1"))
 
+    def test_newer_sglang_verify_and_draft_step_names(self):
+        # DSPARK on newer SGLang (build_step_span_name) emits step[VERIFY ...]
+        # for the target and step[DRAFT ...] for every draft-worker step.
+        verify = sglang_step_modes.parse_step("step[VERIFY bs=4]")
+        self.assertEqual((verify["mode"], verify["phase"], verify["batch_size"]),
+                         ("VERIFY", "verify", 4))
+        self.assertTrue(verify["speculative"])
+        draft = sglang_step_modes.parse_step("step[DRAFT bs=4]")
+        self.assertEqual(draft["phase"], "draft")
+        self.assertEqual(sglang_step_modes.canonical_phase("VERIFY"), "verify")
+        self.assertEqual(sglang_step_modes.canonical_phase("DRAFT"), "draft")
+
     def test_phase_aliases_accept_target_verify(self):
         self.assertEqual(sglang_step_modes.canonical_phase("TARGET_VERIFY"),
                          "verify")
