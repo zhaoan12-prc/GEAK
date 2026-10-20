@@ -200,9 +200,14 @@ class TestBucketAccountingUnderAWarmupDriver(unittest.TestCase):
 class _ScopeLogger(object):
     def __init__(self):
         self.scopes = []
+        self.active = []
 
     def layer_scope(self, layer_id, op_path):
         self.scopes.append((layer_id, op_path))
+        return contextlib.nullcontext()
+
+    def layer_active(self, layer_id, op_path):
+        self.active.append((layer_id, op_path))
         return contextlib.nullcontext()
 
 
@@ -215,7 +220,7 @@ class _Model(object):
     def __init__(self):
         self.layer0, self.layer1, self.mlp = _Layer(), _Layer(), object()
 
-    def named_modules(self):
+    def named_modules(self, remove_duplicate=True):
         return [("", self), ("model.layers.0", self.layer0),
                 ("model.layers.1", self.layer1),
                 ("model.layers.0.mlp", self.mlp)]
@@ -247,6 +252,7 @@ class LayerEntryCallablesTest(unittest.TestCase):
         self.assertEqual(wrapped, 2)
         self.assertEqual(model.layer1.forward_entry(1), 2)
         self.assertEqual(logger.scopes, [(1, "model.layers.1")])
+        self.assertEqual(logger.active, [(1, "model.layers.1")])
 
     def test_configured_function_is_replaced_in_its_calling_module(self):
         module = types.SimpleNamespace(run_layer=lambda layer, value: value * 2)
@@ -301,3 +307,127 @@ class LayerEntryCallablesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _BackRefModel(object):
+    """A model whose layer i keeps a registered link to layer i+1 (DSv4.1's
+    `_next_layer`): named_modules() reaches layer 1 through layer 0 first."""
+
+    def __init__(self):
+        self.layer0, self.layer1 = _Layer(), _Layer()
+
+    def named_modules(self, remove_duplicate=True):
+        rows = [("", self), ("model.layers.0", self.layer0),
+                ("model.layers.0._next_layer", self.layer1),
+                ("model.layers.1", self.layer1)]
+        if not remove_duplicate:
+            return rows
+        seen, out = set(), []
+        for path, module in rows:
+            if id(module) not in seen:
+                seen.add(id(module))
+                out.append((path, module))
+        return out
+
+
+class CanonicalModulePathTest(unittest.TestCase):
+    def test_a_back_reference_does_not_hide_the_main_layer_path(self):
+        paths = [path for path, _ in
+                 capture._canonical_named_modules(_BackRefModel())]
+        self.assertEqual(paths, ["", "model.layers.0", "model.layers.1"])
+
+    def test_entry_wrapping_marks_the_layer_under_its_own_index(self):
+        model, logger = _BackRefModel(), _ScopeLogger()
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith("GEAK_SEMANTICS_LAYER_ENTRY_")}
+        env["GEAK_SEMANTICS_LAYER_ENTRY_METHODS"] = "forward_entry"
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(
+                capture._wrap_layer_entry_functions(model, logger), 2)
+        model.layer1.forward_entry(1)
+        self.assertEqual(logger.scopes, [(1, "model.layers.1")])
+
+
+class LayerActiveTest(unittest.TestCase):
+    def _logger(self):
+        logger = capture.SemanticRuntimeLogger.__new__(
+            capture.SemanticRuntimeLogger)
+        logger._stacks = capture.threading.local()
+        return logger
+
+    def test_layer_body_is_the_launcher_parent_while_it_runs(self):
+        logger = self._logger()
+        with logger.layer_active(7, "model.layers.7"):
+            parent = logger._active_modules()[-1]
+            self.assertEqual((parent["layer_id"], parent["op_path"]),
+                             (7, "model.layers.7"))
+        self.assertEqual(logger._active_modules(), [])
+
+    def test_out_of_order_exit_removes_only_its_own_entry(self):
+        logger = self._logger()
+        inner = {"layer_id": 7, "op_path": "model.layers.7.mlp"}
+        with logger.layer_active(7, "model.layers.7"):
+            logger._active_modules().append(inner)
+        self.assertEqual(logger._active_modules(), [inner])
+
+
+class DraftGraphRunnerTest(unittest.TestCase):
+    """DSPARK draft workers capture with the base decode graph runner class, so
+    the runner instance -- not the class -- decides whether it exports."""
+
+    def _install(self, tmp):
+        class _Runner(object):
+            def __init__(self, draft):
+                self.model_runner = types.SimpleNamespace(is_draft_worker=draft)
+
+        class _Prof(object):
+            def __init__(self, **kwargs):
+                self.exported = []
+
+            def export_chrome_trace(self, path):
+                self.exported.append(path)
+
+        activity = types.SimpleNamespace(CPU="cpu", CUDA="cuda")
+        fake_torch = types.ModuleType("torch")
+        fake_torch.profiler = types.SimpleNamespace(
+            ProfilerActivity=activity, profile=_Prof)
+        runner_mod = types.SimpleNamespace(CudaGraphRunner=_Runner)
+        modules = {
+            "torch": fake_torch, "torch.profiler": fake_torch.profiler,
+            "sglang": types.ModuleType("sglang"),
+            "sglang.srt": types.ModuleType("sglang.srt"),
+            "sglang.srt.model_executor": types.ModuleType(
+                "sglang.srt.model_executor"),
+            "sglang.srt.model_executor.cuda_graph_runner": runner_mod,
+        }
+        env = {"GEAK_SEMANTICS_GRAPH_CAPTURE_TRACE": os.path.join(tmp, "g.json"),
+               "GEAK_SEMANTICS_RANK": "0"}
+        with mock.patch.dict(sys.modules, modules), \
+                mock.patch.dict(os.environ, env), \
+                mock.patch.object(capture, "_GRAPH_CAPTURE_PROFILER_INSTALLED",
+                                  False), \
+                mock.patch.object(capture, "_install_draft_graph_profiler_noop"):
+            capture.install_graph_capture_profiler()
+        return _Runner, _Prof
+
+    def test_only_the_target_runner_exports_its_capture_trace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner_cls, prof_cls = self._install(tmp)
+            target, draft = runner_cls(False), runner_cls(True)
+            self.assertIsInstance(
+                runner_cls._init_profile_context_and_memory_record(target),
+                prof_cls)
+            self.assertIsNone(
+                runner_cls._init_profile_context_and_memory_record(
+                    draft).__enter__())
+            prof = prof_cls()
+            runner_cls._post_process_after_profile(draft, prof)
+            self.assertEqual(prof.exported, [])
+            with mock.patch.object(capture, "_graph_capture_trace_path",
+                                   return_value=os.path.join(tmp, "g.json")):
+                runner_cls._post_process_after_profile(target, prof)
+            self.assertEqual(prof.exported, [os.path.join(tmp, "g.json")])
+
+    def test_a_runner_without_a_model_runner_is_the_target(self):
+        self.assertFalse(capture._is_draft_graph_runner(object()))
+

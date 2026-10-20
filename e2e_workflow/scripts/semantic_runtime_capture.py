@@ -276,6 +276,18 @@ def _install_draft_graph_profiler_noop():
             % class_name)
 
 
+def _is_draft_graph_runner(runner):
+    """True for a graph runner that belongs to a speculative draft worker.
+
+    DSPARK/DFLASH draft workers capture with the base decode graph runner class
+    itself (not a draft subclass the no-op above can patch), so their export
+    would overwrite the target model's graph-capture trace (same rank, same
+    path).
+    """
+    return bool(getattr(getattr(runner, "model_runner", None),
+                        "is_draft_worker", False))
+
+
 def install_graph_capture_profiler():
     """Export a rank-0 trace of CUDA/HIP graph construction.
 
@@ -303,8 +315,8 @@ def install_graph_capture_profiler():
                 import DecodeCudaGraphRunner as CudaGraphRunner
 
         def _init_profile_context_and_memory_record(self):
-            if _distributed_rank() != int(os.environ.get(
-                    "GEAK_SEMANTICS_RANK", "0")):
+            if _is_draft_graph_runner(self) or _distributed_rank() != int(
+                    os.environ.get("GEAK_SEMANTICS_RANK", "0")):
                 return contextlib.nullcontext(None)
             return profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -314,6 +326,8 @@ def install_graph_capture_profiler():
 
         def _post_process_after_profile(self, prof_context):
             rank = _distributed_rank()
+            if _is_draft_graph_runner(self):
+                return
             if prof_context is None or rank != int(os.environ.get(
                     "GEAK_SEMANTICS_RANK", "0")):
                 return
@@ -578,6 +592,24 @@ class SemanticRuntimeLogger(object):
             return contextlib.nullcontext()
         return self._tracked_layer_scope(scope, layer_id, open_layers)
 
+    @contextlib.contextmanager
+    def layer_active(self, layer_id, op_path):
+        """Make the main-layer body the active parent for targeted launcher
+        probes. A layer body that is entered through a plain function (not a
+        hooked module call) otherwise leaves launchers called directly from
+        it without a parent, so begin_callable records nothing."""
+        entry = {"layer_id": layer_id, "op_path": op_path,
+                 "kind": "layer_entry"}
+        active = self._active_modules()
+        active.append(entry)
+        try:
+            yield
+        finally:
+            if active and active[-1] is entry:
+                active.pop()
+            elif entry in active:
+                active.remove(entry)
+
     def _open_layer_scopes(self):
         """Layer ids whose scope is open on this thread."""
         layers = getattr(self._scope_state, "layers", None)
@@ -830,13 +862,35 @@ def _install_callable_probes():
             "[GEAK_SEMANTICS] targeted launcher wrapped %s\n" % target)
 
 
+def _canonical_named_modules(model):
+    """(path, module) once per module, under its shortest path.
+
+    ``named_modules()`` reports each module under the FIRST path it reaches.
+    A model that keeps a registered back-reference to another layer (e.g. a
+    ``_next_layer`` link from layer i to layer i+1) then reports layer i+1 as
+    ``layers.i._next_layer`` and the ``layers.<n>`` main-layer path is lost.
+    Choose the path with the fewest segments instead (first one on ties).
+    """
+    best = {}
+    order = []
+    for raw_path, module in model.named_modules(remove_duplicate=False):
+        key = id(module)
+        depth = raw_path.count(".") + (1 if raw_path else 0)
+        if key not in best:
+            order.append(key)
+            best[key] = (depth, raw_path, module)
+        elif depth < best[key][0]:
+            best[key] = (depth, raw_path, module)
+    return [(best[key][1], best[key][2]) for key in order]
+
+
 def _register_hooks(model):
     logger = get_logger()
     if not logger.active():
         return
     count = 0
     layer_scope_count = 0
-    for raw_path, module in model.named_modules():
+    for raw_path, module in _canonical_named_modules(model):
         if not raw_path:
             continue
         path = _op_path(raw_path)
@@ -850,7 +904,8 @@ def _register_hooks(model):
             def layer_scoped_forward(
                     *args, __forward=original_forward,
                     __layer=layer, __path=path, **kwargs):
-                with logger.layer_scope(__layer, __path):
+                with logger.layer_scope(__layer, __path), \
+                        logger.layer_active(__layer, __path):
                     return __forward(*args, **kwargs)
 
             module.forward = layer_scoped_forward
@@ -938,7 +993,7 @@ def _wrap_layer_entry_functions(model, logger):
     if not methods and not functions:
         return 0
     layer_paths = {}
-    for raw_path, module in model.named_modules():
+    for raw_path, module in _canonical_named_modules(model):
         path = _op_path(raw_path) if raw_path else ""
         if path and _MAIN_LAYER_RE.search(path):
             layer_paths[id(module)] = (module, _layer_id(path), path)
@@ -961,7 +1016,8 @@ def _wrap_layer_entry_functions(model, logger):
             @functools.wraps(original)
             def scoped_method(*args, __fn=original, __layer=layer,
                               __path=path, **kwargs):
-                with logger.layer_scope(__layer, __path):
+                with logger.layer_scope(__layer, __path), \
+                        logger.layer_active(__layer, __path):
                     return __fn(*args, **kwargs)
 
             setattr(module, name, scoped_method)
@@ -991,7 +1047,8 @@ def _wrap_layer_entry_functions(model, logger):
             owner = by_module.get(id(layer_module))
             if owner is None:
                 return __fn(layer_module, *args, **kwargs)
-            with logger.layer_scope(owner[0], owner[1]):
+            with logger.layer_scope(owner[0], owner[1]), \
+                    logger.layer_active(owner[0], owner[1]):
                 return __fn(layer_module, *args, **kwargs)
 
         scoped_function._geak_semantics_entry_wrapped = True
