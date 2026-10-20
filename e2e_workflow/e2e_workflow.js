@@ -3964,22 +3964,15 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON && FUSION_BACKENDS.has(BACKEND)) {
       fusionFailureStage = 'unitside';
       const semanticTableJson = (semantics && semantics.semantic_table_json) || '';
       // The token range the server can hand each patched seam (graph capture sizes, prefill
-      // chunk budget), derived from the serving flags. Every verdict must run its overlay at
-      // both ends (integration_checks.shape_envelope); the harness fails a candidate that
-      // did not. Best-effort: without the file the harness only checks reported points.
-      let shapeEnvelopeJson = '';
-      try {
-        const { execFileSync } = require('child_process');
-        require('fs').mkdirSync(`${EVAL_DIR}/fusion`, { recursive: true });
-        const out = `${EVAL_DIR}/fusion/serving_shape_envelope.json`;
-        execFileSync('python3', [`${WORKFLOW_DIR}/scripts/serving_shape_envelope.py`,
-          '--backend', BACKEND, '--server-args', curFlags || '', '--out', out],
-        { stdio: 'pipe', timeout: 60000 });
-        shapeEnvelopeJson = out;
-        log(`KernelFusion unit-side: serving shape envelope -> ${out}`);
-      } catch (envErr) {
-        log(`KernelFusion unit-side: serving shape envelope skipped (${envErr && envErr.message ? envErr.message : envErr})`);
-      }
+      // chunk budget). Workflow scripts have no filesystem / child_process access, so the agents
+      // derive it: each validator and the aggregate run scripts/serving_shape_envelope.py on
+      // SERVING_BACKEND + SERVING_FLAGS into SHAPE_ENVELOPE_JSON (same flags -> same file), every
+      // verdict runs its overlay at both ends (integration_checks.shape_envelope), and the harness
+      // fails a candidate that did not.
+      const shapeEnvelopeInputs = {
+        SHAPE_ENVELOPE_JSON: `${EVAL_DIR}/fusion/serving_shape_envelope.json`,
+        SERVING_BACKEND: BACKEND, SERVING_FLAGS: curFlags || '',
+      };
       const unitJobs = [];
       const seenCids = new Set();
       const addJob = (entry, cid, kind) => {
@@ -4019,7 +4012,7 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON && FUSION_BACKENDS.has(BACKEND)) {
             TARGET_EXECUTION: job.entry, UNIT_JOB_KIND: job.kind,
             FUSION_TOPK_JSON: FUSION_INPUTS.FUSION_TOPK_JSON,
             FUSION_CANDIDATES_JSON: FUSION_INPUTS.FUSION_CANDIDATES_JSON,
-            SEMANTIC_TABLE_JSON: semanticTableJson, SHAPE_ENVELOPE_JSON: shapeEnvelopeJson,
+            SEMANTIC_TABLE_JSON: semanticTableJson, ...shapeEnvelopeInputs,
             GPU_IDS: gpuIds, TP: job.collective ? SERVING_TP : 1,
             VERDICT_DIR: `${EVAL_DIR}/verdict`, KERNEL_DIR: `${EVAL_DIR}/fusion/unitside/${job.cid}`,
             FUSION_DIR: `${EVAL_DIR}/fusion`,
@@ -4064,15 +4057,16 @@ if (!FAST_MODE && FUSION_DISCOVERY_ON && FUSION_BACKENDS.has(BACKEND)) {
       const unitAgg = await safeAgent(
         roleAgent('fusion_unit_validator', 'aggregate',
           'Run scripts/fusion_unitside_harness.py over VERDICT_DIR for the Top-K denominator (pass ' +
-          '--semantic-table SEMANTIC_TABLE_JSON and --shape-envelope SHAPE_ENVELOPE_JSON when set, and every ' +
-          'BUDGET_SKIPPED item as --budget-skipped), ' +
+          '--semantic-table SEMANTIC_TABLE_JSON when set, --shape-envelope SHAPE_ENVELOPE_JSON after generating it ' +
+          'with scripts/serving_shape_envelope.py from SERVING_BACKEND/SERVING_FLAGS, and every BUDGET_SKIPPED item ' +
+          'as --budget-skipped), ' +
           'publish EVAL_DIR/04_FUSION_UNITSIDE.md even when the gate fails, run report_index.py, and return ' +
           'FUSION_UNIT_AGG_SCHEMA with unit_status_by_candidate copied from fusion_unitside.json ' +
           '(alternative-rung and candidate-pool ids included).', {
             EVAL_DIR, FUSION_DIR: `${EVAL_DIR}/fusion`, VERDICT_DIR: `${EVAL_DIR}/verdict`,
             FUSION_TOPK_JSON: FUSION_INPUTS.FUSION_TOPK_JSON,
             FUSION_CANDIDATES_JSON: FUSION_INPUTS.FUSION_CANDIDATES_JSON,
-            SEMANTIC_TABLE_JSON: semanticTableJson, SHAPE_ENVELOPE_JSON: shapeEnvelopeJson,
+            SEMANTIC_TABLE_JSON: semanticTableJson, ...shapeEnvelopeInputs,
             FUSION_UNITSIDE_BUDGET: kinds('topk'),
             EXTRA_UNIT_CANDIDATES: unitJobs.filter((j) => j.kind !== 'topk').map((j) => j.cid),
             EQUIVALENT_COVERED: [], SUBSUMED_COVERED: [], BUDGET_SKIPPED: neverMeasured,

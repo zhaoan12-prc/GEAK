@@ -155,6 +155,8 @@ the harness once over the whole verdict dir and publishes the Phase 3.0 report a
 EVAL_DIR root, beside the other four phase reports:
 
 ```bash
+python3 "$SKILL_DIR/scripts/serving_shape_envelope.py" --backend "$SERVING_BACKEND" \
+  --server-args "$SERVING_FLAGS" --out "$SHAPE_ENVELOPE_JSON"
 python3 "$SKILL_DIR/scripts/fusion_unitside_harness.py" \
   --candidates "$FUSION_CANDIDATES_JSON" \
   --topk       "$FUSION_TOPK_JSON" \
@@ -367,8 +369,11 @@ Read the candidate object for `CANDIDATE_ID` from `FUSION_CANDIDATES_JSON`:
      capture and is wrong at replay.
    - `shape_envelope`: the server does not only run the captured shape. At startup it
      captures a graph for EVERY capture size, and prefill chunks span the whole chunk
-     budget. Read `SHAPE_ENVELOPE_JSON` (`serving_shape_envelope.py` output:
-     `phases.graph` covers decode/verify, `phases.prefill` covers prefill/extend) and run
+     budget. Generate the envelope from the serving flags (the workflow cannot run it for you):
+     `python3 "$SKILL_DIR/scripts/serving_shape_envelope.py" --backend "$SERVING_BACKEND"
+     --server-args "$SERVING_FLAGS" --out "$SHAPE_ENVELOPE_JSON"` (deterministic; every
+     validator writes the same file). Read it (`phases.graph` covers decode/verify,
+     `phases.prefill` covers prefill/extend; a phase it leaves out is unpinned) and run
      the patched entry, inside inference_mode, at the `min_tokens` and `max_tokens` of this
      candidate's phase (add a midpoint if the kernel has a size-dependent path). At each
      point the overlay must either ENGAGE and match the live chain (`pass`) or DECLINE via
