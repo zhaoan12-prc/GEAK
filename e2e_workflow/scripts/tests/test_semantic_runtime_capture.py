@@ -1,4 +1,5 @@
 import contextlib
+import io
 import os
 import sys
 import tempfile
@@ -272,6 +273,47 @@ class LayerEntryCallablesTest(unittest.TestCase):
             self._wrap({"GEAK_SEMANTICS_LAYER_ENTRY_FUNCTIONS": "pkg.model:missing"},
                        types.SimpleNamespace())
 
+    def _backbone(self, target):
+        """A monokernel-style ``Class.method`` entry: the layer is the
+        ``.module`` of the record passed after ``self``."""
+        class Backbone(object):
+            def _layer(self, record, value):
+                return value * 2
+
+        model, logger, _ = self._wrap(
+            {"GEAK_SEMANTICS_LAYER_ENTRY_FUNCTIONS": target},
+            types.SimpleNamespace(Backbone=Backbone))
+        self.addCleanup(capture._LAYER_ENTRY_STATS.clear)
+        return model, logger, Backbone()
+
+    def test_class_method_locates_the_layer_through_an_argument_attribute(self):
+        model, logger, backbone = self._backbone("pkg.mono:Backbone._layer@1.module")
+        record = types.SimpleNamespace(module=model.layer1)
+        self.assertEqual(backbone._layer(record, 3), 6)
+        self.assertEqual(logger.scopes, [(1, "model.layers.1")])
+
+    def test_unresolved_calls_are_counted_and_warned_once_per_reason(self):
+        target = "pkg.mono:Backbone._layer@1.module"
+        model, logger, backbone = self._backbone(target)
+        with mock.patch.object(sys, "stderr", io.StringIO()) as err:
+            for _ in range(4):          # 2 forwards x 2 main layers
+                backbone._layer(model.layer0, 3)
+            backbone._layer(types.SimpleNamespace(module=object()), 3)
+        stats = capture._LAYER_ENTRY_STATS[target]
+        self.assertEqual((stats["calls"], stats["hits"]), (5, 0))
+        self.assertEqual(stats["misses"],
+                         {"missing_attr": 4, "not_main_layer": 1})
+        self.assertEqual(err.getvalue().count("has no .module"), 1)
+        self.assertIn("ran 4 times without resolving a main layer",
+                      err.getvalue())
+        self.assertEqual(logger.scopes, [])
+
+    def test_impossible_locators_fail_at_wrap_time(self):
+        for target in ("pkg.mono:Backbone._layer@3",   # self, record, value
+                       "pkg.mono:Backbone._layer@x.module"):
+            with self.assertRaises(RuntimeError):
+                self._backbone(target)
+
     def test_nested_scope_for_the_same_layer_emits_one_marker(self):
         markers = []
 
@@ -532,3 +574,37 @@ class ContainerHookTest(unittest.TestCase):
         hooked = self._hooked({"GEAK_SEMANTICS_HOOK_CONTAINERS": "0"})
         self.assertNotIn("layers.1.self_attn", hooked)
         self.assertIn("layers.1.self_attn.wq", hooked)
+
+
+class ForwardBatchLookupTest(unittest.TestCase):
+    def test_forward_batch_is_found_anywhere_and_its_absence_warned_once(self):
+        batch = types.SimpleNamespace(forward_mode="DECODE")
+        lookup = capture._forward_batch_of
+        with mock.patch.object(capture, "_WARNED_FORWARDS", set()), \
+                mock.patch.object(sys, "stderr", io.StringIO()) as err:
+            self.assertIs(lookup((1, 2), {"forward_batch": batch}, "f"), batch)
+            self.assertIs(lookup((1, 2, batch), {}, "f"), batch)
+            self.assertIs(lookup((batch, 1, 2), {}, "f"), batch)
+            self.assertIsNone(lookup((1, 2, 3), {}, "f"))
+            self.assertIsNone(lookup((1, 2, 3), {}, "f"))
+        self.assertEqual(err.getvalue().count("f got no forward_batch"), 1)
+
+    def test_a_runtime_installed_instance_forward_sets_the_phase(self):
+        class Model(object):
+            def forward(self, *args):
+                return "class"
+
+        model, logger = Model(), mock.Mock()
+        model.forward = lambda input_ids, positions, forward_batch: "mono"
+        with mock.patch.multiple(
+                capture, get_logger=mock.Mock(return_value=logger),
+                install_graph_capture_profiler=mock.DEFAULT,
+                dump_operator_schema_manifest=mock.DEFAULT,
+                _install_callable_probes=mock.DEFAULT,
+                _register_hooks=mock.DEFAULT, _INSTALLED_CLASSES=set()), \
+                mock.patch.object(sys, "stderr", io.StringIO()):
+            capture.install_on_model(model)
+            batch = types.SimpleNamespace(forward_mode="DECODE")
+            self.assertEqual(model.forward(1, 2, batch), "mono")
+        logger.set_context.assert_called_once()
+        logger.mark_forward.assert_called_once()
