@@ -2037,6 +2037,19 @@ def _prior_applies(prior, family, gfx):
     return not prior.get("gfx") or gfx in prior["gfx"]
 
 
+# The generation forward is "verify" under speculative decoding on SGLang and
+# "decode" otherwise (vLLM calls both "decode"). A prior written against one
+# must match a board that names the other, so phases compare through this.
+_PHASE_ALIASES = {"decode": ("decode", "verify"), "verify": ("decode", "verify")}
+
+
+def _phase_set(phases):
+    out = set()
+    for phase in phases or ():
+        out.update(_PHASE_ALIASES.get(phase, (phase,)))
+    return out
+
+
 def _seam_match(entry, prior, occurrences):
     seam = prior.get("seam") or {}
     kinds = seam.get("kinds")
@@ -2057,7 +2070,7 @@ def _seam_match(entry, prior, occurrences):
                     best = max(best, 0.5 * both / len(want) + 0.5 * both / len(rows))
         return best
     phases = seam.get("phases") or prior.get("phases")
-    if phases and not set(phases) & set(entry.get("phases") or [entry["phase"]]):
+    if phases and not _phase_set(phases) & _phase_set(entry.get("phases") or [entry["phase"]]):
         return 0.0
     want = catalog_lib._expand_implied(seam.get("tags") or [])
     have = catalog_lib._expand_implied(set(entry["op_tags"]) - _POSITION_TAGS)
@@ -2849,8 +2862,8 @@ def _forced_entries(status, rows, found, noise_band, limit, blind=()):
                       and s["prior"]["measured_e2e_gain_pct"] >= noise_band),
                      key=lambda s: -s["prior"]["measured_e2e_gain_pct"])
     for item in ordered:
-        phases = set(item["prior"].get("phases") or (item["prior"].get("seam") or {}).get("phases") or [])
-        if blind and (not phases or phases & set(blind)):
+        phases = _phase_set(item["prior"].get("phases") or (item["prior"].get("seam") or {}).get("phases") or [])
+        if blind and (not phases or phases & _phase_set(blind)):
             item["forced"] = "phase_blind:%s" % ",".join(blind)
             continue
         if len(forced) >= limit:

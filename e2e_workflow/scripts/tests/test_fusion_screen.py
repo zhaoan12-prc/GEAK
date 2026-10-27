@@ -1066,5 +1066,27 @@ class EpMoeBoundaryAndCompactLadderTest(unittest.TestCase):
         self.assertEqual([r["entry_id"] for r in head["alt_ladder"]], ["s1", "s3", "s2"])
 
 
+
+class PhaseAliasTest(unittest.TestCase):
+    """A prior written for "decode" must match a speculative-decoding board,
+    whose generation forward SGLang calls "verify" (and vice versa)."""
+    ENTRY = {"kind": "serial", "phases": ["verify"], "phase": "verify",
+             "op_tags": ["allreduce", "gemm", "norm", "gemm_epilogue"]}
+
+    def _prior(self, phases):
+        return {"phases": phases, "seam": {"tags": ["allreduce", "gemm", "norm"]}}
+
+    def test_decode_prior_matches_verify_entry(self):
+        self.assertGreaterEqual(screen._seam_match(self.ENTRY, self._prior(["decode"]), []),
+                                screen.PRIOR_MATCH_MIN)
+
+    def test_verify_prior_matches_decode_entry(self):
+        entry = dict(self.ENTRY, phases=["decode"], phase="decode")
+        self.assertGreaterEqual(screen._seam_match(entry, self._prior(["verify"]), []),
+                                screen.PRIOR_MATCH_MIN)
+
+    def test_prefill_prior_still_skips_verify_entry(self):
+        self.assertEqual(screen._seam_match(self.ENTRY, self._prior(["prefill"]), []), 0.0)
+
 if __name__ == "__main__":
     unittest.main()
