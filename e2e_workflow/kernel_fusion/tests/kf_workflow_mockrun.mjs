@@ -1,6 +1,6 @@
 // Runs kf_workflow.js against scripted agent / nested-workflow answers (no GPU, no LLM).
 //   node kf_workflow_mockrun.mjs <scenario> <workflow_dir>
-// Prints one JSON line: {result, calls: [{label, prompt_head}], workflows: [args]}.
+// Prints one JSON line: {result, calls: [{label, phase, prompt}], workflows: [args]}.
 import { readFile } from 'node:fs/promises';
 
 const [scenario, WF_DIR] = process.argv.slice(2);
@@ -8,29 +8,41 @@ const KF = '/tmp/kf_mock/kf';
 const calls = [];
 const workflows = [];
 
+// c1 (difficulty 3) is recommended; c1s is its smaller exclusive alternative (the fallback).
 const CANDS = [
-  { id: 'c1', rank: 1, level: 'L1', region: 'rmsnorm chain', kernels: ['pow', 'mean', 'mul'],
-    seam: { target_callable: 'pkg.layers:RMSNorm.forward' }, region_pct_device_time: 4, bitwise_exact: true },
-  { id: 'c2', rank: 2, level: 'L2', region: 'gemm+quant', kernels: ['gemm', 'quant'],
-    seam: { target_callable: 'pkg.linear:apply' }, region_pct_device_time: 6 },
-  { id: 'c3', rank: 3, level: 'L3', region: 'moe stage', kernels: ['a', 'b'], seam: {} },
+  { id: 'c1', rank: 1, level: 'L2', region: 'route epilogue + prep', kernels: ['joint', 'prep', 'scatter'], difficulty: 3,
+    exclusive_with: ['c1s', 'c3'], seam: { target_callable: 'pkg.moe:MoE.forward' }, region_pct_device_time: 4,
+    bitwise_exact: true, est_gain_pct_expected: 2.7 },
+  { id: 'c2', rank: 2, level: 'L1', region: 'gemm+quant', kernels: ['gemm', 'quant'], difficulty: 2,
+    seam: { target_callable: 'pkg.linear:apply' }, region_pct_device_time: 6, est_gain_pct_expected: 1.5 },
+  { id: 'c1s', rank: 4, level: 'L1', region: 'prep + scatter', kernels: ['prep', 'scatter'], difficulty: 1,
+    exclusive_with: ['c1'], seam: { target_callable: 'pkg.moe:compact' }, est_gain_pct_expected: 1.6 },
+  { id: 'c3', rank: 5, level: 'L3', region: 'moe stage', kernels: ['a', 'b'], difficulty: 2, seam: {}, est_gain_pct_expected: 9 },
 ];
+const ISO = { c1: scenario === 'fallback' ? 0.97 : 1.4, c2: 0.95, c1s: 1.6 };
+const won = (gate, d) => ({ gate, ab_complete: true, e2e_throughput_tok_s: 100 + d, ref_med: 100, cand_med: 100 + d,
+  e2e_delta_pct: d, accepted_overlay: `${KF}/overlay/cand_${gate}` });
 
 const answers = {
   'kf:director:setup': () => (scenario === 'setup_fail' ? null : { eval_dir: KF, baseline_throughput_tok_s: 100, noise_band_pct: 0.5 }),
   'kf:profiler': () => ({ profile_topN_json: `${KF}/profile/round_0/profile_topN.json`, top_kernels: [] }),
   'kf:analyst': () => ({ topk_json: `${KF}/analysis/topk.json`, report_path: `${KF}/analysis/report.md`,
     candidates: CANDS, recommended: ['c1', 'c2'] }),
-  'kf:extract c1': () => ({ editable: true, task_dir: `${KF}/kernels/c1_task`, unittest_smoke: 'pass', target_callable: 'pkg.layers:RMSNorm.forward', short_name: 'c1',
-    baseline_frozen: scenario !== 'unfrozen' }),
-  'kf:extract c2': () => ({ editable: true, task_dir: `${KF}/kernels/c2_task`, unittest_smoke: 'pass', short_name: 'c2' }),
   'kf:integrate c1': () => ({
-    accept: { gate: 'accepted', ab_complete: true, e2e_throughput_tok_s: 103, ref_med: 100, cand_med: 103, e2e_delta_pct: 3, accepted_overlay: `${KF}/overlay/cand_c1` },
-    stack: { gate: 'stack', ab_complete: true, e2e_throughput_tok_s: 100.2, ref_med: 100, cand_med: 100.2, accepted_overlay: `${KF}/overlay/cand_c1` },
+    accept: won('accepted', 3), stack: won('stack', 0.2),
     retry: { gate: 'incomplete', ab_complete: false, e2e_throughput_tok_s: 0, ref_med: 100 },
   }[scenario] || { gate: 'rejected', e2e_throughput_tok_s: 99, reason: 'parity_regression' }),
-  'kf:integrate c1 (finish 1)': () => ({ gate: 'accepted', ab_complete: true, e2e_throughput_tok_s: 102, ref_med: 100, cand_med: 102, accepted_overlay: `${KF}/overlay/cand_c1` }),
+  'kf:integrate c1 (finish 1)': () => won('accepted', 2),
+  'kf:integrate c1s': () => won('accepted', 1.5),
+  'kf:director:validate': () => (scenario === 'stack'
+    ? { validation_status: 'validated_no_win', throughput_speedup: 1.001, output_parity: 'pass' }
+    : { validation_status: 'validated_win', throughput_speedup: 1.025, director_verified_throughput_tok_s: 102.5, output_parity: 'pass' }),
 };
+for (const id of Object.keys(ISO)) {
+  answers[`kf:extract ${id}`] = () => ({ editable: true, task_dir: `${KF}/kernels/${id}_task`, unittest_smoke: 'pass', short_name: id,
+    target_callable: CANDS.find((c) => c.id === id).seam.target_callable,
+    baseline_frozen: !(scenario === 'unfrozen' && id === 'c1') });
+}
 
 async function agent(prompt, opts) {
   calls.push({ label: opts.label, phase: opts.phase, prompt });
@@ -40,9 +52,9 @@ async function agent(prompt, opts) {
 }
 async function workflow(ref, a) {
   workflows.push({ scriptPath: ref.scriptPath, ...a });
-  return a.kernel_path.includes('c1')
-    ? { eval_dir: `${KF}/kernels/_exp/c1`, final_patch: 'diff --git a b', final_geomean: 1.4, validation_status: 'validated' }
-    : { eval_dir: `${KF}/kernels/_exp/c2`, final_patch: '', final_geomean: 0.95, validation_status: 'no_gain' };
+  const id = a.kernel_path.split('/').pop().replace(/_task$/, '');
+  return { eval_dir: `${KF}/kernels/_exp/${id}`, final_patch: ISO[id] > 1 ? `diff ${id}` : '', final_geomean: ISO[id],
+    validation_status: ISO[id] > 1 ? 'validated' : 'no_gain' };
 }
 const parallel = (ts) => Promise.all(ts.map((t) => Promise.resolve().then(t).catch(() => null)));
 const pipeline = null;

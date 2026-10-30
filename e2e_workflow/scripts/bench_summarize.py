@@ -30,6 +30,17 @@ TOTAL_KEYS = ("total_token_throughput", "total_throughput", "total_token_through
 OUTPUT_KEYS = ("output_throughput", "output_token_throughput", "output_throughput_tok_s")
 
 
+#: AgentX objective: InferenceX P90 interactivity (higher is better), which the AgentX client rows
+#: carry. Selected when the handoff's workload_spec.metric_basis names it (run_e2e.py exports that as
+#: GEAK_METRIC_BASIS) and no explicit E2E_METRIC overrides it.
+INTVTY_BASIS = "p90_intvty_inferencex"
+
+
+def _is_intvty():
+    return (not os.environ.get("E2E_METRIC")
+            and (os.environ.get("GEAK_METRIC_BASIS") or "").strip() == INTVTY_BASIS)
+
+
 def _is_total():
     return (os.environ.get("E2E_METRIC") or "output").strip().lower() in (
         "total", "total_token", "total_throughput")
@@ -74,7 +85,7 @@ def _emit(summary, out_path, tail):
 
 
 def from_runs(args):
-    keys = TOTAL_KEYS if _is_total() else OUTPUT_KEYS
+    keys = (INTVTY_BASIS,) if _is_intvty() else TOTAL_KEYS if _is_total() else OUTPUT_KEYS
 
     def read(path):
         xs = []
@@ -115,7 +126,7 @@ def from_runs(args):
                     dst.append(x)
     cold = read(args.cold) if args.cold else []
     med, spread = _med3(tps), _spread_pct(tps)
-    total = _is_total()
+    total = _is_total() or _is_intvty()     # either way: no output_* legacy alias
     summary = {
         # Canonical, metric-neutral throughput of the SELECTED basis. Downstream reads this +
         # metric_basis. The output_*-named pair below is a legacy alias, populated ONLY in output
@@ -132,7 +143,8 @@ def from_runs(args):
         # JIT/graph-capture costs included, same metric basis as the hot median. None by default.
         "cold_output_throughput_tok_s": _med3(cold),
         "cold_runs": len(cold),
-        "metric_basis": "aggregate_total_token_tok_s" if total else "aggregate_output_tok_s",
+        "metric_basis": (INTVTY_BASIS if _is_intvty() else
+                         "aggregate_total_token_tok_s" if total else "aggregate_output_tok_s"),
         "measurement_mode": ("isolated_server_replica"
                              if os.environ.get("GEAK_ISOLATED_REPLICA") == "1"
                              else "legacy_same_server"),

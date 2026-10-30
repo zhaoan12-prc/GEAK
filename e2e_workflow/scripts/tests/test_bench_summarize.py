@@ -25,7 +25,7 @@ SUMMARIZE = os.path.join(SCRIPTS_DIR, "bench_summarize.py")
 #: Env this module reads. Scrubbed before every call so a caller's shell cannot change
 #: what a test measures; `env=` re-adds the ones a test is actually about.
 _LIFECYCLE_ENV = ("E2E_METRIC", "WARM_SERVER_ROUNDS", "GEAK_ISOLATED_REPLICA",
-                  "MEASUREMENT_PURPOSE", "EFFECTIVE_CONFIG_DIGEST")
+                  "MEASUREMENT_PURPOSE", "EFFECTIVE_CONFIG_DIGEST", "GEAK_METRIC_BASIS")
 
 
 def _load_summarize():
@@ -104,6 +104,24 @@ class FromRunsTest(unittest.TestCase):
         self.assertEqual(s["measurement_mode"], "legacy_same_server")
         self.assertIn("E2E_SUMMARY aggregate_output_tok_s=103.5", line)
         self.assertIn("measurement_mode=legacy_same_server", line)
+
+    def test_agentx_interactivity_basis_from_the_handoff(self):
+        """workload_spec.metric_basis=p90_intvty_inferencex (GEAK_METRIC_BASIS) gates on the AgentX
+        rows' P90 interactivity, not throughput; an explicit E2E_METRIC still wins."""
+        with open(self.runs, "w", encoding="utf-8") as fh:
+            for t, iv in ((32000.0, 265.8), (33000.0, 280.1), (32500.0, 270.1)):
+                fh.write(json.dumps({"output_throughput": t, "p90_intvty_inferencex": iv}) + "\n")
+        line = _run(["from-runs", self.runs, self.out], {"GEAK_METRIC_BASIS": "p90_intvty_inferencex"})
+        with open(self.out, encoding="utf-8") as fh:
+            s = json.load(fh)
+        self.assertEqual(s["throughput_tok_s_median"], 270.1)
+        self.assertEqual(s["metric_basis"], "p90_intvty_inferencex")
+        self.assertIsNone(s["output_throughput_tok_s_median"])
+        self.assertIn("E2E_SUMMARY p90_intvty_inferencex=270.1", line)
+        _run(["from-runs", self.runs, self.out],
+             {"GEAK_METRIC_BASIS": "p90_intvty_inferencex", "E2E_METRIC": "output"})
+        with open(self.out, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["metric_basis"], "aggregate_output_tok_s")
 
     def test_single_round_reports_zero_spread_not_null(self):
         """0.0 means 'no spread'; None would read as 'unknown' and gate differently."""

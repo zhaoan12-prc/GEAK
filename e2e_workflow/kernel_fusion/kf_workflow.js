@@ -6,8 +6,8 @@ export const meta = {
     { title: 'Setup', detail: 'e2e Director builds the KF eval dir + baseline throughput (roles/director.md PHASE=setup)' },
     { title: 'Trace', detail: 'Profiler captures a warm serving trace (roles/profiler.md), or kf_trace_dir supplies one' },
     { title: 'TopK', detail: 'fusion analyst: kf_trace_digest.py + the user prompt -> ranked Top-K fusion candidates (topk.json)' },
-    { title: 'Author', detail: 'per candidate: kernel_extractor builds the region unittest, kernel_lane.js mode=author writes the fused kernel' },
-    { title: 'ApplyBack', detail: 'per authored kernel, serially: e2e_integrator overlay + ref/cand A/B; accepted overlays compound' },
+    { title: 'Author', detail: 'per recommended candidate + its fallback: kernel_extractor builds the region unittest, kernel_lane.js mode=author writes the fused kernel' },
+    { title: 'ApplyBack', detail: 'per slot, serially: e2e_integrator A/B (primary, else its fallback), accepted/stack overlays compound; director validate confirms the whole stack' },
   ],
 };
 
@@ -52,6 +52,8 @@ const WORKLOAD_SUMMARY = String(A.kf_workload_summary || ''); // per-point weigh
 const SOURCE_DIRS = String(A.kf_source_dirs || '');           // framework source, when not importable here
 const STEPS = new Set(String(A.kf_steps || 'trace,topk,author,apply').split(',').map((s) => s.trim()).filter(Boolean));
 const want = (s) => STEPS.has(s);
+const VALIDATION_MODE = String(A.kf_validation_mode || 'isolated_server');   // fresh servers: boot-to-boot noise
+const VALIDATION_REPLICAS = parseInt(A.kf_validation_replicas != null ? A.kf_validation_replicas : 2, 10);
 const AUTHOR_K = parseInt(A.kf_author_k != null ? A.kf_author_k : 3, 10);
 const KERNEL_BUDGET = parseInt(A.kf_kernel_budget != null ? A.kf_kernel_budget : 4, 10);
 const AGENT_TIMEOUT_MS = parseInt(A.agent_timeout_ms != null ? A.agent_timeout_ms : 7200000, 10);
@@ -141,6 +143,9 @@ const EXTRACT_SCHEMA = obj({ short_name: { type: 'string' }, editable: { type: '
   target_callable: { type: 'string' }, unittest_smoke: { type: 'string' }, candidate_bind: { type: 'object', additionalProperties: true },
   baseline_frozen: { type: 'boolean' },
   notes: { type: 'string' } }, ['editable', 'task_dir', 'unittest_smoke']);
+const VALIDATE_SCHEMA = obj({ validation_status: { type: 'string' }, throughput_speedup: { type: 'number' },
+  director_verified_throughput_tok_s: { type: 'number' }, output_parity: { type: 'string' }, notes: { type: 'string' } },
+  ['validation_status']);
 const INTEGRATE_SCHEMA = obj({ short_name: { type: 'string' }, e2e_throughput_tok_s: { type: 'number' },
   e2e_delta_pct: { type: 'number' }, ref_med: { type: 'number' }, cand_med: { type: 'number' },
   ab_complete: { type: 'boolean' }, output_parity: { type: 'string' }, parity_kind: { type: 'string' },
@@ -230,6 +235,7 @@ Write ${OUT}/topk.json: {"candidates": [...], "recommended": [ids in the order t
   inputs_outputs (tensors that cross the region boundary, with shapes/dtypes), launches_before, launches_after,
   region_pct_device_time (weighted), est_gain_pct_upper, est_gain_pct_expected (weighted e2e %),
   difficulty (1-5), bitwise_exact (bool), exclusive_with [ids], language ("triton" unless you have a reason),
+  fallback (id of the smaller-scope candidate to implement instead if this one fails, or null),
   fused_design (how the fused kernel works: tiling, what stays in registers/LDS, what it no longer writes to HBM).
 "recommended" = the non-conflicting set the prompt's ranking recommends, best first. A candidate whose region
 cannot be reached through one Python seam can still be ranked, but must not be recommended.
@@ -256,15 +262,35 @@ if (!topk || !(want('author') || want('apply'))) {
   if (!topk && want('topk')) { result.status = 'error'; result.reason = 'analyst returned nothing'; }
   return result;
 }
-
 // ---------------------------------------------------------------------------
-// Author: extract the region unittest (GEAK kernel_extractor) and author the fused kernel (kernel_lane).
+// Author: one slot per recommended candidate. A slot also authors its FALLBACK -- the smaller-scope
+// pattern the prompt's ranking names for when the recommended one does not pan out (the analyst's
+// `fallback`, else the lowest-difficulty exclusive alternative of a difficulty>=3 candidate). Each
+// job: region unittest (GEAK kernel_extractor) -> fused kernel (kernel_lane.js mode=author).
 // ---------------------------------------------------------------------------
 phase('Author');
 const byId = new Map((topk.candidates || []).map((c) => [String(c.id), c]));
-const picks = (topk.recommended || []).map((id) => byId.get(String(id))).filter(Boolean).slice(0, AUTHOR_K);
-log(`[kf] authoring ${picks.length} candidate(s): ${picks.map((c) => c.id).join(', ')}`);
-const authored = await parallel(picks.map((c, i) => async () => {
+const seamOf = (c) => (c && c.seam && c.seam.target_callable) || '';
+function fallbackOf(c, taken) {
+  const named = c.fallback != null ? byId.get(String(c.fallback)) : null;
+  if (named && seamOf(named) && !taken.has(String(named.id))) return named;
+  if (!((c.difficulty || 0) >= 3)) return null;
+  const alts = (c.exclusive_with || []).map((id) => byId.get(String(id)))
+    .filter((a) => a && seamOf(a) && !taken.has(String(a.id)) && (a.difficulty || 9) < (c.difficulty || 0))
+    .sort((a, b) => (b.est_gain_pct_expected || 0) - (a.est_gain_pct_expected || 0));
+  return alts[0] || null;
+}
+const primaries = (topk.recommended || []).map((id) => byId.get(String(id))).filter(Boolean).slice(0, AUTHOR_K);
+const taken = new Set(primaries.map((c) => String(c.id)));
+const slots = primaries.map((c) => {
+  const fb = fallbackOf(c, taken);
+  if (fb) taken.add(String(fb.id));
+  return { primary: c, fallback: fb };
+});
+const jobs = slots.flatMap((s) => [s.primary, s.fallback].filter(Boolean));
+log(`[kf] authoring ${jobs.length} job(s): ${slots.map((s) => s.primary.id + (s.fallback ? `(fallback ${s.fallback.id})` : '')).join(', ')}`);
+
+async function authorOne(c, i) {
   if (DEADLINE_HIT) return { c, skip: 'stage deadline' };
   const gpu = GPU_LIST[i % GPU_LIST.length];
   const short = String(c.id).replace(/[^A-Za-z0-9_]+/g, '_');
@@ -278,8 +304,8 @@ const authored = await parallel(picks.map((c, i) => async () => {
       EVAL_DIR, MODEL_PATH, GPU_ID: gpu, WORKLOAD, SKILL_DIR: WORKFLOW_DIR,
       KERNEL: { short_name: short, classification: 'fusion', fusion_level: c.level, region: c.region,
         device_kernel: (c.kernels || [])[0] || '', device_kernels: c.kernels || [],
-        target_callable: (c.seam || {}).target_callable || '', source_hint: (c.seam || {}).source_file || '',
-        seam_candidates: [(c.seam || {}).target_callable].filter(Boolean), inputs_outputs: c.inputs_outputs || '',
+        target_callable: seamOf(c), source_hint: (c.seam || {}).source_file || '',
+        seam_candidates: [seamOf(c)].filter(Boolean), inputs_outputs: c.inputs_outputs || '',
         phases: c.phases || [], m_range: c.m_range || '', candidate_backends: [c.language || 'triton'] },
       CURRENT_OVERLAY: INIT_OVERLAY, CURRENT_FLAGS: INIT_FLAGS, CURRENT_ENV: INIT_ENV,
     }), { phase: 'Author', label: `kf:extract ${short}`, schema: EXTRACT_SCHEMA });
@@ -303,36 +329,39 @@ const authored = await parallel(picks.map((c, i) => async () => {
         `Beat the live unfused region on the recorded serving shapes.` + GRAPH_REQ,
     });
   } catch (e) { kl = { validation_status: 'error', reason: String(e) }; }
-  return { c, ext, kl, lang };
-}));
+  const iso = kl ? (kl.final_weighted != null ? kl.final_weighted : kl.final_geomean) : 0;
+  return { c, ext, kl, lang, iso };
+}
+const authored = await parallel(jobs.map((c, i) => () => authorOne(c, i)));
+const authoredById = new Map(authored.filter(Boolean).map((r) => [String(r.c.id), r]));
+const usable = (r) => r && !r.skip && r.kl && r.kl.authored !== false && r.iso > 1.0 && r.kl.final_patch;
+for (const r of authored) {
+  if (r && !usable(r)) {
+    const why = r.skip || `no isolated win (${r.iso || 0}x, ${r.kl ? r.kl.reason || r.kl.validation_status || '' : 'none'})`;
+    log(`[kf] ${r.c.id}: ${why}`);
+    result.rejected.push({ id: r.c.id, stage: r.skip ? 'extract' : 'author', reason: why, isolated_speedup: r.iso || 0 });
+  }
+}
 
 // ---------------------------------------------------------------------------
-// ApplyBack: GEAK e2e_integrator, serially, compounding accepted overlays.
+// ApplyBack: per slot, serially, GEAK e2e_integrator A/B on the compounding overlay -- the primary
+// first, its fallback if the primary has no isolated win or does not pass. 'accepted' and 'stack'
+// (engaged, parity ok, not slower) both carry forward, exactly as in the e2e workflow; the GEAK
+// director's validate then measures the WHOLE stack against the original baseline, and only a
+// validated_win is handed to the main workflow.
 // ---------------------------------------------------------------------------
 phase('ApplyBack');
-let curOverlay = INIT_OVERLAY, curTput = baseTput, speedup = 1;
-for (const r of authored) {
-  if (!r) continue;
-  const { c } = r;
-  const iso = r.kl ? (r.kl.final_weighted != null ? r.kl.final_weighted : r.kl.final_geomean) : 0;
-  if (r.skip || !r.kl || r.kl.authored === false || !(iso > 1.0) || !r.kl.final_patch) {
-    const why = r.skip || `no isolated win (${iso || 0}x, ${r.kl ? r.kl.reason || r.kl.validation_status || '' : 'none'})`;
-    log(`[kf] ${c.id}: ${why}`);
-    result.rejected.push({ id: c.id, stage: r.skip ? 'extract' : 'author', reason: why, isolated_speedup: iso || 0 });
-    continue;
-  }
-  if (!want('apply') || DEADLINE_HIT) {
-    result.rejected.push({ id: c.id, stage: 'apply', reason: want('apply') ? 'stage deadline' : 'apply step disabled', isolated_speedup: iso });
-    continue;
-  }
+let curOverlay = INIT_OVERLAY, curTput = baseTput;
+async function integrateOne(r) {
+  const c = r.c;
   const inputs = {
     EVAL_DIR, MODEL_PATH, GPU_ID: SERVING_GPU, WORKLOAD, NOISE_BAND_PCT: noiseBand,
     MEASUREMENT_PURPOSE: 'search', REPLICAS: SEARCH_REPLICAS, SKILL_DIR: WORKFLOW_DIR,
     KERNEL_RESULT: { short_name: r.ext.short_name || c.id, task_dir: r.ext.task_dir, op_kind: 'fusion',
       winner_kind: 'authored', winner_backend: r.lang, authored_language: r.lang,
-      authored_kernel_eval_dir: r.kl.eval_dir || '', target_callable: r.ext.target_callable || (c.seam || {}).target_callable || '',
-      code_patch: r.kl.final_patch, final_patch: r.kl.final_patch, verified_isolated_speedup: iso,
-      pct_gpu_time: c.region_pct_device_time || 0, live_call_seam: (c.seam || {}).target_callable || '',
+      authored_kernel_eval_dir: r.kl.eval_dir || '', target_callable: r.ext.target_callable || seamOf(c),
+      code_patch: r.kl.final_patch, final_patch: r.kl.final_patch, verified_isolated_speedup: r.iso,
+      pct_gpu_time: c.region_pct_device_time || 0, live_call_seam: seamOf(c),
       parity_note: c.bitwise_exact ? 'expected_exact' : 'expected_close' },
     CURRENT_OVERLAY: curOverlay, CURRENT_FLAGS: INIT_FLAGS, CURRENT_ENV: INIT_ENV, CURRENT_THROUGHPUT: curTput,
   };
@@ -344,27 +373,55 @@ for (const r of authored) {
       'FINISH this e2e A/B: reuse a reference leg already on disk if usable, run the missing leg, then return the gate.',
       { ...inputs, RESUME_AB: true }), { phase: 'ApplyBack', label: `kf:integrate ${c.id} (finish ${t})`, schema: INTEGRATE_SCHEMA });
   }
-  const rec = { id: c.id, level: c.level, isolated_speedup: iso, gate: integ ? integ.gate : 'incomplete',
-    e2e_delta_pct: integ ? integ.e2e_delta_pct : null, ref_med: integ ? integ.ref_med : null,
-    cand_med: integ ? integ.cand_med : null, parity: integ ? integ.output_parity : '', reason: integ ? integ.reason || '' : 'no integrator result' };
-  // Only a clear win banks here ('accepted' = past the noise band with non-overlapping legs). A 'stack'
-  // verdict needs the e2e workflow's final combined validation to mean anything, and this stage has none.
-  if (integ && integ.gate === 'accepted' && integ.ab_complete !== false && integ.accepted_overlay) {
-    curOverlay = integ.accepted_overlay;
-    curTput = integ.e2e_throughput_tok_s;
-    // Each gate is its own same-protocol ref/cand pair; the stage gain is their product.
-    if (integ.ref_med > 0 && integ.cand_med > 0) speedup *= integ.cand_med / integ.ref_med;
-    else speedup *= 1 + (integ.e2e_delta_pct || 0) / 100;
-    result.accepted.push({ ...rec, overlay: curOverlay });
-    log(`[kf] ${c.id}: ACCEPTED ${rec.e2e_delta_pct}% -> ${curTput} tok/s`);
-  } else {
+  return integ;
+}
+for (const s of slots) {
+  if (!want('apply')) break;
+  for (const c of [s.primary, s.fallback].filter(Boolean)) {
+    const r = authoredById.get(String(c.id));
+    if (!usable(r)) continue;
+    if (DEADLINE_HIT) { result.rejected.push({ id: c.id, stage: 'apply', reason: 'stage deadline', isolated_speedup: r.iso }); continue; }
+    const integ = await integrateOne(r);
+    const rec = { id: c.id, level: c.level, slot: s.primary.id, isolated_speedup: r.iso,
+      gate: integ ? integ.gate : 'incomplete', e2e_delta_pct: integ ? integ.e2e_delta_pct : null,
+      ref_med: integ ? integ.ref_med : null, cand_med: integ ? integ.cand_med : null,
+      parity: integ ? integ.output_parity : '', reason: integ ? integ.reason || '' : 'no integrator result' };
+    if (integ && (integ.gate === 'accepted' || integ.gate === 'stack') && integ.ab_complete !== false && integ.accepted_overlay) {
+      curOverlay = integ.accepted_overlay;
+      curTput = integ.e2e_throughput_tok_s || curTput;
+      result.accepted.push({ ...rec, overlay: curOverlay });
+      log(`[kf] ${c.id}: carried (${rec.gate}, ${rec.e2e_delta_pct}%)`);
+      break;                                   // slot filled; its fallback is not needed
+    }
     result.rejected.push({ ...rec, stage: 'apply' });
     log(`[kf] ${c.id}: not applied (${rec.gate}: ${rec.reason})`);
   }
 }
+if (!want('apply')) {
+  for (const r of authored) if (usable(r)) result.rejected.push({ id: r.c.id, stage: 'apply', reason: 'apply step disabled', isolated_speedup: r.iso });
+}
 
-result.final_overlay = curOverlay;
-result.final_throughput_tok_s = curTput;
-result.throughput_speedup = speedup;
-result.status = result.accepted.length ? 'accepted' : 'no_gain';
+// Combined confirmation: the stack vs the TRUE baseline, fresh servers, GEAK director validate.
+if (result.accepted.length) {
+  phase('ApplyBack');
+  const v = await safeAgent(roleAgent('director', 'validate',
+    'Independently re-measure the KernelFusion stack against the true baseline + output parity and arbitrate. ' +
+    'This stage has no architect/final report: skip report reconciliation (step 7), and APPLY_TO_ORIGINAL=false.', {
+      EVAL_DIR, MODEL_PATH, GPU_ID: GPU_LIST[0], BASELINE_THROUGHPUT: baseTput, NOISE_BAND_PCT: noiseBand,
+      BASELINE_OVERLAY: INIT_OVERLAY, FINAL_OVERLAY: curOverlay, FINAL_FLAGS: { flags: INIT_FLAGS, env: INIT_ENV },
+      CLAIMED_THROUGHPUT: curTput, WORKLOAD, APPLY_TO_ORIGINAL: 'false',
+      MEASUREMENT_MODE: VALIDATION_MODE, MEASUREMENT_PURPOSE: 'validation', REPLICAS: VALIDATION_REPLICAS,
+      SKILL_DIR: WORKFLOW_DIR,
+    }), { phase: 'ApplyBack', label: 'kf:director:validate', schema: VALIDATE_SCHEMA });
+  result.validation = v || { validation_status: 'error', notes: 'validate returned nothing' };
+  if (v && v.validation_status === 'validated_win' && v.throughput_speedup > 1) {
+    result.final_overlay = curOverlay;
+    result.final_throughput_tok_s = v.director_verified_throughput_tok_s || curTput;
+    result.throughput_speedup = v.throughput_speedup;
+    result.status = 'accepted';
+    return result;
+  }
+  log(`[kf] combined stack not confirmed (${result.validation.validation_status}, x${result.validation.throughput_speedup || '?'}); main workflow keeps the original stack.`);
+}
+result.status = 'no_gain';
 return result;

@@ -34,6 +34,8 @@ _KNOBS = {
     "steps": ("GEAK_KF_STEPS", "kf_steps"),
     "author_k": ("GEAK_KF_AUTHOR_K", "kf_author_k"),
     "kernel_budget": ("GEAK_KF_KERNEL_BUDGET", "kf_kernel_budget"),
+    "validation_mode": ("GEAK_KF_VALIDATION_MODE", "kf_validation_mode"),
+    "validation_replicas": ("GEAK_KF_VALIDATION_REPLICAS", "kf_validation_replicas"),
     "budget_s": ("GEAK_KF_BUDGET_S", None),
     "kf_dir": ("GEAK_KF_DIR", "kf_dir"),
 }
