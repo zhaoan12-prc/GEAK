@@ -200,9 +200,6 @@ def digest_trace(path: str, top: int) -> dict:
         busy = [sum(k.get("dur", 0) for k in per_step[i]) for i in idxs]
         span = [windows[i][2] - windows[i][1] for i in idxs]
         cover = [covered_us(per_step[i]) for i in idxs]
-        # Host/scheduler time between the previous step window and this one: launch, sync and Python
-        # scheduling the per-step device numbers never see (it is part of every ITL).
-        gaps = [windows[i][1] - windows[i - 1][2] for i in idxs if i > 0 and windows[i][1] >= windows[i - 1][2]]
         nk = [len(per_step[i]) for i in idxs]
         agg: dict[str, list[float]] = defaultdict(list)
         for i in idxs:
@@ -233,8 +230,6 @@ def digest_trace(path: str, top: int) -> dict:
             "busy_us_per_step": round(statistics.mean(busy), 1),   # summed kernel time (all streams)
             "span_us_per_step": round(statistics.mean(span), 1),
             "idle_frac": round(max(0.0, 1 - sum(cover) / (sum(span) or 1.0)), 3),
-            "gap_before_us_per_step": round(statistics.mean(gaps), 1) if gaps else None,
-            "gap_frac_of_wall": round(sum(gaps) / ((sum(gaps) + sum(span)) or 1.0), 3) if gaps else None,
             "kernels_per_step": round(statistics.mean(nk), 1),
             "distinct_kernels": len(agg),
             "short_kernel_share": {"count_frac": round(len(short) / max(1, len(all_d)), 3),
@@ -265,8 +260,6 @@ def to_md(groups: dict[str, dict]) -> str:
                   f"{100 * s['short_kernel_share']['time_frac']:.1f}% of device time; "
                   f"graph-replayed: {s['graph_replayed']}"
                   + (" (launch frames unavailable: map kernels to source by name)" if s["graph_replayed"] else ""),
-                  f"- host/scheduler gap before each step: {s['gap_before_us_per_step']} us "
-                  f"({100 * (s['gap_frac_of_wall'] or 0):.1f}% of step+gap wall time)",
                   f"- repeating block: {lp['period']} kernels x {lp['repeats']} (match {lp['match']}); "
                   f"sequence: `{s['seq_file']}`", "",
                   "| kernel | calls/step | us/step | avg us | % step |", "|---|---|---|---|---|"]

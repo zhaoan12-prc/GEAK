@@ -61,7 +61,6 @@ def test_synthetic_digest(tmp_path):
     pairs = {r["pair"]: r["per_step"] for r in dec["adjacent_pairs"]}
     assert pairs == {"rms_norm_kernel -> Cijk_gemm": 3, "Cijk_gemm -> add_kernel": 3, "add_kernel -> rms_norm_kernel": 2}
     assert dec["step_once_pairs"] == []
-    assert dec["gap_before_us_per_step"] == 50.0 and ext["gap_before_us_per_step"] == 50.0
     top = {r["kernel"]: r for r in dec["top_kernels"]}
     assert top["Cijk_gemm"]["calls_per_step"] == 3 and top["Cijk_gemm"]["us_per_step"] == 30
     seq = (tmp_path / "out" / "seq_de_4_EXTEND.tsv").read_text().splitlines()
