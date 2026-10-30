@@ -139,6 +139,13 @@ def _read_json(p: Path) -> dict | None:
         return None
 
 
+def _unwrap(d: dict | None) -> dict | None:
+    """The Workflow tool persists an envelope ({summary, result, logs, ...}); the return is its result."""
+    if isinstance(d, dict) and "eval_dir" not in d and isinstance(d.get("result"), dict):
+        return d["result"]
+    return d
+
+
 def fold_overlay(ps_args: dict, kf_overlay: str) -> str:
     """The fused overlay REPLACES the initial one: the integrator built it as a copy of the initial
     overlay plus the fused kernels, and roles copy CURRENT_OVERLAY as one directory."""
@@ -179,7 +186,7 @@ def run_stage(h: dict, ps_args: dict, timeout_s: int, G: dict, flags=frozenset()
             if isinstance(e, (KeyboardInterrupt, SystemExit)):
                 raise
             summary["error"] = f"{type(e).__name__}: {e}"[:2000]
-            wf = _read_json(kf_dir / "workflow_return.json")
+            wf = _unwrap(_read_json(kf_dir / "workflow_return.json"))
     elapsed = int(time.time() - t0)
     if wf:
         # The analyst cannot write .md reports from inside the workflow; it returns them and they land here.

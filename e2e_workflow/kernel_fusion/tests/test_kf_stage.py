@@ -122,6 +122,19 @@ def test_run_stage_no_gain_or_failure_leaves_main_args_alone(tmp_path):
             assert "boom" in kf["error"]
 
 
+def test_envelope_on_disk_is_unwrapped(tmp_path):
+    """The driver's stdout had no JSON; the Workflow tool's own envelope on disk carries the return."""
+    pa = ps_args(tmp_path)
+    kf_dir = kf_stage.kf_dir_for({}, pa)
+    kf_dir.mkdir(parents=True)
+    (kf_dir / "workflow_return.json").write_text(json.dumps(
+        {"summary": "x", "logs": [], "result": {"eval_dir": str(kf_dir), "status": "analysis_only",
+                                                "analysis_files": {str(kf_dir) + "/analysis/REPORT.md": "# r"}}}))
+    R, _ = fake_R(exc=RuntimeError("WorkflowParseError"))
+    kf = kf_stage.run_stage({"kernel_fusion": True}, pa, 36000, R)
+    assert kf["status"] == "analysis_only" and (kf_dir / "analysis" / "REPORT.md").read_text() == "# r"
+
+
 def test_sigterm_self_stop_propagates(tmp_path):
     R, _ = fake_R(exc=TimeoutError("signal 15: self-stop to flush interface files"))
     with pytest.raises(TimeoutError):
