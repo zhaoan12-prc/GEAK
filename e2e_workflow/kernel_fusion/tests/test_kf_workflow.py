@@ -43,7 +43,7 @@ def test_accept_path_reuses_geak_roles_and_confirms_the_stack():
             m = re.search(r"Read (\S+/roles/(\w+)\.md)", c["prompt"])
             assert m and Path(m.group(1)).is_file(), c["label"]
     analyst = out["calls"][2]["prompt"]
-    assert "Read /prompts/p.txt" in analyst and "kf_trace_digest.py" in analyst and "fallback (id" in analyst
+    assert "Read every one of these files in full: /prompts/p.txt, /prompts/deploy.txt" in analyst and "kf_trace_digest.py" in analyst and "fallback (id" in analyst
     assert f"TRACE_DIR: {KF}/profile" in analyst
     assert all(w["scriptPath"].endswith("kernel_workflow/kernel_lane.js") and w["mode"] == "author"
                for w in out["workflows"]) and len(out["workflows"]) == 3

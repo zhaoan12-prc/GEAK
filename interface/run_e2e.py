@@ -6791,17 +6791,18 @@ def main(argv: list[str]) -> int:
                           "speedup": cached_out.get("throughput_speedup")}))
         return 0 if cached_out.get("status") != "error" else 1
 
-    # KernelFusion first when switched on; the main workflow then starts from its accepted overlay.
-    kf = kf_stage.run_stage(h, ps_args, timeout_s, globals(), flags)
-    if kf:
-        timeout_s = kf["main_timeout_s"]
-        prompt = build_prompt(ps_args)
-
     out: dict = {}
     wf: dict | None = None
     err: object = None
     err_class: str | None = None
+    kf: dict | None = None
     try:
+        # KernelFusion first (on unless switched off); the main workflow then starts from its
+        # accepted overlay. Inside the try so a SIGTERM during the stage flushes like any other.
+        kf = kf_stage.run_stage(h, ps_args, timeout_s, globals(), flags)
+        if kf:
+            timeout_s = kf["main_timeout_s"]
+            prompt = build_prompt(ps_args)
         wf = invoke_workflow(prompt, timeout_s, ps_args["eval_dir"], ps_args=ps_args)
     except Exception as e:  # scrape/crash/timeout/SIGTERM: recover from disk.
         err = e

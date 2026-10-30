@@ -1,7 +1,7 @@
 export const meta = {
   name: 'kernel-fusion',
   description: 'KernelFusion stage, run BEFORE the GEAK e2e workflow: capture a serving trace (GEAK profiler), pick the Top-K fusion patterns with a user-supplied analysis prompt, author each fused kernel with the GEAK kernel layer, and apply the winners back through the GEAK e2e integrator A/B. Returns the accepted fused overlay, which the e2e workflow then uses as its baseline.',
-  whenToUse: 'Started by interface/run_e2e.py when kernel fusion is switched on (handoff "kernel_fusion", GEAK_KERNEL_FUSION=1 or --kernel-fusion). Takes the same args as e2e_workflow.js plus kf_dir, kf_prompt and the optional kf_* knobs documented in kernel_fusion/README.md.',
+  whenToUse: 'Started by interface/run_e2e.py before the e2e workflow unless switched off (handoff "kernel_fusion": false, GEAK_KERNEL_FUSION=0 or --no-kernel-fusion). Takes the same args as e2e_workflow.js plus kf_dir, kf_prompt and the optional kf_* knobs documented in kernel_fusion/README.md.',
   phases: [
     { title: 'Setup', detail: 'e2e Director builds the KF eval dir + baseline throughput (roles/director.md PHASE=setup)' },
     { title: 'Trace', detail: 'Profiler captures a warm serving trace (roles/profiler.md), or kf_trace_dir supplies one' },
@@ -61,6 +61,7 @@ const AB_FINISH_RETRIES = parseInt(A.ab_finish_retries != null ? A.ab_finish_ret
 
 // KernelFusion knobs.
 const PROMPT = String(A.kf_prompt || `${KF_HOME}/default_prompt.md`);
+const PROMPTS = PROMPT.split(',').map((p) => p.trim()).filter(Boolean);   // several files drive one analysis
 const TRACE_DIR_IN = String(A.kf_trace_dir || '');          // existing traces: skip the capture
 const WORKLOAD_SUMMARY = String(A.kf_workload_summary || ''); // per-point weights, when the caller has them
 const SOURCE_DIRS = String(A.kf_source_dirs || '');           // framework source, when not importable here
@@ -220,9 +221,12 @@ if (want('topk')) {
   topk = await safeAgent(`You are the GEAK KernelFusion analyst. You choose which kernel-fusion patterns to implement.
 
 ## Your method is the user's prompt
-Read ${PROMPT} in full. It is the AUTHORITATIVE analysis method, ranking rules and deliverable list for this
-task: follow it step by step. It may name a container, a working directory or a materials/ layout from the
-setting it was written in; those are NOT this environment. Map them onto the inputs below instead:
+Read every one of these files in full: ${PROMPTS.join(', ')}. Together they are the AUTHORITATIVE analysis
+method, ranking rules, deliverable list, deployment and workload description for this task: follow them step
+by step. A file may describe a whole run (launching servers, running GEAK, where outputs go): take from it the
+deployment, workload, metric and constraints, but your job is only the analysis below. They may also name a
+container, a working directory or a materials/ layout from the setting they were written in; those are NOT
+this environment. Map them onto the inputs below instead:
 - its traces / sampling points            -> the trace files under TRACE_DIR (any depth; one dir = one point)
 - its workload summary / weights           -> WORKLOAD_SUMMARY when given; otherwise derive the weights from the
                                               baseline bench + server log under EVAL_DIR and say so

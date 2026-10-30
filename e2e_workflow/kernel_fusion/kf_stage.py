@@ -1,9 +1,10 @@
 """KernelFusion stage driver: the only KernelFusion code interface/run_e2e.py calls.
 
-The stage is OFF unless switched on, and then it runs to completion BEFORE the main e2e workflow:
+The stage is ON by default and runs to completion BEFORE the main e2e workflow
+(baseline -> trace -> topk -> author -> apply back -> the e2e workflow). Switch it off with:
 
-    handoff  "kernel_fusion": true | {"enabled": true, "prompt": "...", ...}
-    env      GEAK_KERNEL_FUSION=1|0            (overrides the handoff)
+    handoff  "kernel_fusion": false | {"enabled": false}   (an object configures it: {"prompt": "...", ...})
+    env      GEAK_KERNEL_FUSION=0|1            (overrides the handoff)
     CLI      run_e2e.py ... --kernel-fusion | --no-kernel-fusion   (overrides both)
 
 It runs kernel_fusion/kf_workflow.js through run_e2e's own invoke_workflow (Claude SDK / CLI / standalone
@@ -50,10 +51,10 @@ def _truthy(v: Any) -> bool:
 
 
 def config(h: dict, flags: set[str] | frozenset = frozenset()) -> dict | None:
-    """The stage config when the switch is on, else None. CLI > env > handoff."""
+    """The stage config when the switch is on (the default), else None. CLI > env > handoff."""
     raw = h.get("kernel_fusion")
     cfg: dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
-    cfg["enabled"] = _truthy(cfg.get("enabled", True)) if isinstance(raw, dict) else (raw is not None and _truthy(raw))
+    cfg["enabled"] = _truthy(cfg.get("enabled", True)) if isinstance(raw, dict) else (raw is None or _truthy(raw))
     if os.environ.get("GEAK_KERNEL_FUSION", "").strip():
         cfg["enabled"] = _truthy(os.environ["GEAK_KERNEL_FUSION"])
     if "--kernel-fusion" in flags:
@@ -86,7 +87,9 @@ def build_args(cfg: dict, ps_args: dict, budget_s: int) -> dict:
             a[arg] = cfg[key]
     for path_key in ("kf_prompt", "kf_trace_dir", "kf_workload_summary"):
         if a.get(path_key):
-            a[path_key] = str(Path(a[path_key]).expanduser().resolve())
+            # kf_prompt may name several files (comma-separated): all of them drive the analysis.
+            a[path_key] = ",".join(str(Path(p.strip()).expanduser().resolve())
+                                   for p in str(a[path_key]).split(",") if p.strip())
     a["kf_dir"] = str(kf_dir_for(cfg, ps_args))
     a["time_budget_s"] = int(budget_s)
     return a
@@ -96,8 +99,9 @@ def validate(args: dict) -> list[str]:
     """Problems that make the stage pointless to start (the analysis has nothing to work from)."""
     probs = []
     for k in ("kf_prompt", "kf_trace_dir", "kf_workload_summary"):
-        if args.get(k) and not Path(args[k]).exists():
-            probs.append(f"{k} does not exist: {args[k]}")
+        for p in str(args.get(k) or "").split(","):
+            if p and not Path(p).exists():
+                probs.append(f"{k} does not exist: {p}")
     return probs
 
 

@@ -22,8 +22,8 @@ def _clean_env(monkeypatch):
             monkeypatch.delenv(k)
 
 
-def test_switch_off_by_default_and_precedence(monkeypatch):
-    assert kf_stage.config({}) is None
+def test_switch_on_by_default_and_precedence(monkeypatch):
+    assert kf_stage.config({})["enabled"]                                         # external call => on
     assert kf_stage.config({"kernel_fusion": False}) is None
     assert kf_stage.config({"kernel_fusion": True})["enabled"]
     assert kf_stage.config({"kernel_fusion": {"prompt": "/p"}})["prompt"] == "/p"   # object => on
@@ -41,6 +41,15 @@ def ps_args(tmp_path):
     return {"model_path": "/m", "workflow_dir": "/w", "eval_dir": str(tmp_path / "e2e_M_20261030T0_ab12Z"),
             "initial_overlay_pythonpath": "/base", "time_budget_s": 36000, "phases": "all", "state": {"x": 1},
             "tracelens": {}, "apply_to_original": "true", "tp": 8}
+
+
+def test_several_prompt_files(tmp_path):
+    a, b = tmp_path / "prompt.txt", tmp_path / "deploy.txt"
+    a.write_text("x"); b.write_text("y")
+    args = kf_stage.build_args({"prompt": f"{a}, {b}"}, ps_args(tmp_path), 60)
+    assert args["kf_prompt"] == f"{a},{b}" and kf_stage.validate(args) == []
+    args["kf_prompt"] += ",/no/such.txt"
+    assert kf_stage.validate(args) == ["kf_prompt does not exist: /no/such.txt"]
 
 
 def test_build_args_drops_main_only_keys_and_maps_knobs(tmp_path):
@@ -133,8 +142,9 @@ def _dry_run(tmp_path, extra_handoff, flags=(), env=None):
 
 
 def test_run_e2e_dry_run_reports_the_switch(tmp_path):
-    assert _dry_run(tmp_path, {})["kernel_fusion"] == {"enabled": False}
-    on = _dry_run(tmp_path, {}, ("--kernel-fusion",))["kernel_fusion"]
+    assert _dry_run(tmp_path, {}, ("--no-kernel-fusion",))["kernel_fusion"] == {"enabled": False}
+    assert _dry_run(tmp_path, {"kernel_fusion": False})["kernel_fusion"] == {"enabled": False}
+    on = _dry_run(tmp_path, {})["kernel_fusion"]                                  # default on
     assert on["enabled"] and on["script"].endswith("kernel_fusion/kf_workflow.js")
     assert on["args"]["tp"] == 2 and on["args"]["kf_dir"].startswith(str(tmp_path / "kf_M_"))
     assert _dry_run(tmp_path, {"kernel_fusion": True}, env={"GEAK_KERNEL_FUSION": "0"})["kernel_fusion"] == {"enabled": False}

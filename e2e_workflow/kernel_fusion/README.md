@@ -1,8 +1,9 @@
 # KernelFusion — optional stage before the GEAK e2e workflow
 
-A separate module. When switched on, `interface/run_e2e.py` runs it to completion **before** the
-main e2e workflow; when it accepts a fused overlay, the main workflow starts from that overlay
-(its own baseline is measured on the fused stack). Switched off — the default — nothing changes.
+A separate module, **on by default**: every external `interface/run_e2e.py` call runs it to
+completion **before** the main e2e workflow (baseline → trace → topk → author → apply back → the
+e2e workflow). When it accepts a fused overlay, the main workflow starts from that overlay (its own
+baseline is measured on the fused stack). Switched off, nothing changes.
 
 ```
 trace ──► topk ──► author ──► apply
@@ -14,7 +15,7 @@ profiler)  prompt)  kernel     A/B, compounding
 | Step | What runs | Reused GEAK code |
 |---|---|---|
 | Setup | eval dir + baseline throughput | `roles/director.md` PHASE=setup, `bench_e2e.sh` |
-| `trace` | warm serving trace (skipped when `trace_dir` is given) | `roles/profiler.md` PHASE=baseline, `bench_e2e.sh PROFILE=1` |
+| `trace` | warm serving trace (skipped when `trace_dir` is given); on an AgentX replay the window opens in steady state (`adapters/clients/agentx.sh: adapter_profile_warmup_s`) | `roles/profiler.md` PHASE=baseline, `bench_e2e.sh PROFILE=1` |
 | `topk` | `kf_trace_digest.py` (deterministic), then the analyst agent applies **your prompt** → `analysis/topk.json` + the report the prompt asks for | `parse_profile.py` |
 | `author` | per recommended candidate **and its fallback** (the analyst's `fallback`, else the lowest-difficulty exclusive alternative of a difficulty ≥ 3 candidate): region unittest, then a fused kernel | `roles/kernel_extractor.md`, `kernel_workflow/kernel_lane.js` `mode=author` |
 | `apply` | per slot, serially: A/B the primary, else its fallback; `accepted`/`stack` overlays compound; then one combined confirmation of the whole stack vs the original baseline — only `validated_win` is handed to the main workflow | `roles/e2e_integrator.md` PHASE=integrate, `roles/director.md` PHASE=validate |
@@ -24,16 +25,16 @@ profiler)  prompt)  kernel     A/B, compounding
 Precedence: CLI > env > handoff.
 
 ```
-run_e2e.py handoff.json result.json --kernel-fusion        # on for this run
+run_e2e.py handoff.json result.json                        # on (default)
 run_e2e.py handoff.json result.json --no-kernel-fusion     # off for this run
-GEAK_KERNEL_FUSION=1|0                                     # env
-"kernel_fusion": true                                      # handoff, or an object:
-"kernel_fusion": {"enabled": true, "prompt": "/path/prompt.txt", "trace_dir": "...", ...}
+GEAK_KERNEL_FUSION=0|1                                     # env
+"kernel_fusion": false                                     # handoff, or an object that configures it:
+"kernel_fusion": {"prompt": "/path/prompt.txt,/path/deploy.txt", "trace_dir": "...", ...}
 ```
 
 | key (handoff) | env | default | meaning |
 |---|---|---|---|
-| `prompt` | `GEAK_KF_PROMPT` | `default_prompt.md` | the TopK analysis prompt (e.g. `agentx/prompt.txt`) |
+| `prompt` | `GEAK_KF_PROMPT` | `default_prompt.md` | the TopK analysis prompt(s), comma-separated, all read (e.g. `agentx/prompt.txt,agentx/muse_agentx_con16.txt`) |
 | `trace_dir` | `GEAK_KF_TRACE_DIR` | — | existing traces (any depth; one dir per sampling point); skips the capture |
 | `workload_summary` | `GEAK_KF_WORKLOAD_SUMMARY` | — | per-point weights for the analysis |
 | `source_dirs` | `GEAK_KF_SOURCE_DIRS` | installed packages | framework/op-library source for the analyst when it is not importable where the stage runs |
