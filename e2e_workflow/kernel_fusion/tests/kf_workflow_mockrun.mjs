@@ -25,7 +25,11 @@ const won = (gate, d) => ({ gate, ab_complete: true, e2e_throughput_tok_s: 100 +
 
 const answers = {
   'kf:director:setup': () => (scenario === 'setup_fail' ? null : { eval_dir: KF, baseline_throughput_tok_s: 100, noise_band_pct: 0.5 }),
-  'kf:profiler': () => ({ profile_topN_json: `${KF}/profile/round_0/profile_topN.json`, top_kernels: [] }),
+  'kf:profiler': () => (scenario === 'no_trace' || scenario === 'trace_retry'
+    ? { profile_topN_json: '', top_kernels: [], notes: 'capture still running' }
+    : { profile_topN_json: `${KF}/profile/round_0/profile_topN.json`, top_kernels: [{ name: 'k' }] }),
+  'kf:profiler (retry)': () => (scenario === 'no_trace' ? null
+    : { profile_topN_json: `${KF}/profile/round_0/profile_topN.json`, top_kernels: [{ name: 'k' }] }),
   'kf:analyst': () => ({ topk_json: `${KF}/analysis/topk.json`, report_path: `${KF}/analysis/report.md`,
     candidates: CANDS, recommended: ['c1', 'c2'], report_md: '# report', model_notes_md: '# notes' }),
   'kf:integrate c1': () => ({

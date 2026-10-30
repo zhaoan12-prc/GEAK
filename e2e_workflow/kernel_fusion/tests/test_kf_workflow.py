@@ -109,6 +109,25 @@ def test_analysis_only_with_given_traces_needs_no_server():
     assert "report_md" in out["calls"][0]["prompt"]
 
 
+def test_no_trace_is_retried_then_stops_the_stage():
+    out = run("no_trace")
+    assert labels(out)[:2] == ["kf:director:setup", "kf:profiler"] and "kf:analyst" not in labels(out)
+    assert labels(out).count("kf:profiler (retry)") == 3          # safeAgent's tries on a null result
+    r = out["result"]
+    assert r["status"] == "error" and "no Top-N" in r["reason"] and r["final_overlay"] == ""
+
+
+def test_no_trace_once_then_recaptured():
+    out = run("trace_retry")
+    assert labels(out)[:4] == ["kf:director:setup", "kf:profiler", "kf:profiler (retry)", "kf:analyst"]
+    assert out["result"]["status"] == "accepted"
+
+
+def test_agents_are_told_not_to_end_their_turn_on_a_running_job():
+    out = run("accept")
+    assert all("Never end your turn while a job you started" in c["prompt"] for c in out["calls"])
+
+
 def test_setup_failure_returns_cleanly():
     r = run("setup_fail")["result"]
     assert r["status"] == "error" and r["final_overlay"] == ""

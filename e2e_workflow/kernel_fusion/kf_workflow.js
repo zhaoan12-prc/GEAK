@@ -103,6 +103,10 @@ NEVER run global or pattern-matched process cleanup (no \`pkill -f\`, \`killall\
 \`kill -- -PGID\` for a group you did not create). Manage ONLY processes you started, by the pid you captured.
 For any server you launch yourself: \`source ${WORKFLOW_DIR}/scripts/server_teardown.sh; trap server_teardown EXIT\`,
 launch with \`\${SERVER_LAUNCH_PREFIX:-} <server> &\`, then \`server_record_identity "$!"\`.
+Never end your turn while a job you started (a bench, a server, a capture) is still running: inside this
+workflow, ending the turn returns your result immediately and the job is killed with it. Wait in the
+foreground instead, in bounded chunks below the per-command limit (e.g. a loop that sleeps and checks for
+the job's result file for at most ~9 minutes, then call it again), until the job has finished.
 
 `;
 
@@ -199,12 +203,29 @@ let TRACE_DIR = TRACE_DIR_IN;
 let profileTopN = '';
 if (want('trace') && !TRACE_DIR_IN) {
   phase('Trace');
-  const prof = await safeAgent(roleAgent('profiler', 'baseline',
+  let prof = await safeAgent(roleAgent('profiler', 'baseline',
     'Capture a warm serving trace and emit the standardized Top-N. Keep the raw per-rank trace files on disk.', {
       EVAL_DIR, MODEL_PATH, GPU_ID: GPU_LIST[0], WORKLOAD, ROUND: 0,
       OVERLAY_PYTHONPATH: INIT_OVERLAY, EXTRA_SERVER_ARGS: INIT_FLAGS, EXTRA_ENV: INIT_ENV, SKILL_DIR: WORKFLOW_DIR,
     }), { phase: 'Trace', label: 'kf:profiler', schema: PROFILE_SCHEMA });
-  profileTopN = (prof && prof.profile_topN_json) || '';
+  let got = prof && prof.profile_topN_json && (prof.top_kernels || []).length;
+  if (!got) {
+    // A profiler that returned without a trace (killed capture, unfinished wait) must not hand TopK an
+    // empty dir: retry once, then stop the stage -- the e2e workflow still runs on the original stack.
+    log('[kf] profiler returned no Top-N; retrying the capture once.');
+    prof = await safeAgent(roleAgent('profiler', 'baseline',
+      'A previous attempt returned before its trace existed. Capture the warm serving trace again, wait for it ' +
+      'to finish, and emit the standardized Top-N. Keep the raw per-rank trace files on disk.', {
+        EVAL_DIR, MODEL_PATH, GPU_ID: GPU_LIST[0], WORKLOAD, ROUND: 0,
+        OVERLAY_PYTHONPATH: INIT_OVERLAY, EXTRA_SERVER_ARGS: INIT_FLAGS, EXTRA_ENV: INIT_ENV, SKILL_DIR: WORKFLOW_DIR,
+      }), { phase: 'Trace', label: 'kf:profiler (retry)', schema: PROFILE_SCHEMA });
+    got = prof && prof.profile_topN_json && (prof.top_kernels || []).length;
+  }
+  if (!got) {
+    return { eval_dir: KF_DIR, kf_dir: KF_DIR, status: 'error', reason: 'trace capture produced no Top-N (twice)',
+      accepted: [], final_overlay: INIT_OVERLAY };
+  }
+  profileTopN = prof.profile_topN_json;
   TRACE_DIR = `${EVAL_DIR}/profile`;
 }
 

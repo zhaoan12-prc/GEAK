@@ -1188,6 +1188,11 @@ identity (pid, pgid, /proc start time) before signalling anything:
     \${SERVER_LAUNCH_PREFIX:-} <launch server> &   # own session => pgid == pid
     SERVER_PID=\$!; server_record_identity "\$SERVER_PID"
 
+Never end your turn while a job you started (a bench, a server, a capture) is still running: inside this
+workflow, ending the turn returns your result immediately and the job is killed with it. Wait in the
+foreground instead, in bounded chunks below the per-command limit (e.g. a loop that sleeps and checks for
+the job's result file for at most ~9 minutes, then call it again), until the job has finished.
+
 `;
 function withProcessSafety(prompt) {
   return typeof prompt === 'string' ? PROCESS_SAFETY + prompt : prompt;
