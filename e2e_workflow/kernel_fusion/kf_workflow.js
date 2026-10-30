@@ -198,7 +198,11 @@ let profileTopN = '';
 if (want('trace') && !TRACE_DIR_IN) {
   phase('Trace');
   const prof = await safeAgent(roleAgent('profiler', 'baseline',
-    'Capture a warm serving trace and emit the standardized Top-N. Keep the raw per-rank trace files on disk.', {
+    'Capture a warm serving trace and emit the standardized Top-N. Keep the raw per-rank trace files on disk. ' +
+    'The PROFILE=1 lifecycle can run far longer than one foreground shell command may (an AgentX replay is a warmup leg, ' +
+    'a timed leg and a profiled leg): start bench_e2e.sh in the background and poll for the trace instead of blocking on it. ' +
+    'PROFILE_* variables already present in your environment (e.g. PROFILE_WARMUP_SEC, which places the window in steady ' +
+    'state) were set by the caller on purpose: keep them.', {
       EVAL_DIR, MODEL_PATH, GPU_ID: GPU_LIST[0], WORKLOAD, ROUND: 0,
       OVERLAY_PYTHONPATH: INIT_OVERLAY, EXTRA_SERVER_ARGS: INIT_FLAGS, EXTRA_ENV: INIT_ENV, SKILL_DIR: WORKFLOW_DIR,
     }), { phase: 'Trace', label: 'kf:profiler', schema: PROFILE_SCHEMA });
