@@ -82,6 +82,28 @@ adapter_bench() {
 # (and MEM/RPD activities) shrinks the trace ~an order of magnitude while KEEPING everything parse_profile
 # needs: the GPU kernel timeline, cpu_op Input Dims (record_shapes), and execute_* phase annotations.
 # Override via SGLANG_PROFILE_ACTIVITIES / SGLANG_PROFILE_WITH_STACK.
+# A trace file appears as soon as the server starts writing it (one per rank, ~10 MB of gzip each on a
+# large TP job). Returning on its first appearance let the caller tear the server down mid-write and
+# left every rank's .gz truncated. Wait until the file set and sizes stop changing and every .gz is whole.
+_profile_wait_flushed() {
+  local prev="" cur f ok i
+  for i in $(seq 1 "${PROFILE_FLUSH_POLLS:-60}"); do
+    cur=$(ls -l "$PROFILE_DIR"/*.trace.json* 2>/dev/null | awk '{print $5, $NF}')
+    if [ -n "$cur" ] && [ "$cur" = "$prev" ]; then
+      ok=1
+      for f in "$PROFILE_DIR"/*.trace.json.gz; do
+        [ -e "$f" ] || continue
+        gzip -t "$f" 2>/dev/null || { ok=0; break; }
+      done
+      [ "$ok" = 1 ] && return 0
+    fi
+    prev=$cur
+    sleep "${PROFILE_FLUSH_POLL_S:-3}"
+  done
+  echo "!!! profile trace(s) still changing or truncated after the flush wait" >&2
+  return 1
+}
+
 adapter_profile_window() {
   local before after
   before=$(ls "$PROFILE_DIR"/*.trace.json* 2>/dev/null | wc -l)
@@ -97,12 +119,12 @@ adapter_profile_window() {
   local deadline=$(( $(date +%s) + ${PROFILE_WINDOW_TIMEOUT:-180} ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
     after=$(ls "$PROFILE_DIR"/*.trace.json* 2>/dev/null | wc -l)
-    [ "$after" -gt "$before" ] && { sleep 2; return 0; }   # +2s for the write to flush
+    [ "$after" -gt "$before" ] && { _profile_wait_flushed; return; }
     sleep 3
   done
   # num_steps may not be honored on some builds — force a stop and re-check
   curl -sf -X POST "${BASE_URL}/stop_profile" >/dev/null 2>&1 || true
   sleep 3
   after=$(ls "$PROFILE_DIR"/*.trace.json* 2>/dev/null | wc -l)
-  [ "$after" -gt "$before" ]
+  [ "$after" -gt "$before" ] && _profile_wait_flushed
 }
