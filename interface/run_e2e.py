@@ -109,6 +109,9 @@ GEAK_ROOT = INTERFACE_DIR.parent
 E2E_DIR = GEAK_ROOT / "e2e_workflow"
 E2E_SCRIPT = E2E_DIR / "e2e_workflow.js"
 BENCH_SCRIPT = E2E_DIR / "scripts" / "bench_e2e.sh"
+# Optional KernelFusion stage (e2e_workflow/kernel_fusion), run before the main workflow; off by default.
+sys.path.insert(0, str(E2E_DIR / "kernel_fusion"))
+import kf_stage  # noqa: E402
 
 # Workflow primitives are only available at this effort tier (see README).
 CLAUDE_EFFORT = os.environ.get("GEAK_CLAUDE_EFFORT", "ultracode")
@@ -6565,7 +6568,7 @@ def main(argv: list[str]) -> int:
     if len(args) < 2:
         sys.stderr.write(
             "usage: run_e2e.py <handoff.json> <result.json> "
-            "[--timeout-s N] [--dry-run]\n"
+            "[--timeout-s N] [--dry-run] [--kernel-fusion|--no-kernel-fusion]\n"
         )
         return 2
     handoff_path, result_path = Path(args[0]), Path(args[1])
@@ -6612,6 +6615,7 @@ def main(argv: list[str]) -> int:
                           "agent_backend": runtime_combo_label(),
                           "runtime_selection": _runtime_selection_args() if USE_RUNTIME else None,
                           "runtime_script": str(RUNTIME_SCRIPT) if USE_RUNTIME else None,
+                          "kernel_fusion": kf_stage.dry_run_info(h, ps_args, timeout_s, flags),
                           "prompt": prompt, "e2e_script": str(E2E_SCRIPT)}, indent=2))
         return 0
 
@@ -6787,6 +6791,12 @@ def main(argv: list[str]) -> int:
                           "speedup": cached_out.get("throughput_speedup")}))
         return 0 if cached_out.get("status") != "error" else 1
 
+    # KernelFusion first when switched on; the main workflow then starts from its accepted overlay.
+    kf = kf_stage.run_stage(h, ps_args, timeout_s, globals(), flags)
+    if kf:
+        timeout_s = kf["main_timeout_s"]
+        prompt = build_prompt(ps_args)
+
     out: dict = {}
     wf: dict | None = None
     err: object = None
@@ -6809,6 +6819,8 @@ def main(argv: list[str]) -> int:
             sys.stderr.write(f"GEAK e2e failed [{err_class}]: {e}\n")
     finally:
         out = _emit(wf=wf, error=err, error_class=err_class)
+        if kf:
+            out = kf_stage.attach(result_path, out, kf)
 
     print(json.dumps({"status": out.get("status"),
                       "result_json": str(result_path),
