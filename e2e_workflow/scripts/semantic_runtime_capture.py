@@ -6,6 +6,7 @@ loads the model.  It records metadata only and wraps each selected module call
 in a profiler record_function marker so launched kernels can be proven to be
 contained by the wrapper that supplied the Shape.
 """
+import atexit
 import json
 import functools
 import importlib
@@ -27,6 +28,11 @@ _INSTALLED_CLASSES = set()
 _PATCHED_CALLABLES = set()
 _GRAPH_CAPTURE_PROFILER_INSTALLED = False
 _OPERATOR_SCHEMA_MANIFEST_DUMPED = False
+_WARNED_FORWARDS = set()
+_LAYER_ENTRY_STATS = {}
+# Calls a layer entry may make without resolving any main layer before its
+# locator is reported as wrong, per main layer: one forward enters each once.
+_LAYER_ENTRY_ZERO_HIT_FORWARDS = 2
 
 
 def _flag(name, default="0"):
@@ -392,6 +398,39 @@ def _phase_of(forward_batch):
         except Exception:
             pass
     return phase, batch_size, input_tokens
+
+
+def _warn(message):
+    sys.stderr.write("[GEAK_SEMANTICS][warn] %s\n" % message)
+
+
+def _arg_types(args):
+    return ", ".join(
+        "%d:%s" % (index, type(value).__name__)
+        for index, value in enumerate(args)) or "none"
+
+
+def _forward_batch_of(args, kwargs, where):
+    """The ForwardBatch of a model ``forward`` call, or None.
+
+    SGLang passes ``(input_ids, positions, forward_batch)``; another runtime or
+    model may order them differently, so any positional argument carrying
+    ``forward_mode`` is accepted.  Without one the phase context is left as it
+    was, so say so once per wrapper instead of mislabelling shapes silently.
+    """
+    if "forward_batch" in kwargs:
+        return kwargs["forward_batch"]
+    if len(args) >= 3 and hasattr(args[2], "forward_mode"):
+        return args[2]
+    for value in args:
+        if hasattr(value, "forward_mode"):
+            return value
+    if where not in _WARNED_FORWARDS:
+        _WARNED_FORWARDS.add(where)
+        _warn("%s got no forward_batch (positional %s; keywords %s); the "
+              "phase context is not set and shapes keep the previous phase"
+              % (where, _arg_types(args), sorted(kwargs) or "none"))
+    return None
 
 
 def _layer_id(path):
@@ -1004,6 +1043,7 @@ def install_hooks_only(model):
 # pattern document; run_semantics_1_2 hands it to this process as
 #   GEAK_SEMANTICS_LAYER_ENTRY_METHODS    method names on main-layer modules
 #   GEAK_SEMANTICS_LAYER_ENTRY_FUNCTIONS  ``module:function`` (layer is arg 0)
+#       or ``module:Class.method@<arg index>[.<attr>]``
 # Both are empty by default; nothing beyond ``forward`` is wrapped then.
 def _layer_entry_names(variable):
     return tuple(dict.fromkeys(
@@ -1052,35 +1092,133 @@ def _wrap_layer_entry_functions(model, logger):
                 "GEAK layer entry method %r is not defined on any main-layer "
                 "module" % name)
     by_module = {id(m): (layer, path) for m, layer, path in layer_paths.values()}
-    for target in functions:
+    for raw_target in functions:
+        # ``module:function`` takes the layer as argument 0.  A class attribute
+        # ``module:Class.method`` may locate it with ``@<index>[.<attr>]``
+        # (positional index, ``self`` counts; ``attr`` read off that argument),
+        # e.g. a monokernel backbone whose per-layer call receives a record
+        # holding the layer module.
+        target, _, locator = raw_target.partition("@")
         module_name, sep, attr = target.partition(":")
         if not sep or not module_name or not attr:
             raise RuntimeError(
                 "invalid GEAK layer entry function %r; expected module:function"
-                % target)
+                % raw_target)
+        arg_index, layer_attr = 0, ""
+        if locator:
+            index_text, _, layer_attr = locator.partition(".")
+            if not index_text.isdigit():
+                raise RuntimeError(
+                    "invalid GEAK layer entry locator %r; expected "
+                    "@<arg index>[.<attr>]" % raw_target)
+            arg_index = int(index_text)
         namespace = importlib.import_module(module_name)
-        original = getattr(namespace, attr, None)
+        holder = namespace
+        parts = attr.split(".")
+        for part in parts[:-1]:
+            holder = getattr(holder, part, None)
+            if holder is None:
+                raise RuntimeError(
+                    "GEAK layer entry function owner is missing: %s" % raw_target)
+        attr = parts[-1]
+        original = getattr(holder, attr, None)
         if not callable(original):
             raise RuntimeError(
-                "GEAK layer entry function is not callable: %s" % target)
+                "GEAK layer entry function is not callable: %s" % raw_target)
         if getattr(original, "_geak_semantics_entry_wrapped", False):
             continue
+        _check_layer_arg(original, arg_index, raw_target)
+        stats = _LAYER_ENTRY_STATS[raw_target] = {
+            "calls": 0, "hits": 0, "misses": {},
+            "zero_hit_limit": _LAYER_ENTRY_ZERO_HIT_FORWARDS * len(layer_paths)}
 
         @functools.wraps(original)
-        def scoped_function(layer_module, *args, __fn=original, **kwargs):
-            owner = by_module.get(id(layer_module))
+        def scoped_function(*args, __fn=original, __target=raw_target,
+                            __index=arg_index, __attr=layer_attr,
+                            __stats=stats, **kwargs):
+            owner = _resolve_entry_layer(
+                __stats, __target, args, __index, __attr, by_module)
             if owner is None:
-                return __fn(layer_module, *args, **kwargs)
+                return __fn(*args, **kwargs)
             with logger.layer_scope(owner[0], owner[1]), \
                     logger.layer_active(owner[0], owner[1]):
-                return __fn(layer_module, *args, **kwargs)
+                return __fn(*args, **kwargs)
 
         scoped_function._geak_semantics_entry_wrapped = True
-        setattr(namespace, attr, scoped_function)
+        setattr(holder, attr, scoped_function)
         wrapped += len(layer_paths)
         sys.stderr.write(
-            "[GEAK_SEMANTICS] layer scope wrapped %s\n" % target)
+            "[GEAK_SEMANTICS] layer scope wrapped %s\n" % raw_target)
     return wrapped
+
+
+def _check_layer_arg(fn, index, raw_target):
+    """Refuse a layer argument index the callable can never receive."""
+    try:
+        parameters = list(inspect.signature(fn).parameters.values())
+    except (TypeError, ValueError):
+        return
+    if any(p.kind == p.VAR_POSITIONAL for p in parameters):
+        return
+    positional = [p.name for p in parameters if p.kind in (
+        p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+    if index >= len(positional):
+        raise RuntimeError(
+            "GEAK layer entry %s locates the layer at argument %d but the "
+            "callable takes %d positional argument(s) %s (self counts)"
+            % (raw_target, index, len(positional), positional))
+
+
+def _resolve_entry_layer(stats, target, args, index, attr, by_module):
+    """The (layer id, path) a layer entry call runs, or None, counting why not.
+
+    A wrong ``@<index>.<attr>`` locator otherwise looks exactly like "this
+    entry never ran a main layer".  Each kind of miss is reported the first
+    time it happens; a draft or non-main layer is an expected miss, so the
+    locator is called wrong only when no call resolves a main layer at all.
+    """
+    stats["calls"] += 1
+    if len(args) <= index:
+        reason, detail = "missing_arg", "no positional argument %d" % index
+    else:
+        candidate = args[index]
+        if attr and not hasattr(candidate, attr):
+            reason, detail = "missing_attr", "argument %d (%s) has no .%s" % (
+                index, type(candidate).__name__, attr)
+        else:
+            candidate = getattr(candidate, attr) if attr else candidate
+            owner = by_module.get(id(candidate))
+            if owner is not None:
+                stats["hits"] += 1
+                return owner
+            reason, detail = "not_main_layer", (
+                "argument %d%s is a %s, not a main-layer module (expected for "
+                "draft or non-main layers)" % (
+                    index, "." + attr if attr else "",
+                    type(candidate).__name__))
+    misses = stats["misses"]
+    misses[reason] = misses.get(reason, 0) + 1
+    if misses[reason] == 1:
+        _warn("layer entry %s: %s; call arguments %s"
+              % (target, detail, _arg_types(args)))
+    if not stats["hits"] and stats["calls"] == stats["zero_hit_limit"]:
+        _warn("layer entry %s ran %d times without resolving a main layer; "
+              "check its layer_arg / layer_attr (misses %s)"
+              % (target, stats["calls"], misses))
+    return None
+
+
+def _report_layer_entry_stats():
+    for target, stats in sorted(_LAYER_ENTRY_STATS.items()):
+        line = "layer entry %s: calls=%d hits=%d misses=%s" % (
+            target, stats["calls"], stats["hits"], stats["misses"])
+        if stats["calls"] and not stats["hits"]:
+            _warn(line + "; it never resolved a main layer")
+        else:
+            sys.stderr.write("[GEAK_SEMANTICS] %s\n" % line)
+
+
+atexit.register(_report_layer_entry_stats)
 
 
 def install_on_model(model, is_draft=False):
@@ -1107,8 +1245,8 @@ def install_on_model(model, is_draft=False):
         def wrapped_forward(self, *args, **kwargs):
             if getattr(self, "_geak_semantics_draft", False):
                 return original_forward(self, *args, **kwargs)
-            forward_batch = args[2] if len(args) >= 3 else None
-            forward_batch = kwargs.get("forward_batch", forward_batch)
+            forward_batch = _forward_batch_of(
+                args, kwargs, "%s.forward" % model_class.__name__)
             if forward_batch is not None:
                 logger.set_context(*_phase_of(forward_batch))
             if not getattr(self, "_geak_semantics_hooked", False):
@@ -1124,6 +1262,34 @@ def install_on_model(model, is_draft=False):
     elif not getattr(model, "_geak_semantics_hooked", False):
         _register_hooks(model)
         model._geak_semantics_hooked = True
+    # A runtime may install its own per-instance ``forward`` during load_model
+    # (e.g. SGLang's --monokernel-backend shape dispatcher).  The instance
+    # attribute shadows the class wrapper above, so the phase context would
+    # never be set and no hook registered.  Wrap the instance attribute too.
+    instance_forward = model.__dict__.get("forward")
+    if instance_forward is not None and not getattr(
+            instance_forward, "_geak_semantics_instance_wrapped", False):
+
+        @functools.wraps(instance_forward)
+        def wrapped_instance_forward(*args, __fn=instance_forward,
+                                     __model=model, **kwargs):
+            forward_batch = _forward_batch_of(
+                args, kwargs, "instance forward of %s" % model_class.__name__)
+            if forward_batch is not None:
+                logger.set_context(*_phase_of(forward_batch))
+            if not getattr(__model, "_geak_semantics_hooked", False):
+                _register_hooks(__model)
+                __model._geak_semantics_hooked = True
+            result = __fn(*args, **kwargs)
+            if forward_batch is not None:
+                logger.mark_forward()
+            return result
+
+        wrapped_instance_forward._geak_semantics_instance_wrapped = True
+        model.forward = wrapped_instance_forward
+        sys.stderr.write(
+            "[GEAK_SEMANTICS] wrapped instance forward of %s\n"
+            % model_class.__name__)
     _install_callable_probes()
     sys.stderr.write(
         "[GEAK_SEMANTICS] wrapped %s.forward\n" % model_class.__name__)

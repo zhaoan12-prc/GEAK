@@ -384,6 +384,13 @@ def layer_entry_env(layer_entry_callables):
         if item.get("kind") == "method":
             methods.append(target)
         elif item.get("kind") == "function":
+            # Optional layer locator: ``target@<arg index>[.<attr>]``.
+            layer_arg = item.get("layer_arg")
+            layer_attr = item.get("layer_attr")
+            if layer_arg is not None or layer_attr:
+                target += "@%d" % int(layer_arg or 0)
+                if layer_attr:
+                    target += "." + str(layer_attr)
             functions.append(target)
     return ",".join(methods), ",".join(functions)
 

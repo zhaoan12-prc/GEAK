@@ -306,9 +306,12 @@ class LayerEntryEnvTest(unittest.TestCase):
         methods, functions = capture.layer_entry_env([
             {"kind": "method", "target": "forward_entry"},
             {"kind": "function", "target": "pkg.model:run_layer"},
+            {"kind": "function", "target": "pkg.mono:Backbone._layer",
+             "layer_arg": 1, "layer_attr": "module"},
         ])
         self.assertEqual(methods, "forward_entry")
-        self.assertEqual(functions, "pkg.model:run_layer")
+        self.assertEqual(functions,
+                         "pkg.model:run_layer,pkg.mono:Backbone._layer@1.module")
         self.assertEqual(capture.layer_entry_env(None), ("", ""))
 
 

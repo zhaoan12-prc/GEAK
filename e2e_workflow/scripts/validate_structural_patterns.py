@@ -172,7 +172,9 @@ def _validate_layer_entry_callables(entries, source_by_path):
     Needed only when main layers bypass ``layer.forward``. A ``method`` is an
     attribute name on the main-layer module; a ``function`` is
     ``module:function`` in the module that calls it, taking the layer as its
-    first argument. Each entry cites the runtime source like a layer does.
+    first argument, or ``module:Class.method`` with ``layer_arg`` /
+    ``layer_attr`` locating the layer. Each entry cites the runtime source
+    like a layer does.
     """
     if entries in (None, []):
         return []
@@ -189,12 +191,32 @@ def _validate_layer_entry_callables(entries, source_by_path):
             if not _IDENTIFIER_RE.match(target):
                 raise ValueError(
                     "layer entry method must be an attribute name: %r" % target)
+            if "layer_arg" in entry or "layer_attr" in entry:
+                raise ValueError(
+                    "layer_arg / layer_attr apply to function entries only: %r"
+                    % target)
         elif kind == "function":
+            # ``module:function`` (layer is argument 0), or a class attribute
+            # ``module:Class.method`` whose layer is reached through
+            # ``layer_arg`` (positional index, ``self`` counts) and optionally
+            # ``layer_attr`` (e.g. a per-layer record holding ``.module``).
             module_name, sep, attr = target.partition(":")
             if not (sep and _MODULE_RE.match(module_name)
-                    and _IDENTIFIER_RE.match(attr)):
+                    and _MODULE_RE.match(attr)):
                 raise ValueError(
                     "layer entry function must be module:function: %r" % target)
+            if "layer_arg" in entry:
+                layer_arg = entry.get("layer_arg")
+                if (not isinstance(layer_arg, int) or isinstance(layer_arg, bool)
+                        or layer_arg < 0):
+                    raise ValueError(
+                        "layer entry layer_arg must be a non-negative int: %r"
+                        % (layer_arg,))
+            if entry.get("layer_attr") is not None and not _IDENTIFIER_RE.match(
+                    str(entry.get("layer_attr"))):
+                raise ValueError(
+                    "layer entry layer_attr must be an attribute name: %r"
+                    % (entry.get("layer_attr"),))
         else:
             raise ValueError(
                 "layer entry kind must be method or function: %r" % kind)

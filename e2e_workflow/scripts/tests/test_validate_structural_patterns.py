@@ -112,6 +112,19 @@ class ValidateStructuralPatternsTest(unittest.TestCase):
                          ["forward_entry", "pkg.model:run_layer"])
         self.assertTrue(entries[0]["source_evidence"][0]["sha256"])
 
+    def test_class_method_entries_take_a_validated_layer_locator(self):
+        entry = dict(self._entry("function", "pkg.mono:Backbone._layer"),
+                     layer_arg=1, layer_attr="module")
+        self._with_layer_entries([entry])
+        result = validator.validate(self.patterns, self.config, [self.source])
+        self.assertEqual(result["layer_entry_callables"][0]["layer_arg"], 1)
+        for bad in (dict(entry, layer_arg=-1), dict(entry, layer_arg=True),
+                    dict(entry, layer_attr="a.b"),
+                    dict(self._entry("method", "forward_entry"), layer_arg=1)):
+            self._with_layer_entries([bad])
+            with self.assertRaises(ValueError):
+                validator.validate(self.patterns, self.config, [self.source])
+
     def test_layer_entry_callables_are_absent_by_default(self):
         self._write()
         result = validator.validate(self.patterns, self.config, [self.source])
