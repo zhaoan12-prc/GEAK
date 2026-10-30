@@ -533,6 +533,14 @@ PROFILE_TARGET_STEPS=$(python3 -c "import math;print(math.ceil($CONC*$ISL/max(${
 # profiler after N worker steps; default to the workload target clamped to the step cap (bounds the buffer).
 PROFILE_MAX_ITERS=${PROFILE_MAX_ITERS:-$(( PROFILE_TARGET_STEPS < PROFILE_NUM_STEPS_MAX ? PROFILE_TARGET_STEPS : PROFILE_NUM_STEPS_MAX ))}
 PROFILE_DELAY_ITERS=${PROFILE_DELAY_ITERS:-0}       # steps to skip before arming; 0 keeps the prefill burst
+# A client that owns its load (an AgentX replay) has a ramp of its own, so it may publish
+# adapter_profile_warmup_s() to place the window in steady state. An explicit PROFILE_WARMUP_SEC
+# always wins; no hook => unchanged 0.
+if [ -z "${PROFILE_WARMUP_SEC:-}" ] && declare -F adapter_profile_warmup_s >/dev/null; then
+  PROFILE_WARMUP_SEC="$(adapter_profile_warmup_s 2>/dev/null || echo 0)"
+  case "$PROFILE_WARMUP_SEC" in ''|*[!0-9]*) PROFILE_WARMUP_SEC=0 ;; esac
+  echo ">>> profile window placed by the $BENCH_CLIENT client adapter: warmup ${PROFILE_WARMUP_SEC}s"
+fi
 PROFILE_WARMUP_SEC=${PROFILE_WARMUP_SEC:-0}         # 0 = arm at load start so prefill is captured too
 PROFILE_NUM_PROMPTS=${PROFILE_NUM_PROMPTS:-$((CONC * 4))}   # >CONC so the queue stays saturated
 PROFILE_REQUEST_RATE=${PROFILE_REQUEST_RATE:-}      # optional req/s to stagger arrivals; empty = inf
@@ -835,6 +843,11 @@ PY
     sleep "$PROFILE_WARMUP_SEC"
     if kill -0 "$_bg_load" 2>/dev/null; then
       adapter_profile_window || echo "!!! profile window failed"
+    elif [ "${GEAK_ISL_OSL_INACTIVE:-0}" = "1" ]; then
+      # A trace replay is not expressible as ISL/OSL: the synthetic fallback below would profile a
+      # different workload and hand it on looking exactly like the real one. No trace is honest.
+      echo "!!! the replay ended before the profile window opened (warmup ${PROFILE_WARMUP_SEC}s) -- NO trace captured;" \
+           "lower AGENTX_PROFILE_WARMUP_S or profile a longer leg." >&2
     else
       echo "!!! background load exited before the profile window (load too short?) — falling back"
       adapter_bench "$PROFILE_NUM_PROMPTS" "$CONC" 1 || echo "!!! profile run failed"

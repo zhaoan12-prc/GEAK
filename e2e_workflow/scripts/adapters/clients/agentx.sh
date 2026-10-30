@@ -13,6 +13,33 @@
 # Requires: aiperf on PATH (or AIPERF_BIN), INFERENCEX_PATH with map_aiperf.py
 # deployed under benchmarks/ (Hyperloom's AgentX runtime copies it there).
 
+# _agentx_duration — the measured window for THIS leg. Shared by the bench and by the
+# profile-window placement below so the two never disagree about how long the replay runs.
+_agentx_duration() {
+  case "${MEASUREMENT_PURPOSE:-search}" in
+    parity|validation) echo "${GEAK_AGENTX_DURATION_S:-3600}" ;;
+    *)                 echo "${GEAK_AGENTX_LOOP_DURATION_S:-900}" ;;
+  esac
+}
+
+# adapter_profile_warmup_s — OPTIONAL hook read by bench_e2e.sh: seconds after load start before
+# the profiler window opens. bench_e2e.sh's default of 0 suits a synthetic sweep; here it records
+# the replay's ramp -- cold long-context prefill while aiperf resolves the corpus and warms each
+# lane -- and no decode at all (a Muse Spark c4 capture at 0 s was 32/32 EXTEND steps). So the
+# window goes into steady state: 75% into the replay, never past 2700 s (the InferenceX reference
+# client's delay for the canonical 3600 s window), and early enough to close before the replay
+# ends. AGENTX_PROFILE_WARMUP_S overrides; an explicit PROFILE_WARMUP_SEC outranks both.
+adapter_profile_warmup_s() {
+  if [ -n "${AGENTX_PROFILE_WARMUP_S:-}" ]; then
+    echo "$AGENTX_PROFILE_WARMUP_S"
+    return 0
+  fi
+  local dur reserve
+  dur="$(_agentx_duration)"
+  reserve=$(( ${PROFILE_WINDOW_SEC:-20} + 60 ))   # the capture plus the trace flush
+  "${PYTHON_BIN:-python3}" -c "import sys; d, r = int(float(sys.argv[1])), int(sys.argv[2]); print(max(0, min(int(d * 0.75), 2700, d - r)))" "$dur" "$reserve"
+}
+
 adapter_bench() {
   local NUMP="$1" MAXC="$2" PROF="${3:-0}"
 
@@ -54,13 +81,9 @@ adapter_bench() {
   local corpus="${AGENTX_DATASET:-${WEKA_LOADER_OVERRIDE:-semianalysis_cc_traces_weka_062126_256k}}"
   local nent="${AGENTX_NUM_ENTRIES:-393}"
   local conc="${CONC:-${MAXC:-8}}"
-  local full_dur="${GEAK_AGENTX_DURATION_S:-3600}"
-  local loop_dur="${GEAK_AGENTX_LOOP_DURATION_S:-900}"
   local purpose="${MEASUREMENT_PURPOSE:-search}"
-  local duration="$loop_dur"
-  if [ "$purpose" = "parity" ] || [ "$purpose" = "validation" ]; then
-    duration="$full_dur"
-  fi
+  local duration
+  duration="$(_agentx_duration)"
 
   # ── Non-canonical workloads may run, but may never look submittable ────────
   # Mirrors aiperf_client.sh: the SCENARIO cannot police this for us. It has no
