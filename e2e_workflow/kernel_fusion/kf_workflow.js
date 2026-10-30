@@ -37,6 +37,20 @@ const WORKLOAD = { isl: parseInt(A.isl != null ? A.isl : 1024, 10), osl: parseIn
   conc: parseInt(A.conc != null ? A.conc : 64, 10), shape_provenance: String(A.workload_shape_provenance || 'handoff_workload') };
 const INIT_FLAGS = String(A.initial_extra_server_args || '');
 const INIT_ENV = String(A.initial_extra_env || '');
+// Synthetic speculative acceptance (InferenceX AgentX throughput runs force the golden acceptance
+// length). Such a server accepts draft tokens whether or not they are right, so its outputs -- and any
+// parity / gsm8k gate read from them -- are meaningless. Throughput legs keep it; correctness runs on
+// the same stack + overlay with it removed.
+const SYNTH_ACC = /^(SGLANG_SIMULATE_ACC_\w*|TILERT_SIMULATE_ACC_\w*|TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS)=/;
+const envTokens = INIT_ENV.split(/\s+/).filter(Boolean);
+const CORRECTNESS_ENV = envTokens.filter((t) => !SYNTH_ACC.test(t)).join(' ');
+const ACC_RULE = CORRECTNESS_ENV === envTokens.join(' ') ? '' :
+  ' CORRECTNESS RULE: CURRENT_ENV/EXTRA_ENV force synthetic speculative acceptance (' +
+  envTokens.filter((t) => SYNTH_ACC.test(t)).map((t) => t.split('=')[0]).join(', ') + '), so that server\'s outputs are ' +
+  'not the model\'s. Measure throughput with the env exactly as given, but run EVERY output-parity / accuracy (gsm8k) ' +
+  'check on servers launched with CORRECTNESS_ENV instead (same flags, same overlay per side), and say so in notes.';
+// Operator constraints for every agent of this stage (e.g. paths it must not read).
+const KF_TASK = String(A.kf_task || '');
 const INIT_OVERLAY = String(A.initial_overlay_pythonpath || '');
 const EFFECTIVE_CONFIG_DIGEST = String(A.effective_config_digest || '');
 const MEASUREMENT_MODE = String(A.measurement_mode || 'warm_server');
@@ -108,6 +122,7 @@ GPU=${SERVING_GPU} in the bench_e2e.sh env. GPU_IDS=${GPU_IDS} is only for singl
 ## Inputs
 ${cfg(inall)}
 
+${KF_TASK ? `\n## Operator constraints\n${KF_TASK}\n` : ''}
 Return ONLY the structured JSON the role file specifies.`;
 }
 
@@ -245,7 +260,7 @@ ${cfg({ EVAL_DIR, TRACE_DIR, WORKLOAD_SUMMARY: WORKLOAD_SUMMARY || '(none)', PRO
     MODEL_PATH, BACKEND, SERVING_TP, SERVER_FLAGS: INIT_FLAGS, SERVER_ENV: INIT_ENV, LAUNCH_SCRIPT: LAUNCH_SCRIPT || '(none)',
     WORKLOAD, OVERLAY: INIT_OVERLAY || '(none)' })}
 
-Return JSON: {"topk_json": "${OUT}/topk.json", "report_path": "<main report the prompt asks for>",
+${KF_TASK ? `## Operator constraints\n${KF_TASK}\n\n` : ''}Return JSON: {"topk_json": "${OUT}/topk.json", "report_path": "<main report the prompt asks for>",
 "digest_md": "${OUT}/digest/digest.md", "candidates": <topk.json candidates>, "recommended": <ids>, "notes": "..."}`,
   { phase: 'TopK', label: 'kf:analyst', schema: TOPK_SCHEMA });
   log(`[kf] topk: ${topk ? topk.candidates.length : 0} candidates, recommended ${topk ? JSON.stringify(topk.recommended) : '[]'}`);
@@ -364,13 +379,14 @@ async function integrateOne(r) {
       pct_gpu_time: c.region_pct_device_time || 0, live_call_seam: seamOf(c),
       parity_note: c.bitwise_exact ? 'expected_exact' : 'expected_close' },
     CURRENT_OVERLAY: curOverlay, CURRENT_FLAGS: INIT_FLAGS, CURRENT_ENV: INIT_ENV, CURRENT_THROUGHPUT: curTput,
+    ...(ACC_RULE ? { CORRECTNESS_ENV } : {}),
   };
   let integ = await safeAgent(roleAgent('e2e_integrator', 'integrate',
-    'Overlay this fused kernel back onto the live server and gate it on the e2e A/B.', inputs),
+    'Overlay this fused kernel back onto the live server and gate it on the e2e A/B.' + ACC_RULE, inputs),
     { phase: 'ApplyBack', label: `kf:integrate ${c.id}`, schema: INTEGRATE_SCHEMA });
   for (let t = 1; t <= AB_FINISH_RETRIES && !(integ && integ.gate !== 'incomplete' && integ.ab_complete !== false); t++) {
     integ = await safeAgent(roleAgent('e2e_integrator', 'integrate',
-      'FINISH this e2e A/B: reuse a reference leg already on disk if usable, run the missing leg, then return the gate.',
+      'FINISH this e2e A/B: reuse a reference leg already on disk if usable, run the missing leg, then return the gate.' + ACC_RULE,
       { ...inputs, RESUME_AB: true }), { phase: 'ApplyBack', label: `kf:integrate ${c.id} (finish ${t})`, schema: INTEGRATE_SCHEMA });
   }
   return integ;
@@ -406,12 +422,12 @@ if (result.accepted.length) {
   phase('ApplyBack');
   const v = await safeAgent(roleAgent('director', 'validate',
     'Independently re-measure the KernelFusion stack against the true baseline + output parity and arbitrate. ' +
-    'This stage has no architect/final report: skip report reconciliation (step 7), and APPLY_TO_ORIGINAL=false.', {
+    'This stage has no architect/final report: skip report reconciliation (step 7), and APPLY_TO_ORIGINAL=false.' + ACC_RULE, {
       EVAL_DIR, MODEL_PATH, GPU_ID: GPU_LIST[0], BASELINE_THROUGHPUT: baseTput, NOISE_BAND_PCT: noiseBand,
       BASELINE_OVERLAY: INIT_OVERLAY, FINAL_OVERLAY: curOverlay, FINAL_FLAGS: { flags: INIT_FLAGS, env: INIT_ENV },
       CLAIMED_THROUGHPUT: curTput, WORKLOAD, APPLY_TO_ORIGINAL: 'false',
       MEASUREMENT_MODE: VALIDATION_MODE, MEASUREMENT_PURPOSE: 'validation', REPLICAS: VALIDATION_REPLICAS,
-      SKILL_DIR: WORKFLOW_DIR,
+      SKILL_DIR: WORKFLOW_DIR, ...(ACC_RULE ? { CORRECTNESS_ENV } : {}),
     }), { phase: 'ApplyBack', label: 'kf:director:validate', schema: VALIDATE_SCHEMA });
   result.validation = v || { validation_status: 'error', notes: 'validate returned nothing' };
   if (v && v.validation_status === 'validated_win' && v.throughput_speedup > 1) {

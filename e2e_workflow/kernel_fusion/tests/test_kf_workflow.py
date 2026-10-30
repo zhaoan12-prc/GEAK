@@ -53,6 +53,13 @@ def test_accept_path_reuses_geak_roles_and_confirms_the_stack():
     assert f"FINAL_OVERLAY: {KF}/overlay/cand_accepted" in validate and "MEASUREMENT_MODE: isolated_server" in validate
     assert "REPLICAS: 2" in validate
     assert r["status"] == "accepted" and r["final_overlay"] == f"{KF}/overlay/cand_accepted"
+    # synthetic acceptance stays on for throughput, off for every correctness check
+    for p in (integ, validate):
+        assert "CORRECTNESS RULE" in p and "SGLANG_SIMULATE_ACC_LEN, SGLANG_SIMULATE_ACC_METHOD" in p
+        assert "CORRECTNESS_ENV: SGLANG_USE_AITER=1 HF_HUB_OFFLINE=1\n" in p
+    assert "CURRENT_ENV: SGLANG_USE_AITER=1 SGLANG_SIMULATE_ACC_LEN=4.05" in integ
+    # operator constraints reach every agent
+    assert all("Do not read /answers." in c["prompt"] for c in out["calls"])
     assert r["throughput_speedup"] == pytest.approx(1.025)          # the director's combined number
     assert [a["id"] for a in r["accepted"]] == ["c1"]
     assert rejected(r) == [("c2", "author")]

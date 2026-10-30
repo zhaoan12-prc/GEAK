@@ -41,8 +41,13 @@ GEAK_KERNEL_FUSION=1|0                                     # env
 | `author_k` | `GEAK_KF_AUTHOR_K` | 3 | recommended candidates to implement |
 | `kernel_budget` | `GEAK_KF_KERNEL_BUDGET` | 4 | kernel-layer rounds per candidate |
 | `validation_mode` / `validation_replicas` | `GEAK_KF_VALIDATION_MODE` / `_REPLICAS` | `isolated_server` / 2 | the director's combined confirmation of the whole fused stack |
+| `task` | `GEAK_KF_TASK` | — | operator constraints appended to every agent prompt (e.g. directories it must not read) |
 | `budget_s` | `GEAK_KF_BUDGET_S` | min(12 h, ⅓ of the run) | stage wall clock; the main workflow gets the rest |
 | `kf_dir` | `GEAK_KF_DIR` | `<exp_root>/kf_<main eval dir suffix>` | stage output dir |
+
+Synthetic speculative acceptance (`SGLANG_SIMULATE_ACC_*`, `TILERT_SIMULATE_ACC_*`,
+`TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS`, as InferenceX AgentX throughput runs set) stays on for
+throughput legs; every parity / gsm8k check of the apply step runs on servers without it.
 
 ## Outputs
 

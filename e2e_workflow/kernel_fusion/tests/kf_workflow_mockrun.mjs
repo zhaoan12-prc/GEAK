@@ -62,7 +62,8 @@ const phase = () => {};
 const log = () => {};
 
 const args = { workflow_dir: WF_DIR, kf_dir: KF, model_path: '/models/M', gpu_ids: '0,1', tp: 2,
-  kf_prompt: '/prompts/p.txt', agent_timeout_ms: 0 };
+  kf_prompt: '/prompts/p.txt', agent_timeout_ms: 0, kf_task: 'Do not read /answers.',
+  initial_extra_env: 'SGLANG_USE_AITER=1 SGLANG_SIMULATE_ACC_LEN=4.05 SGLANG_SIMULATE_ACC_METHOD=match-expected HF_HUB_OFFLINE=1' };
 if (scenario === 'analysis_only') Object.assign(args, { kf_steps: 'topk', kf_trace_dir: '/traces/x' });
 
 const src = (await readFile(`${WF_DIR}/kernel_fusion/kf_workflow.js`, 'utf8'))
