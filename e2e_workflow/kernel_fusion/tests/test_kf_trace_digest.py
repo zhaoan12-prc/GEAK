@@ -65,6 +65,25 @@ def test_synthetic_digest(tmp_path):
     assert ext["steps"] == 1
 
 
+def test_skips_truncated_and_kernel_less_traces(tmp_path):
+    """A failed capture leaves a truncated .gz (and maybe a salvaged CPU-only JSON) next to the
+    good re-capture; the digest must use the good one, whatever the names sort to."""
+    pt = tmp_path / "traces" / "round_0"
+    pt.mkdir(parents=True)
+    good = pt / "200-TP-0.trace.json.gz"
+    synthetic(good)
+    os.utime(good, (1, 1))                                   # oldest
+    whole = (pt / "200-TP-0.trace.json.gz").read_bytes()
+    (pt / "100-TP-0.trace.json.gz").write_bytes(whole[: len(whole) // 2])   # truncated, newer
+    (pt / "salvaged-TP-0.trace.json").write_text(json.dumps(
+        {"traceEvents": [{"ph": "X", "cat": "cpu_op", "name": "aten::mm", "ts": 1, "dur": 1}]}))
+    assert D.main(["--trace-dir", str(tmp_path / "traces"), "--out", str(tmp_path / "out")]) == 0
+    d = json.loads((tmp_path / "out" / "digest.json").read_text())["groups"]["round_0"]
+    assert d["trace"] == str(good) and d["step_kinds"]["DECODE"]["steps"] == 2
+    (good).unlink()
+    assert D.main(["--trace-dir", str(tmp_path / "traces"), "--out", str(tmp_path / "out2")]) == 3
+
+
 def test_short_name():
     assert D.short_name("_ZN5aiter26cross_device_reduce_1stageIDF16bLi8ELb0EEEvPNS_8R") == "aiter::cross_device_reduce_1stage"
     assert D.short_name("void at::native::reduce_kernel<512, 1>(at::native::ReduceOp<float>)").startswith("at::native::reduce_kernel<512")

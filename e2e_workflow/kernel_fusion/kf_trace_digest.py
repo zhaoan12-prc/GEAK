@@ -66,7 +66,9 @@ def load_events(path: str) -> list[dict]:
     return doc.get("traceEvents", []) if isinstance(doc, dict) else doc
 
 
-def discover(trace_dir: str, rank: int) -> dict[str, str]:
+def discover(trace_dir: str, rank: int) -> dict[str, list[str]]:
+    """Per group, the candidate files to try: the wanted rank first, newest first (a re-capture
+    lands next to the files of a failed one)."""
     groups: dict[str, list[str]] = defaultdict(list)
     for root, _dirs, files in os.walk(trace_dir, followlinks=True):
         if "capture_traces" in root.split(os.sep):
@@ -76,9 +78,9 @@ def discover(trace_dir: str, rank: int) -> dict[str, str]:
                 groups[os.path.relpath(root, trace_dir) or "."].append(os.path.join(root, fn))
     picked = {}
     for g, files in sorted(groups.items()):
-        files.sort()
+        files.sort(key=lambda f: (-os.path.getmtime(f), f))
         ranked = [f for f in files if (m := RANK_RE.search(os.path.basename(f))) and int(m.group(1)) == rank]
-        picked[g] = (ranked or files)[0]
+        picked[g] = ranked + [f for f in files if f not in ranked]
     return picked
 
 
@@ -253,14 +255,27 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
     picked = dict(discover(a.trace_dir, a.rank)) if a.trace_dir else {}
     for t in a.trace:
-        picked[os.path.basename(os.path.dirname(os.path.abspath(t))) + "/" + os.path.basename(t)] = t
+        picked[os.path.basename(os.path.dirname(os.path.abspath(t))) + "/" + os.path.basename(t)] = [t]
     if not picked:
         sys.stderr.write("no trace files found\n")
         return 2
     os.makedirs(a.out, exist_ok=True)
     groups = {}
-    for g, path in picked.items():
-        d = digest_trace(path, a.top)
+    for g, cands in picked.items():
+        d = None
+        for path in cands:
+            try:
+                d = digest_trace(path, a.top)
+            except (OSError, EOFError, ValueError) as e:   # truncated .gz, cut-off JSON
+                sys.stderr.write(f"skip unreadable trace {path}: {type(e).__name__}: {e}\n")
+                continue
+            if d["num_kernels"]:
+                break
+            sys.stderr.write(f"skip trace without GPU kernels {path}\n")
+            d = None
+        if d is None:
+            sys.stderr.write(f"group {g}: no usable trace\n")
+            continue
         safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", g).strip("_") or "trace"
         for kind, s in d["step_kinds"].items():
             s["seq_file"] = os.path.join(a.out, f"seq_{safe}_{kind}.tsv")
@@ -270,6 +285,9 @@ def main(argv: list[str] | None = None) -> int:
                     f.write(f"{i}\t{r['kernel']}\t{r['dur_us']}\t{r['gap_us']}\t{r['stream']}\t"
                             f"{r['launch']}\t{r['cpu_op']}\t{r['frame']}\n")
         groups[g] = d
+    if not groups:
+        sys.stderr.write("no usable trace (all unreadable or without GPU kernels)\n")
+        return 3
     with open(os.path.join(a.out, "digest.json"), "w") as f:
         json.dump({"schema": "geak.kf_trace_digest/1", "groups": groups}, f, indent=1)
     with open(os.path.join(a.out, "digest.md"), "w") as f:
