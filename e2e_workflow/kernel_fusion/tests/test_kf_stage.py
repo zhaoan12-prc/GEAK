@@ -99,6 +99,18 @@ def test_run_stage_accepts_and_folds_overlay(tmp_path):
     assert kf2["reused"] and not seen2 and pa2["initial_overlay_pythonpath"] == "/kf/overlay/cand_c1"
 
 
+def test_analysis_reports_are_written_by_the_stage(tmp_path):
+    pa = ps_args(tmp_path)
+    kf_dir = kf_stage.kf_dir_for({}, pa)
+    rep = str(kf_dir) + "/analysis/REPORT.md"
+    R, _ = fake_R({"status": "analysis_only", "eval_dir": str(kf_dir),
+                   "analysis_files": {rep: "# r", "/etc/evil.md": "x"}})
+    kf_stage.run_stage({"kernel_fusion": True}, pa, 36000, R)
+    assert Path(rep).read_text() == "# r" and not Path("/etc/evil.md").exists()
+    saved = json.loads((kf_dir / "kf_return.json").read_text())["workflow_return"]
+    assert "analysis_files" not in saved
+
+
 def test_run_stage_no_gain_or_failure_leaves_main_args_alone(tmp_path):
     for ret, exc in (({"status": "no_gain", "final_overlay": "/base"}, None), (None, RuntimeError("boom"))):
         pa = ps_args(tmp_path / str(bool(exc)))

@@ -182,6 +182,14 @@ def run_stage(h: dict, ps_args: dict, timeout_s: int, G: dict, flags=frozenset()
             wf = _read_json(kf_dir / "workflow_return.json")
     elapsed = int(time.time() - t0)
     if wf:
+        # The analyst cannot write .md reports from inside the workflow; it returns them and they land here.
+        for path, text in (wf.pop("analysis_files", None) or {}).items():
+            if text and str(path).startswith(str(kf_dir.parent) + os.sep):   # the director may suffix the dir
+                try:
+                    Path(path).parent.mkdir(parents=True, exist_ok=True)
+                    Path(path).write_text(text, encoding="utf-8")
+                except OSError:
+                    pass
         summary.update({k: wf.get(k) for k in (
             "status", "baseline_throughput_tok_s", "final_throughput_tok_s", "throughput_speedup",
             "final_overlay", "accepted", "rejected", "topk_json", "analysis_report", "trace_dir", "reason")})

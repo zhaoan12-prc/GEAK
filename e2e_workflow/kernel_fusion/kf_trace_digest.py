@@ -128,6 +128,28 @@ def covered_us(ks: list[dict]) -> float:
     return tot
 
 
+def adjacent_pairs(seq: list[dict], top: int, once: bool = False) -> list[dict]:
+    """Back-to-back kernel pairs on one stream in the step, ranked by the time the pair spends --
+    the raw material of every L1/L2 candidate (a GEMM/attention and its neighbouring norm, quant,
+    reduce or cast). Count is per step, so a pair inside the layer block shows ~once per layer;
+    once=True lists the pairs that run once per step instead (step head/tail glue)."""
+    agg: dict = {}
+    last: dict = {}
+    for s in seq:
+        prev = last.get(s["stream"])
+        if prev is not None:
+            a = agg.setdefault((prev["kernel"], s["kernel"]), [0, 0.0, 0.0, 0.0])
+            a[0] += 1
+            a[1] += prev["dur_us"]
+            a[2] += s["dur_us"]
+            a[3] += s["gap_us"]
+        last[s["stream"]] = s
+    rows = [{"pair": f"{k[0]} -> {k[1]}", "per_step": n, "us_per_step": round(d1 + d2, 1),
+             "avg_us": [round(d1 / n, 2), round(d2 / n, 2)], "avg_gap_us": round(g / n, 2)}
+            for k, (n, d1, d2, g) in agg.items() if (n == 1) == once]
+    return sorted(rows, key=lambda r: -r["us_per_step"])[:top]
+
+
 def layer_period(names: list[str]) -> dict:
     """Smallest shift p at which the step's kernel-name sequence best repeats itself."""
     n = len(names)
@@ -215,6 +237,8 @@ def digest_trace(path: str, top: int) -> dict:
                                    "threshold_us": SHORT_US},
             "graph_replayed": bool(seq) and sum(1 for s in seq if "Graph" in s["launch"]) > len(seq) / 2,
             "layer_period": layer_period([s["kernel"] for s in seq]),
+            "adjacent_pairs": adjacent_pairs(seq, top),
+            "step_once_pairs": adjacent_pairs(seq, 15, once=True),
             "top_kernels": rows[:top],
             "_seq": seq,
         }
@@ -241,6 +265,14 @@ def to_md(groups: dict[str, dict]) -> str:
                   "| kernel | calls/step | us/step | avg us | % step |", "|---|---|---|---|---|"]
             L += [f"| `{r['kernel']}` | {r['calls_per_step']} | {r['us_per_step']} | {r['avg_us']} | {r['pct_step']} |"
                   for r in s["top_kernels"]]
+            L += ["", "Back-to-back pairs (same stream, median step):", "",
+                  "| pair | per step | us/step | avg us (a, b) | avg gap us |", "|---|---|---|---|---|"]
+            L += [f"| `{r['pair']}` | {r['per_step']} | {r['us_per_step']} | {r['avg_us'][0]}, {r['avg_us'][1]} | {r['avg_gap_us']} |"
+                  for r in s["adjacent_pairs"]]
+            L += ["", "Pairs that run once per step (step head/tail glue):", "",
+                  "| pair | us/step | us (a, b) | gap us |", "|---|---|---|---|"]
+            L += [f"| `{r['pair']}` | {r['us_per_step']} | {r['avg_us'][0]}, {r['avg_us'][1]} | {r['avg_gap_us']} |"
+                  for r in s["step_once_pairs"]]
             L.append("")
     return "\n".join(L) + "\n"
 

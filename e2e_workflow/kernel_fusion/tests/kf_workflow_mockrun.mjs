@@ -27,7 +27,7 @@ const answers = {
   'kf:director:setup': () => (scenario === 'setup_fail' ? null : { eval_dir: KF, baseline_throughput_tok_s: 100, noise_band_pct: 0.5 }),
   'kf:profiler': () => ({ profile_topN_json: `${KF}/profile/round_0/profile_topN.json`, top_kernels: [] }),
   'kf:analyst': () => ({ topk_json: `${KF}/analysis/topk.json`, report_path: `${KF}/analysis/report.md`,
-    candidates: CANDS, recommended: ['c1', 'c2'] }),
+    candidates: CANDS, recommended: ['c1', 'c2'], report_md: '# report', model_notes_md: '# notes' }),
   'kf:integrate c1': () => ({
     accept: won('accepted', 3), stack: won('stack', 0.2),
     retry: { gate: 'incomplete', ab_complete: false, e2e_throughput_tok_s: 0, ref_med: 100 },
