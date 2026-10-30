@@ -229,7 +229,8 @@ deployment, workload, metric and constraints, but your job is only the analysis 
 container, a working directory or a materials/ layout from the setting they were written in; those are NOT
 this environment. Map them onto the inputs below instead:
 - its traces / sampling points            -> the trace files under TRACE_DIR (any depth; one dir = one point)
-- its workload summary / weights           -> WORKLOAD_SUMMARY when given; otherwise derive them yourself (below)
+- its workload summary / weights           -> WORKLOAD_SUMMARY when given; otherwise derive the weights from the
+                                              baseline bench + server log under EVAL_DIR and say so
 - its deploy/server args + env             -> SERVER_FLAGS / SERVER_ENV / LAUNCH_SCRIPT (and EVAL_DIR/baseline/server.log)
 - its model config                         -> MODEL_PATH/config.json
 - framework + operator-library source      -> ${SOURCE_DIRS ? `SOURCE_DIRS (${SOURCE_DIRS})` : `the installed packages (python3 -c "import ${BACKEND}; print(${BACKEND}.__file__)", aiter, ...)`}
@@ -241,43 +242,20 @@ your recommended candidates with the GEAK kernel layer and A/B-tests them on the
     python3 ${KF_HOME}/kf_trace_digest.py --trace-dir "${TRACE_DIR}" --out "${OUT}/digest"
     # optional per-kernel Top-N of any one trace file:  python3 ${WORKFLOW_DIR}/scripts/parse_profile.py --torch-trace <file> --top 40 --out ${OUT}/topn_<point>
 ${OUT}/digest/digest.md has, per trace and per step kind: steps, busy/span/idle per step, kernels/step, short-kernel
-share, the per-layer repeating block, the top kernels, two pair tables -- back-to-back kernel pairs inside the
-layer block and pairs that run once per step (step head/tail glue) -- and seq_*.tsv (the median step's full
-ordered kernel sequence with gaps and, for eager launches, the launching cpu_op + framework frame). Use these
-numbers; quote them in your report. Every row of both pair tables must be accounted for in your report: a
-candidate, part of one, or rejected with the reason (data dependency, multi-consumer, collective, already fused).
+share, the per-layer repeating block, the top kernels, and seq_*.tsv (the median step's full ordered kernel
+sequence with gaps and, for eager launches, the launching cpu_op + framework frame). Use these numbers; quote
+them in your report. Graph-replayed steps have no launch frames: map those kernels to source by name.
 
-## Seams must be the LIVE path
-Graph-replayed steps have no launch frames, and a trace captured without Python stacks has none at all, so a
-kernel name alone does not tell you which source file runs. Before you name a seam:
-- resolve the implementation THIS platform actually runs: the model registry's class for the checkpoint's
-  architectures, then every platform branch on the way (is_hip()/is_cuda() re-imports, env-selected backends,
-  size guards) down to the function that launches the kernels;
-- name the callable the live CALLER looks up: when the caller does \`from m import f\`, the seam is
-  \`caller_module:f\`, not \`m:f\` (rebinding the definition after the caller imported it changes nothing);
-- record that evidence in seam.live_evidence (the import chain / branch you followed).
-
-## Deliver everything the prompt asks for
-Rank as many candidates as the prompt asks for (e.g. its Top-N), not only the ones you recommend. This environment
-does not let you write .md report files: return the full report the prompt asks for as markdown in report_md, and
-the model / deployment notes in model_notes_md; the stage writes them to ${OUT}/REPORT.md and ${OUT}/MODEL_NOTES.md.
-
-## Weights when there is no WORKLOAD_SUMMARY
-Derive them from the serving logs, and write the derivation into your report: the measured window's log
-(\`${EVAL_DIR}/baseline/server.log\` when it exists) and the traced server's log (a \`server.log\` in TRACE_DIR or
-one of its parent dirs). SGLang writes one \`Prefill batch\` line per prefill batch (#new-token, #cached-token)
-and one \`Decode batch\` line every \`decode_log_interval\` decode iterations (read it from that log's server_args
-line) with #running-req and accept len. Weight of a step kind = its iteration count in the measured window x its
-per-step device time from the digest (prefill: scale the traced EXTEND step by #new-token). A single trace window
-is one shape: say which batch sizes / context lengths it represents and how far the weighted window strays from it.
+This environment does not let you write .md report files: return the full report the prompt asks for as markdown
+in report_md, and the model / deployment notes in model_notes_md; the stage writes them to ${OUT}/REPORT.md and
+${OUT}/MODEL_NOTES.md.
 
 ## Machine-readable result (in addition to everything the prompt asks for)
 Write ${OUT}/topk.json: {"candidates": [...], "recommended": [ids in the order to implement]}, every candidate:
   id (short, [A-Za-z0-9_]), rank, level ("L1".."L4"), region (one line), kernels (device kernel names, in order),
   phases (step kinds it runs in), occurrences {per_layer, per_step, layers}, m_range,
-  seam {target_callable: "pkg.module:Class.method or pkg.module:function" -- ONE Python callable on the live
-        path whose body covers the whole region, so the region can be rebound to a fused implementation;
-        source_file; lines; live_evidence},
+  seam {target_callable: "pkg.module:Class.method or pkg.module:function" -- ONE Python callable whose body
+        covers the whole region, so the region can be rebound to a fused implementation; source_file; lines},
   inputs_outputs (tensors that cross the region boundary, with shapes/dtypes), launches_before, launches_after,
   region_pct_device_time (weighted), est_gain_pct_upper, est_gain_pct_expected (weighted e2e %),
   difficulty (1-5), bitwise_exact (bool), exclusive_with [ids], language ("triton" unless you have a reason),

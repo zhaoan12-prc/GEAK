@@ -106,8 +106,7 @@ def test_analysis_only_with_given_traces_needs_no_server():
     assert out["result"]["status"] == "analysis_only" and out["workflows"] == []
     files = out["result"]["analysis_files"]
     assert files == {f"{KF}/analysis/REPORT.md": "# report", f"{KF}/analysis/MODEL_NOTES.md": "# notes"}
-    p = out["calls"][0]["prompt"]
-    assert "Seams must be the LIVE path" in p and "caller_module:f" in p and "once per step" in p
+    assert "report_md" in out["calls"][0]["prompt"]
 
 
 def test_setup_failure_returns_cleanly():
