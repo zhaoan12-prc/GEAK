@@ -118,6 +118,7 @@ if (scenario === 'reuse') args.kf_reuse = { 'kf:author c1': { final_patch: 'old 
 if (scenario === 'reuse_topk') Object.assign(args, { kf_baseline_dir: '/old/kf/baseline', kf_trace_dir: '/traces/x',
   kf_topk_json: '/old/kf/analysis/topk.json', kf_topk: { candidates: CANDS, recommended: ['c1', 'c2'] } });
 if (scenario === 'reuse_baseline') Object.assign(args, { kf_baseline_dir: '/old/kf/baseline', kf_trace_dir: '/traces/x' });
+if (scenario === 'no_full_set') args.accuracy_full_limit = 0;
 
 const src = (await readFile(`${WF_DIR}/kernel_fusion/kf_workflow.js`, 'utf8'))
   .replace(/^[ \t]*export\s+(?=(const|let|var|function|class|async|default)\b)/gm, '');

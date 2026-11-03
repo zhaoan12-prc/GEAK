@@ -72,6 +72,9 @@ def test_all_winners_go_in_together_on_one_ab():
     assert "MEASUREMENT_PURPOSE: validation" in integ and "MEASUREMENT_MODE: isolated_server" in integ and "REPLICAS: 1" in integ
     # fused kernels are held to task accuracy (the integrator's ACCURACY_GATE), not byte-exact greedy parity
     assert "ACCURACY_GATE: gsm8k" in integ and "GSM8K_EVAL_SCRIPT: " in integ and "ACCURACY_TOL: 0.01" in integ
+    # a miss on the 200-question subset is confirmed on the full test set before it counts
+    assert "ACCURACY_LIMIT: 200" in integ and "ACCURACY_FULL_LIMIT: 1319" in integ
+    assert "ACCURACY ESCALATION" in integ and "--limit $ACCURACY_FULL_LIMIT" in integ and "only a full-set miss" in integ
     assert 'starts with "correctness:"' in integ
     # synthetic acceptance stays on for throughput, off for every correctness check
     assert "CORRECTNESS PROBES RUN WITHOUT SIMULATED ACCEPTANCE" in integ
@@ -235,6 +238,7 @@ def test_a_stack_that_fails_accuracy_is_screened_kernel_by_kernel_then_re_run():
     sc = by["kf:integrate screen"]
     assert "CORRECTNESS SCREEN ONLY" in sc and "no throughput legs" in sc and f"{KF}/overlay/screen_" in sc
     assert "CORRECTNESS PROBES RUN WITHOUT SIMULATED ACCEPTANCE" in sc and "ACCURACY_GATE: gsm8k" in sc
+    assert "ACCURACY_FULL_LIMIT: 1319" in sc and "ACCURACY ESCALATION" in sc      # the per-kernel screen escalates too
     integ = by["kf:integrate kf_stack (screened)"]
     assert "Apply ALL 1 fused kernels" in integ and f'"overlay_dir":"{KF}/kernels/c2/overlay"' not in integ
     r = out["result"]
@@ -335,3 +339,9 @@ def test_a_gain_inside_the_noise_band_is_not_handed_on():
     assert r["status"] == "no_gain" and r["final_overlay"] == "" and not r["accepted"]
     assert r["validation"]["noise_band_pct"] == 0.5 and "within the noise band 0.5%" in r["validation"]["reason"]
     assert run("accept")["result"]["status"] == "accepted"                          # +2.5% clears it
+
+
+def test_the_full_set_escalation_can_be_switched_off():
+    out = run("no_full_set")
+    integ = next(c["prompt"] for c in out["calls"] if c["label"] == "kf:integrate kf_stack")
+    assert "ACCURACY_LIMIT: 200" in integ and "ACCURACY_FULL_LIMIT" not in integ and "ACCURACY ESCALATION" not in integ

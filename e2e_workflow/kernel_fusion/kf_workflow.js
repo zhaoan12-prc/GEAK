@@ -83,12 +83,22 @@ const STEPS = new Set(String(A.kf_steps || 'trace,topk,author,apply').split(',')
 const want = (s) => STEPS.has(s);
 // A fused kernel reorders floating-point work (a fused reduction, fp32 kept in registers), so like a quant kernel
 // it is held to TASK ACCURACY, not byte-exact greedy parity: the GEAK integrator's existing ACCURACY_GATE switch.
+// A 200-question probe has a standard error of ~0.025 on the base-vs-cand difference, so a miss of the tolerance is
+// confirmed on the full gsm8k test set (1319 questions) before it counts: only a full-set miss is a correctness failure.
 const KF_ACCURACY_GATE = String(A.accuracy_gate || 'gsm8k').trim();
+const KF_ACCURACY_FULL_LIMIT = parseInt(A.accuracy_full_limit != null ? A.accuracy_full_limit : 1319, 10);
 const KF_ACCURACY_INPUTS = KF_ACCURACY_GATE !== 'none'
   ? { ACCURACY_GATE: KF_ACCURACY_GATE, ACCURACY_LIMIT: parseInt(A.accuracy_limit != null ? A.accuracy_limit : 200, 10),
       ACCURACY_TOL: parseFloat(A.accuracy_tol != null ? A.accuracy_tol : 0.01),
+      ...(KF_ACCURACY_FULL_LIMIT > 0 ? { ACCURACY_FULL_LIMIT: KF_ACCURACY_FULL_LIMIT } : {}),
       GSM8K_EVAL_SCRIPT: `${WORKFLOW_DIR}/scripts/gsm8k_eval.py` }
   : {};
+const KF_ACCURACY_ESCALATION = KF_ACCURACY_GATE !== 'none' && KF_ACCURACY_FULL_LIMIT > 0
+  ? ' ACCURACY ESCALATION: if a CAND misses ACCURACY_TOL on the ACCURACY_LIMIT-question gsm8k, do not fail it yet: ' +
+    're-run BOTH the reference and that CAND on the same servers with --limit $ACCURACY_FULL_LIMIT (the full test ' +
+    'set) and decide on the full-set scores with the same ACCURACY_TOL; only a full-set miss is a correctness ' +
+    'failure. Record both the subset and the full-set scores.'
+  : '';
 const VALIDATION_MODE = String(A.kf_validation_mode || 'isolated_server');   // fresh servers: boot-to-boot noise
 const VALIDATION_REPLICAS = parseInt(A.kf_validation_replicas != null ? A.kf_validation_replicas : 1, 10);   // ONE A/B
 // The stage's own baseline: one fresh server, one timed round -- no discarded full warmup round.
@@ -794,7 +804,7 @@ async function screen(list, label) {
     'patches one seam lazily), and run your output-correctness check of that CAND against the reference with the same ' +
     'probes, the same correctness gate (the ACCURACY GATE of your role when ACCURACY_GATE is in your inputs) and the ' +
     'same correctness env (one reference measurement shared by all entries; reuse the stack A/B\'s reference result ' +
-    'on disk if it has one); confirm the entry\'s engaged_banner in the CAND server log. ' +
+    'on disk if it has one); confirm the entry\'s engaged_banner in the CAND server log.' + KF_ACCURACY_ESCALATION + ' ' +
     'Return {members: [{short_name, correctness: "pass"|"fail", engaged, reason}]}.',
     { EVAL_DIR, MODEL_PATH, GPU_ID: SERVING_GPU, WORKLOAD, SKILL_DIR: WORKFLOW_DIR, MEASUREMENT_PURPOSE: 'parity',
       ...KF_ACCURACY_INPUTS,
@@ -841,7 +851,8 @@ async function stackAB(members, suffix) {
     'patches. Run the correctness checks once on that stack and confirm EVERY entry\'s engaged_banner in the CAND ' +
     'server log; if the stack fails either, skip the throughput legs and return gate "rejected" with a reason that ' +
     'starts with "correctness:" (name the kernels that did not engage). Otherwise ONE reference-vs-CAND throughput ' +
-    'A/B. Return the gate for the whole set; accepted_overlay = the CAND overlay when it is accepted or stack.';
+    'A/B. Return the gate for the whole set; accepted_overlay = the CAND overlay when it is accepted or stack.' +
+    KF_ACCURACY_ESCALATION;
   const label = `kf:integrate ${stackName}${suffix}`;
   let integ = await safeAgent(roleAgent('e2e_integrator', 'integrate', intro, inputs),
     { phase: 'ApplyBack', label, schema: INTEGRATE_SCHEMA, timeoutMs: APPLY_TIMEOUT_MS });
