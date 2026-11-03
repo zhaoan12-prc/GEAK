@@ -20,9 +20,11 @@ EXTEND, VERIFY, DRAFT; the whole window when the trace has no step annotations):
   that step's full ordered kernel sequence with gaps and launching frames (``seq_*.tsv``).
 
 Across all traces: the LIVE model code -- every ``nn.Module`` class the eager (non-graph) steps entered and the
-source file of the ``forward`` it ran. A model can ship several implementations of one layer (a generic and a
-platform-specific module); graph-replayed steps (decode / verify) have no launch frames, but they run the same
-module classes, so this table is where a fusion seam must live.
+source file of the ``forward`` it ran -- and every framework / operator-library source file (``sglang/``, ``aiter/``)
+any eager Python frame ran, with its functions. This is positive evidence only: a model can ship several
+implementations of one layer (a generic and a platform-specific module), and code that runs only inside graph
+replay (e.g. a speculative draft model, graph-captured metadata) or outside ``nn.Module.forward`` (attention
+backends, speculative workers) may be live without appearing here.
 
 Writes OUT_DIR/digest.json, OUT_DIR/digest.md and OUT_DIR/seq_<group>_<kind>.tsv. Stdlib only.
 """
@@ -45,6 +47,7 @@ SHORT_US = 5.0
 FRAME_HINT = re.compile(r"(sglang|vllm|aiter|atom|flydsl|triton_kernels)[/.]")
 MODULE_RE = re.compile(r"^nn\.Module: (\w+?)(?:_\d+)?$")
 FORWARD_RE = re.compile(r"^(.+?\.py)\(\d+\): forward$")
+SRC_FRAME_RE = re.compile(r"^((?:sglang|aiter)/\S+?\.py)\(\d+\): (\S+)$")
 
 
 def short_name(name: str) -> str:
@@ -172,6 +175,17 @@ def live_modules(events: list[dict]) -> dict[str, Counter]:
     return out
 
 
+def live_files(events: list[dict]) -> dict[str, Counter]:
+    """{framework source file: Counter(function)} for every sglang/aiter frame the eager python stacks ran."""
+    out: dict[str, Counter] = defaultdict(Counter)
+    for e in events:
+        if e.get("ph") == "X" and e.get("cat") == "python_function":
+            m = SRC_FRAME_RE.match(e.get("name", ""))
+            if m:
+                out[m.group(1)][m.group(2)] += 1
+    return out
+
+
 def digest_trace(path: str, top: int) -> dict:
     ev = load_events(path)
     kernels = sorted((e for e in ev if e.get("ph") == "X" and e.get("cat") in KERNEL_CATS),
@@ -201,7 +215,7 @@ def digest_trace(path: str, top: int) -> dict:
             kinds[w[0]].append(i)
 
     out = {"trace": path, "num_kernels": len(kernels), "num_steps": len(windows), "step_kinds": {},
-           "_live": live_modules(ev)}
+           "_live": live_modules(ev), "_live_files": live_files(ev)}
     for kind, idxs in sorted(kinds.items()):
         busy = [sum(k.get("dur", 0) for k in per_step[i]) for i in idxs]
         span = [windows[i][2] - windows[i][1] for i in idxs]
@@ -249,19 +263,27 @@ def digest_trace(path: str, top: int) -> dict:
     return out
 
 
-def to_md(groups: dict[str, dict], live: dict | None = None) -> str:
+def to_md(groups: dict[str, dict], live: dict | None = None, live_src: dict | None = None) -> str:
     L = ["# KernelFusion trace digest", ""]
     if live:
         files = sorted({f for v in live.values() for f in v})
         L += ["## Live model code (from the eager steps' Python stacks)",
-              ("The server runs THESE classes and files. Graph-replayed steps (no launch frames) run the same module "
-               "classes, so map their kernels to these files -- a model may also ship other implementations of the "
-               "same layers (generic vs platform-specific modules) that this server never loads. A fusion seam must "
-               "be a callable in one of these files."), "",
+              ("The server runs THESE classes and files (positive evidence). A model may also ship other "
+               "implementations of the same layers (generic vs platform-specific modules) that this server never "
+               "loads: prefer the implementation listed here. Absence is NOT evidence of dead code: code that runs only "
+               "in graph replay (e.g. a speculative draft model, graph-captured metadata) or outside nn.Module.forward "
+               "(attention backends, speculative workers) can be live without appearing here -- reach it from these "
+               "entries through the source call chain."), "",
               "| nn.Module class | forward in |", "|---|---|"]
         L += [f"| `{c}` | " + ", ".join(f"`{f}`" for f in sorted(v, key=lambda f: -v[f])) + " |"
               for c, v in sorted(live.items())]
         L += ["", "Files: " + ", ".join(f"`{f}`" for f in files), ""]
+    if live_src:
+        L += ["## Live source files (every sglang / aiter frame the eager steps ran)", "",
+              "| file | frames | functions (most frequent first) |", "|---|---:|---|"]
+        L += [f"| `{f}` | {sum(c.values())} | " + ", ".join(f"`{fn}`" for fn, _ in c.most_common(8)) + " |"
+              for f, c in sorted(live_src.items(), key=lambda kv: -sum(kv[1].values()))]
+        L += [""]
     for g, d in groups.items():
         L += [f"## `{g}` — {os.path.basename(d['trace'])}",
               f"{d['num_kernels']} kernels, {d['num_steps']} step windows", ""]
@@ -301,6 +323,7 @@ def main(argv: list[str] | None = None) -> int:
     os.makedirs(a.out, exist_ok=True)
     groups = {}
     live: dict[str, Counter] = defaultdict(Counter)
+    live_src: dict[str, Counter] = defaultdict(Counter)
     for g, cands in picked.items():
         d = None
         for path in cands:
@@ -327,15 +350,18 @@ def main(argv: list[str] | None = None) -> int:
         for c, v in d.pop("_live").items():
             for f, n in v.items():
                 live[c][f] += n
+        for f, v in d.pop("_live_files").items():
+            live_src[f].update(v)
         groups[g] = d
     if not groups:
         sys.stderr.write("no usable trace (all unreadable or without GPU kernels)\n")
         return 3
     with open(os.path.join(a.out, "digest.json"), "w") as f:
         json.dump({"schema": "geak.kf_trace_digest/1", "groups": groups,
-                   "live_model_modules": {c: dict(v) for c, v in sorted(live.items())}}, f, indent=1)
+                   "live_model_modules": {c: dict(v) for c, v in sorted(live.items())},
+                   "live_source_files": {p: dict(v) for p, v in sorted(live_src.items())}}, f, indent=1)
     with open(os.path.join(a.out, "digest.md"), "w") as f:
-        f.write(to_md(groups, live))
+        f.write(to_md(groups, live, live_src))
     print(f"KF_DIGEST groups={len(groups)} out={a.out}/digest.md")
     return 0
 

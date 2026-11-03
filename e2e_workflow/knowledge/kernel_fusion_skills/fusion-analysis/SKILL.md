@@ -50,7 +50,9 @@ A candidate that does not meet all of the following must not be recommended.
 2. **The deployed configuration decides.** Weights, shapes (the distribution of M), platform branches
    and the kernel actually called are taken from what this deployment runs, never from defaults,
    another platform or the function definition alone. A model may ship several implementations of
-   the same layer; only the implementation listed in the Live model code table is live.
+   the same layer; the Live model code tables list what the eager steps ran. Code that runs only in graph replay
+   or outside an nn.Module forward can be live without appearing there: reach it through the source call chain
+   from a live entry, and reject an implementation only when the trace shows another one of that layer running.
 3. **The target metric decides.** Rank by expected gain on the target metric. Candidates that do not
    affect it rank last.
 4. **Implementation scope.** Rank every level as found. Only candidates at an implementable level and not

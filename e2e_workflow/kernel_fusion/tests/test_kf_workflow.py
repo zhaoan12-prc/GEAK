@@ -53,6 +53,11 @@ def test_all_winners_go_in_together_on_one_ab():
     assert "links: /prompts/p.txt, /prompts/deploy.txt" in analyst and "kf_trace_digest.py" in analyst and "fallback (id" in analyst
     assert f"TRACE_DIR: {KF}/profile" in analyst
     assert "Live model code" in analyst and "this server never loads" in analyst      # seams on the live implementation
+    # graph-replayed decode has no launch frames: the eager tables are evidence, not a whitelist; a seam is
+    # reached through the call chain and confirmed by the prepare step's execution proof
+    assert "WITHIN those files" not in analyst and "source call chain" in analyst and 'never "UNCONFIRMED"' in analyst
+    assert "check the trace's launch frames" not in by["kf:triage"]
+    assert "source call chain" in by["kf:triage"] and "execution proof" in by["kf:triage"]
     # the fused kernels are written by plain author agents, not the GEAK kernel layer
     assert len(out["workflows"]) == 3 and all("kernel_lane" not in w["task"] for w in out["workflows"])
     au = next(c["prompt"] for c in out["calls"] if c["label"] == "kf:author c1")
