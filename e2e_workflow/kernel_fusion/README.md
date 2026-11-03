@@ -21,6 +21,59 @@ profiler)  strategy skill;     A/B, compounding
 | `author` | a triage agent reads the whole Top-K and picks, by its own judgement, the patterns worth a kernel (no cap, no gain floor; the one hard line is a Python seam); each: region UT, then a fused kernel | AgentX: kernel-extract skill `PHASE=prepare` (one joint-boundary task per region); else `roles/kernel_extractor.md`. The fused kernel itself: one agent per pattern, given the region and the UT, no GEAK kernel layer |
 | `apply` | once, after every kernel is written: a select agent reads the UT results and picks which kernels go on (no speedup floor; one kernel per seam / overlapping region); they go in together as ONE combined overlay on ONE A/B vs the reference (gsm8k on the whole stack first, then validation-length legs). Only if the stack fails accuracy or engagement is each kernel checked alone (correctness only) and the A/B re-run without the failing ones; only a measured e2e win is handed to the main workflow | `roles/e2e_integrator.md` PHASE=integrate |
 
+## L3 MegaKernel through GEAK mode=mega (opt-in)
+
+The fusion-analysis skill (`knowledge/kernel_fusion_skills/fusion-analysis`) defines four levels (L1
+element-wise, L2 operator-wise, L3 stage-wise, L4 layer-wise) and splits L3 into two forms:
+- **stage fusion**: authored by an agent like L1/L2;
+- **MegaKernel**: by default an unsupported pattern (`unsupported_patterns`).
+
+With `l3_mega` on, the **expert-parallel MoE MegaKernel** (the MegaMoE pattern) is implementable: it
+leaves the unsupported patterns, and GEAK mode=mega builds it.
+
+**Region.** The whole MoE layer as the live path runs it: routing (gate, top-k, sorting), quant,
+dispatch, expert GEMM1 + activation + GEMM2, combine, and the shared expert(s) when computed there.
+
+**Recognition.** From the stage's own kernels, which must include expert GEMMs plus either:
+- EP library kernels (megamoe, DeepEP, mori, all-to-all); or
+- an EP deployment (`ep` > 1). This covers a from-scratch path whose dispatch/combine carry no
+  library name.
+
+An L3 stage fusion without expert GEMMs (router + top-k + dispatch preparation) stays with the author
+agents. This is the pattern mode=mega has been validated on:
+- DeepSeek-V4-Pro EP8 on MI355X;
+- Qwen3-235B EP8 on MI300X, over both an AITER/Mori path and a Triton-from-scratch path.
+
+Any EP size works: mode=mega runs on the stage's own rank count (`gpus_per_job` = the EP group, e.g.
+EP4 on 4 serving GPUs). The measured results above are EP8. The MegaMoE expert skill
+(`use_expert_skills`) is written for EP8 / gfx950, so leave it off for other EP sizes. A finished run
+is reused only for the same rank count.
+
+Other multi-rank stages (a TP collective with its compute) are wired but stay off until mode=mega is
+measured on them. `l3_stage_kinds: "ep_moe,collective"` turns them on.
+
+| step | L1 / L2 / L3 stage fusion | L3 EP MoE MegaKernel |
+|---|---|---|
+| `topk` | ranked as before | ranked with `level: "L3"`, `implementable_by: "mega"`, `exclusive_with` the L1/L2 candidates inside it; it goes to mode=mega only if its kernels are an EP MoE stage |
+| triage | agent's pick | same agent; at most `l3_max` stages |
+| `author` | region UT + one author agent, in parallel on single GPUs | after those: `l3_mega.md` PHASE=prepare (operator, frozen source tree, multi-rank UT) → `kernel_workflow/kernel_mega.js` on the serving GPUs (`gpus_per_job` = the stage's rank group) → PHASE=package (overlay `[kf-<id>] ENGAGED`, checked with the UT) |
+| select / gsm8k / A/B | one stack, one A/B; accuracy failure → per-kernel screen | the L3 kernel is one more kernel of that stack; if the stack holding it does not win, the L1/L2 kernels (with the ones only it had excluded) get one A/B without it |
+
+Mode=mega args are layered, so a run needs nothing beyond `l3_mega: true`:
+
+| layer | keys | set by |
+|---|---|---|
+| search policy | profile, pairs, replays, timeouts, accuracy metric/threshold, `launch_target` / `analysis_skill` per stage kind | `l3_mega_defaults.json` (`common`, then `ep_moe` or `collective`) |
+| this stage | cases, guards, accuracy cases, positive control, task, import modules | prepare (from the trace and the serving config), or `l3_operator` |
+| where / how long | `workflow_dir`, `kernel_path`, `benchmark_harness`, GPUs, `exp_root`, `state_dir`, `budget`, `mega_time_budget_s` | the stage (`l3_operator`, `l3_rounds`, `l3_budget_s`); `l3_mega_args` cannot change them |
+| caller | any policy or stage key | `l3_mega_args`, applied last |
+
+Timing. The stage's usual path is ~7 h (baseline 1 h, trace 0.8 h, topk 0.5 h, kernels + UTs 1.5 h,
+gsm8k 0.2 h, A/B 2 h). A finished mode=mega run (`l3_mega_run`) only adds packaging. A fresh search
+adds mode=mega's own budget (`l3_budget_s`, 8 h); with it the stage budget defaults to 12 h + that,
+capped at half the run. `result.json["kernel_fusion"]["l3"]` records each stage: `applied`,
+`ab_rejected`, `not_selected`, `mega_no_deliverable`, `mega_error`, `prepare_blocked`, `package_blocked`.
+
 ## Switch
 
 Precedence: CLI > env > handoff.
@@ -53,6 +106,16 @@ GEAK_KERNEL_FUSION=0|1                                     # env
 | `validation_mode` / `validation_replicas` | `GEAK_KF_VALIDATION_MODE` / `_REPLICAS` | `isolated_server` / 1 | measurement mode / replicas of the combined A/B (one A/B) |
 | `task` | `GEAK_KF_TASK` | — | operator constraints appended to every agent prompt (e.g. directories it must not read) |
 | `budget_s` | `GEAK_KF_BUDGET_S` | min(12 h, ⅓ of the run) | stage wall clock; the main workflow gets the rest |
+| `kernel_language` | `GEAK_KF_KERNEL_LANGUAGE` | — | language every fused kernel is written in (e.g. `flydsl`), or `auto` for the GPU's default (gfx950: FlyDSL). Unset: L1/L2/L3 stage fusion keep the analyst's choice (Triton by default), and an L3 mode=mega search follows the GPU's default, else its source's language |
+| `l3_mega` | `GEAK_KF_L3_MEGA` | false | L3 stage fusion through GEAK mode=mega (above) |
+| `l3_mega_run` | `GEAK_KF_L3_MEGA_RUN` | — | a finished mode=mega run of the stage (state_dir / eval dir / mega_result.json): package it, no search |
+| `l3_max` | `GEAK_KF_L3_MAX` | 1 | L3 stages handed to mode=mega |
+| `l3_budget_s` / `l3_rounds` | `GEAK_KF_L3_BUDGET_S` / `_ROUNDS` | 28800 / 12 | mode=mega time budget and candidate rounds of a search |
+| `l3_mega_args` | `GEAK_KF_L3_MEGA_ARGS` (JSON) | — | merged last into the mode=mega args, e.g. `{"use_expert_skills": "true"}`; paths / GPUs / budget keys are ignored |
+| `l3_defaults` | `GEAK_KF_L3_DEFAULTS` | `l3_mega_defaults.json` | search-policy defaults file; `false` leaves them to mode=mega |
+| `l3_operator` | `GEAK_KF_L3_OPERATOR` (JSON) | — | what is known about the stage's operator (`kernel_path`, `benchmark_harness`, `call_site`, `package`, `ep_size`, `mega_args`): prepare verifies it instead of discovering it |
+| `l3_kernel_regex` | `GEAK_KF_L3_KERNEL_REGEX` | — | extra EP MoE kernel names to recognize (another EP library) |
+| `l3_stage_kinds` | `GEAK_KF_L3_STAGE_KINDS` | `ep_moe` | stage kinds handed to mode=mega; `ep_moe,collective` adds TP collective stages (not yet measured) |
 | `kf_dir` | `GEAK_KF_DIR` | `<exp_root>/kf_<main eval dir suffix>` | stage output dir |
 
 Synthetic speculative acceptance (`SGLANG_SIMULATE_ACC_*`, `TILERT_SIMULATE_ACC_*`,

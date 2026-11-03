@@ -260,6 +260,29 @@ def test_the_fusion_strategy_is_read_first_and_can_be_replaced_or_dropped(tmp_pa
     assert kf_stage.build_args({"strategy": False, "prompt": str(deploy)}, ps_args(tmp_path), 60)["kf_prompt"] == str(deploy)
 
 
+def test_l3_knobs_budget_and_reuse(tmp_path, monkeypatch):
+    ps = {"eval_dir": str(tmp_path / "e2e_x")}
+    a = kf_stage.build_args({"l3_mega": True, "l3_mega_args": {"use_expert_skills": "true"}, "l3_max": 2}, ps, 100)
+    assert a["kf_l3_mega"] is True and a["kf_l3_max"] == 2 and a["kf_l3_mega_args"] == {"use_expert_skills": "true"}
+    monkeypatch.setenv("GEAK_KF_L3_MEGA_RUN", "/old/mega_state")
+    assert kf_stage.config({})["l3_mega_run"] == "/old/mega_state"
+    # an L3 search adds its mega budget on top of the usual stage (capped at half the run); a finished run does not
+    assert kf_stage.stage_budget_s({"l3_mega": True}, 200000) == 12 * 3600 + 8 * 3600
+    assert kf_stage.stage_budget_s({"l3_mega": True}, 60000) == 30000
+    assert kf_stage.stage_budget_s({"l3_mega": True, "l3_mega_run": "/x"}, 200000) == 12 * 3600
+    assert kf_stage.stage_budget_s({}, 200000) == 12 * 3600
+    # L3 prepare / package results come back through a reuse journal
+    prep = kf_stage.slim_result({"status": "ready", "kernel_path": "/t", "benchmark_harness": "/t/ut.py",
+                                 "mega_args": {"target_guards": ["64"]}, "log": "z" * 9000})
+    assert prep["benchmark_harness"] == "/t/ut.py" and "log" not in prep
+    assert "kf:l3 package c4".startswith(kf_stage.REUSABLE)
+    assert "implementable_by" in kf_stage.CAND_KEYS
+    monkeypatch.setenv("GEAK_KF_L3_STAGE_KINDS", "ep_moe,collective")
+    assert kf_stage.build_args(kf_stage.config({}), ps, 100)["kf_l3_stage_kinds"] == "ep_moe,collective"
+    monkeypatch.setenv("GEAK_KF_L3_KERNEL_REGEX", "uccl_")
+    assert kf_stage.build_args(kf_stage.config({}), ps, 100)["kf_l3_kernel_regex"] == "uccl_"
+
+
 def test_the_stage_stops_what_it_left_running_whatever_happened(tmp_path):
     calls = {}
 
@@ -325,3 +348,17 @@ def test_the_driver_prints_a_pointer_and_the_return_is_read_from_disk(tmp_path):
     assert "never print it" in seen["prompt"] and '"workflow_return_json"' in seen["prompt"]
     assert kf["status"] == "accepted" and kf["throughput_speedup"] == 1.03 and "error" not in kf
     assert kf["accepted"] == [{"id": "c1"}] and pa["initial_overlay_pythonpath"] == "/kf/overlay/cand"
+
+
+def test_l3_search_defaults_are_passed_in(tmp_path):
+    ps = {"eval_dir": str(tmp_path / "e2e_x")}
+    a = kf_stage.build_args({"l3_mega": True}, ps, 100)
+    d = a["kf_l3_defaults"]
+    assert d["common"]["mega_profile"] == "production" and d["ep_moe"]["analysis_skill"] == "moe_bottleneck"
+    assert "_comment" not in d and d["collective"]["launch_target"] == 1
+    assert "kf_l3_defaults" not in kf_stage.build_args({}, ps, 100)                     # L3 off: nothing
+    assert "kf_l3_defaults" not in kf_stage.build_args({"l3_mega": True, "l3_defaults": False}, ps, 100)
+    own = tmp_path / "d.json"
+    own.write_text(json.dumps({"common": {"required_pairs": 3}}))
+    assert kf_stage.build_args({"l3_mega": True, "l3_defaults": str(own)}, ps, 100)["kf_l3_defaults"] == {
+        "common": {"required_pairs": 3}}

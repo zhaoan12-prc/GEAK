@@ -278,6 +278,105 @@ def test_apply_steps_outlast_the_default_agent_timeout():
     assert re.search(r"APPLY_TIMEOUT_MS = .*6 \* 3600 \* 1000", src)
 
 
+# ---- L3 stage fusion through GEAK mode=mega (kf_l3_mega) ---------------------------------------------
+def test_l3_is_off_by_default():
+    out = run("accept")
+    assert out["megaCalls"] == [] and "l3" not in out["result"]
+    by = {c["label"]: c["prompt"] for c in out["calls"]}
+    assert "mode=mega" not in by["kf:analyst"] and "mode=mega" not in by["kf:triage"]
+
+
+def test_an_l3_stage_is_searched_by_mega_and_goes_into_the_one_ab():
+    out = run("l3")
+    r = out["result"]
+    labels_ = labels(out)
+    # mega runs after every author agent (it needs all serving GPUs), before select
+    assert labels_.index("kf:l3 prepare c4") < labels_.index("kf:l3 package c4") < labels_.index("kf:select")
+    assert not any(l.startswith(("kf:author c4", "kf:extract c4", "kf:kernel-extract prepare c4")) for l in labels_)
+    every = labels(out, True)
+    assert all(every.index(f"kf:author {x}") < every.index("kf:l3 prepare c4") for x in ("c1", "c2"))
+    (call,) = out["megaCalls"]
+    assert call["ref"]["scriptPath"].endswith("/kernel_workflow/kernel_mega.js")
+    a = call["args"]
+    assert (a["mode"], a["gpu_ids"], a["gpus_per_job"], a["budget"]) == ("mega", "0,1", 2, 12)
+    assert a["kernel_path"] == f"{KF}/kernels/c4/baseline_tree" and a["state_dir"] == f"{KF}/kernels/c4/mega_state"
+    assert a["target_guards"] == ["64_uniform"] and a["use_expert_skills"] == "true"
+    by = {c["label"]: c["prompt"] for c in out["calls"]}
+    assert "implementable_by \"mega\"" in by["kf:analyst"] and "GEAK mode=mega" in by["kf:triage"]
+    assert "l3_mega.md" in by["kf:l3 prepare c4"] and "BANNER: [kf-c4] ENGAGED" in by["kf:l3 package c4"]
+    sel = json.loads(by["kf:select"].split("## UT results\n")[1].split("\n")[0])
+    assert next(u for u in sel if u["id"] == "c4")["authored_by"].startswith("GEAK mode=mega")
+    stack = json.loads(re.search(r"- KERNEL_RESULTS: (.*)", by["kf:integrate kf_stack"]).group(1))
+    assert [k["short_name"] for k in stack] == ["c4", "c2"] and stack[0]["overlay_dir"] == f"{KF}/kernels/c4/overlay"
+    assert r["status"] == "accepted" and [x["id"] for x in r["accepted"]] == ["c4", "c2"]
+    assert r["l3"][0]["status"] == "applied" and r["l3"][0]["mega"]["selected"]["final_tree"] == "/m/f3"
+
+
+def test_an_l3_kernel_that_loses_end_to_end_does_not_cost_the_l1_l2_kernels():
+    out = run("l3_abreject")
+    r = out["result"]
+    by = {c["label"]: c["prompt"] for c in out["calls"]}
+    again = json.loads(re.search(r"- KERNEL_RESULTS: (.*)", by["kf:integrate kf_stack (without L3)"]).group(1))
+    assert [k["short_name"] for k in again] == ["c2", "c1"]       # c1, excluded only by the L3 stage, comes back
+    assert [x["id"] for x in r["accepted"]] == ["c2", "c1"] and r["final_overlay"].endswith("cand_kf_stack_nol3")
+    assert ("c4", "apply") in rejected(r) and ("c1", "select") not in rejected(r)
+    assert r["l3"][0]["status"] == "ab_rejected" and "slower" in r["l3"][0]["reason"]
+
+
+def test_l3_failures_are_recorded_and_the_rest_goes_on():
+    for scenario, status in (("l3_nodeliver", "mega_no_deliverable"), ("l3_throw", "mega_error")):
+        r = run(scenario)["result"]
+        assert r["l3"][0]["status"] == status and ("c4", "l3") in rejected(r)
+        assert r["status"] == "accepted" and [x["id"] for x in r["accepted"]] == ["c2"]
+
+
+def test_a_blocked_l3_prepare_is_retried_once_and_ep_defaults_to_the_run():
+    out = run("l3_prepretry")
+    by = {c["label"]: c["prompt"] for c in out["calls"]}
+    assert "RETRY" in by["kf:l3 prepare c4 (retry)"] and "wrong call site" in by["kf:l3 prepare c4 (retry)"]
+    assert out["megaCalls"][0]["args"]["gpus_per_job"] == 2
+
+
+def test_a_finished_mega_run_is_packaged_without_searching():
+    out = run("l3_run")
+    assert out["megaCalls"] == [] and "kf:l3 prepare c4" not in labels(out)
+    by = {c["label"]: c["prompt"] for c in out["calls"]}
+    assert "MEGA_RUN: /old/mega_state" in by["kf:l3 package c4"]
+    assert out["result"]["l3"][0]["status"] == "applied"
+
+
+def test_l3_takes_only_the_ep_moe_pattern_by_default():
+    out = run("l3_ar")
+    by = {c["label"]: c["prompt"] for c in out["calls"]}
+    assert out["megaCalls"] == [] and not any(l.startswith("kf:l3 ") for l in labels(out))
+    assert "expert-parallel MoE MegaKernel (the MegaMoE pattern) IS implementable" in by["kf:analyst"]
+    assert "MULTI-RANK stage" not in by["kf:analyst"]
+
+
+def test_a_collective_stage_goes_to_mega_once_its_kind_is_opened():
+    out = run("l3_ar_open")
+    (call,) = out["megaCalls"]
+    by = {c["label"]: c["prompt"] for c in out["calls"]}
+    assert "cross_device_reduce_1stage" in by["kf:l3 prepare c4"] and "multi-rank stage" in by["kf:l3 prepare c4"]
+    assert "MULTI-RANK stage" in by["kf:analyst"] and "all-reduce" in by["kf:analyst"]
+    assert out["result"]["l3"][0]["status"] == "applied"
+    # a collective stage gets the collective defaults, not the MoE ones
+    assert call["args"]["launch_target"] == 1 and "analysis_skill" not in call["args"]
+    assert out["result"]["l3"][0]["stage_kind"] == "collective"
+
+
+def test_mega_args_layer_defaults_prepare_workflow_and_caller():
+    out = run("l3")
+    a = out["megaCalls"][0]["args"]
+    assert (a["mega_profile"], a["analysis_skill"], a["launch_target"]) == ("production", "moe_bottleneck", 2)
+    assert a["target_guards"] == ["64_uniform"]                      # prepare's case-level args
+    assert a["required_pairs"] == 8 and a["use_expert_skills"] == "true"   # caller overrides policy
+    # the caller cannot move what the workflow owns
+    assert a["workflow_dir"].endswith("/kernel_workflow") and not a["workflow_dir"].startswith("/other")
+    assert out["megaCalls"][0]["ref"]["scriptPath"] == f"{a['workflow_dir']}/kernel_mega.js"
+    assert out["result"]["l3"][0]["ignored_mega_args"] == ["workflow_dir"]
+
+
 def test_a_seam_given_as_a_string_still_reaches_extraction_and_authoring():
     # c32 2026-11-02: the analyst returned seam as "pkg.mod:fn"; seamOf() only read seam.target_callable, so every
     # pattern the triage picked was dropped and the stage ended no_gain without writing a single kernel.
@@ -339,6 +438,20 @@ def test_a_gain_inside_the_noise_band_is_not_handed_on():
     assert run("accept")["result"]["status"] == "accepted"                          # +2.5% clears it
 
 
+@pytest.mark.parametrize("scenario, to_mega", [
+    ("l3", True),                 # EP library kernels (megamoe / ep_combine)
+    ("l3_kind_scratch", True),    # from-scratch Triton MoE on an EP deployment: no library names
+    ("l3_kind_tp_moe", False),    # TP-sharded MoE + all-reduce (ep=1): a collective stage, off by default
+    ("l3_kind_attn", False),      # attention + a routing gate + all-reduce: no expert GEMM
+    ("l3_kind_dense", False),     # dense GEMM + quant
+    ("l3_kind_light", False),     # L3 stage fusion (router + top-k + dispatch prep): no expert GEMM, authored as usual
+])
+def test_mode_mega_takes_only_ep_moe_stages(scenario, to_mega):
+    out = run(scenario)
+    assert bool(out["megaCalls"]) == to_mega, scenario
+    assert any(l == "kf:l3 prepare c4" for l in labels(out)) == to_mega
+
+
 def test_a_hand_assembled_prepare_delivery_still_counts():
     # c28 E10: node was not on PATH, the skill could not run its packer and put the passing UT on the entry itself
     out = run("agentx_flat")
@@ -354,3 +467,49 @@ def test_a_stack_that_misses_the_sampled_gsm8k_is_confirmed_on_the_full_set_befo
     assert "decide the accuracy gate on that result alone" in integ
     # only a miss on the full set reaches the per-kernel screen, which is judged on the full set too
     assert "ACCURACY_LIMIT: 1319" in by["kf:integrate screen"]
+
+
+def test_l3_on_moves_only_the_ep_moe_megakernel_out_of_the_unsupported_patterns():
+    by = {c["label"]: c["prompt"] for c in run("l3")["calls"]}
+    for label in ("kf:analyst", "kf:triage"):
+        assert "L3 MegaKernel other than the expert-parallel MoE (MegaMoE) pattern" in by[label], label
+        assert "L4 (whole-layer MonoKernel)" in by[label]
+    assert "IMPLEMENTABLE_LEVELS: L1,L2,L3" in by["kf:analyst"]
+    off = {c["label"]: c["prompt"] for c in run("accept")["calls"]}
+    assert "e.g. MegaMoE" in off["kf:analyst"] and "MegaMoE) pattern" not in off["kf:analyst"]
+
+
+def test_a_pinned_kernel_language_reaches_the_analyst_and_every_author():
+    out = run("lang_flydsl")
+    by = {c["label"]: c["prompt"] for c in out["calls"]}
+    assert 'language ("flydsl": this run\'s kernels are written in it)' in by["kf:analyst"]
+    authors = [p for l, p in by.items() if l.startswith("kf:author ")]
+    assert authors and all("ONE fused flydsl kernel" in p for p in authors)
+    # unset: the analyst's choice, triton by default
+    plain = {c["label"]: c["prompt"] for c in run("accept")["calls"]}
+    assert all("ONE fused triton kernel" in p for l, p in plain.items() if l.startswith("kf:author "))
+
+
+def test_auto_language_follows_the_gpu():
+    out = run("lang_auto_gfx942")      # no default for gfx942: unchanged
+    assert all("ONE fused triton kernel" in c["prompt"] for c in out["calls"] if c["label"].startswith("kf:author "))
+
+
+def test_a_mega_search_on_gfx950_is_held_to_flydsl_by_default():
+    out = run("l3_gfx950")
+    a = out["megaCalls"][0]["args"]
+    assert "KERNEL LANGUAGE: write every candidate's fused kernel in flydsl" in a["task"]
+    by = {c["label"]: c["prompt"] for c in out["calls"]}
+    assert "KERNEL_LANGUAGE: flydsl" in by["kf:l3 prepare c4"]
+    assert out["result"]["l3"][0]["kernel_language"] == "flydsl"
+    # L1/L2 authors keep the analyst's language unless kf_kernel_language pins one
+    assert all("ONE fused triton kernel" in p for l, p in by.items() if l.startswith("kf:author "))
+    assert "KERNEL LANGUAGE" not in run("l3")["megaCalls"][0]["args"].get("task", "")
+
+
+def test_an_ep4_deployment_runs_mega_on_its_four_gpus():
+    out = run("l3_ep4")
+    a = out["megaCalls"][0]["args"]
+    assert (a["gpu_ids"], a["gpus_per_job"]) == ("0,1,2,3", 4)
+    by = {c["label"]: c["prompt"] for c in out["calls"]}
+    assert "EP_DEFAULT: 4" in by["kf:l3 prepare c4"] and "EP_DEFAULT: 4" in by["kf:l3 package c4"]

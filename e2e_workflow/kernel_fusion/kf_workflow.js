@@ -6,7 +6,7 @@ export const meta = {
     { title: 'Setup', detail: 'e2e Director builds the KF eval dir + baseline throughput, one fresh server and one timed round, no warmup round (roles/director.md PHASE=setup)' },
     { title: 'Trace', detail: 'AgentX: kernel-extract skill sampling capture (points from the baseline log, one probe each); else roles/profiler.md; or kf_trace_dir' },
     { title: 'TopK', detail: 'fusion analyst: kf_trace_digest.py + the user prompt -> ranked Top-K fusion candidates (topk.json)' },
-    { title: 'Author', detail: 'a triage agent picks the Top-K patterns worth authoring (no cap, no gain floor); each: region UT (AgentX: kernel-extract skill prepare; else roles/kernel_extractor.md), then one author agent writes the fused kernel against that UT' },
+    { title: 'Author', detail: 'a triage agent picks the Top-K patterns worth authoring (no cap, no gain floor); each: region UT (AgentX: kernel-extract skill prepare; else roles/kernel_extractor.md), then one author agent writes the fused kernel against that UT; with kf_l3_mega a multi-rank stage (L3: EP MoE, collective + compute) goes to GEAK mode=mega instead' },
     { title: 'ApplyBack', detail: 'a select agent picks from the UT results which kernels go on; they go in as one combined overlay on one e2e_integrator A/B (gsm8k on the whole stack first); only if the stack fails accuracy is each kernel checked alone and the A/B re-run without the failing ones' },
   ],
 };
@@ -109,6 +109,77 @@ const CAPTURE_STORAGE_ENV = `CAPTURE_BYTE_BUDGET=${A.capture_byte_budget || '8Gi
   `CAPTURE_CASE_BYTE_LIMIT=${A.capture_case_byte_limit || '2GiB'} CAPTURE_PERSIST_POLICY=${CAPTURE_PERSIST_POLICY}`;
 const AUTHOR_K = parseInt(A.kf_author_k != null ? A.kf_author_k : 0, 10);   // 0 = no cap: the triage agent decides
 const AGENT_TIMEOUT_MS = parseInt(A.agent_timeout_ms != null ? A.agent_timeout_ms : 7200000, 10);
+
+// L3 stage fusion (opt-in). A multi-rank stage -- the kernels of one functional stage that include cross-GPU
+// communication (EP MoE dispatch -> expert GEMMs -> combine; an all-reduce / all-gather / reduce-scatter with
+// the compute around it) -- cannot be authored on one card. With kf_l3_mega on, the analyst may rank it as an
+// implementable L3 candidate, and Author hands it to GEAK mode=mega (kernel_workflow/kernel_mega.js, one
+// nested workflow) on the serving GPUs instead of an author agent. Off: nothing below changes a prompt.
+const jsonArg = (v) => { if (v && typeof v === 'object') return v;
+  try { const o = JSON.parse(String(v || '')); return o && typeof o === 'object' ? o : null; } catch (e) { return null; } };
+const L3_ON = String(A.kf_l3_mega != null ? A.kf_l3_mega : 'false').trim().toLowerCase() === 'true';
+// Kernel language. Languages differ in speed on the same GPU, and nothing here races them, so the language can be
+// pinned: kf_kernel_language = a language (e.g. flydsl), or "auto" for the GPU's default below. Unset, L1/L2/L3
+// stage-fusion kernels keep the analyst's choice (triton unless it has a reason) and a mode=mega search follows
+// its GPU's default, else the language of the source it starts from.
+const LANGUAGE_BY_GFX = { gfx950: 'flydsl' };
+const KF_GFX = String(A.expected_gfx || A.gfx || '').trim().toLowerCase();
+const LANG_ARG = String(A.kf_kernel_language || '').trim().toLowerCase();
+const KERNEL_LANGUAGE = LANG_ARG === 'auto' ? (LANGUAGE_BY_GFX[KF_GFX] || '') : LANG_ARG;
+const L3_LANGUAGE = KERNEL_LANGUAGE || LANGUAGE_BY_GFX[KF_GFX] || '';
+const L3_GEAK_DIR = String(A.kf_l3_geak_dir || `${WORKFLOW_DIR.replace(/\/[^/]*$/, '')}/kernel_workflow`).replace(/\/+$/, '');
+const L3_MAX = Math.max(1, parseInt(A.kf_l3_max != null ? A.kf_l3_max : 1, 10) || 1);
+const L3_BUDGET_S = parseInt(A.kf_l3_budget_s != null ? A.kf_l3_budget_s : 8 * 3600, 10);
+const L3_ROUNDS = parseInt(A.kf_l3_rounds != null ? A.kf_l3_rounds : 12, 10);
+const L3_MEGA_ARGS = jsonArg(A.kf_l3_mega_args) || {};    // merged last into the mega args
+const L3_OPERATOR = jsonArg(A.kf_l3_operator);             // known operator facts: prepare verifies them
+// A finished mode=mega run of this stage (its state_dir, eval dir or a mega_result.json): packaged in minutes
+// instead of a new search. Without it the stage searches, which takes hours beyond the stage's usual ~7 h.
+const L3_MEGA_RUN = String(A.kf_l3_mega_run || '').replace(/\/+$/, '');
+const L3_EP_DEFAULT = parseInt(A.ep != null ? A.ep : SERVING_TP, 10) || SERVING_TP;
+// Stage kinds L3 hands to mode=mega. ep_moe (dispatch -> expert GEMMs -> combine) is the validated one and the
+// default; collective (a TP all-reduce / all-gather / reduce-scatter with its compute) is wired but opt-in
+// (kf_l3_stage_kinds) until mode=mega has been measured on it.
+const L3_KINDS = new Set(String(A.kf_l3_stage_kinds || 'ep_moe').split(',').map((s) => s.trim()).filter(Boolean));
+const EP_MOE_RE = new RegExp('megamoe|ep_combine|ep_dispatch|deepep|mori_|all_?to_?all|a2a_' +
+  (A.kf_l3_kernel_regex ? `|${A.kf_l3_kernel_regex}` : ''), 'i');
+const COLLECTIVE_RE = /all_?reduce|cross_device_reduce|custom_ar|quickreduce|all_?gather|reduce_?scatter|rccl|nccl/i;
+// MoE expert compute (expert GEMMs, not routing alone): on an expert-parallel deployment (args.ep > 1) a stage of these
+// is an EP MoE stage even when its dispatch/combine kernels carry no library name (a from-scratch Triton path).
+const MOE_KERNEL_RE = /fused_moe|moe_gemm|ck_moe|fmoe|moe_stage|moe_mlp|grouped_gemm|experts?_(gemm|mlp|ffn)/i;
+const EP_DEPLOYED = (parseInt(A.ep, 10) || 1) > 1;
+const hasKernel = (c, re) => (c.kernels || []).some((k) => re.test(String(k)));
+// The kind is read from the stage's own kernels, so a candidate is never taken on its label alone.
+const stageKind = (c) => ((hasKernel(c, EP_MOE_RE) || (EP_DEPLOYED && hasKernel(c, MOE_KERNEL_RE))) ? 'ep_moe'
+  : (hasKernel(c, COLLECTIVE_RE) ? 'collective' : ''));
+// Mode=mega takes the MegaKernel form only (it rewrites the heavy expert/GEMM work). A light L3 stage fusion over
+// the same kernels (router + metadata + dispatch preparation) stays with the author agents.
+// Evidence is again the stage's own kernels: expert GEMMs for an EP MoE, a GEMM for a collective stage.
+const isMegaKernel = (c, kind) => (kind === 'ep_moe'
+  ? hasKernel(c, MOE_KERNEL_RE) || hasKernel(c, /megamoe_(stage|gemm)/i)
+  : hasKernel(c, /gemm|matmul/i));
+const isMegaStage = (c) => L3_ON && !!c && String(c.level || '').toUpperCase() === 'L3' && L3_KINDS.has(stageKind(c)) &&
+  isMegaKernel(c, stageKind(c));
+const L3_COLLECTIVE = L3_KINDS.has('collective');
+// The analysis scope with L3 on: L3 is implementable, and the MegaKernel mode=mega implements leaves the
+// unsupported patterns (a caller's own kf_unsupported_patterns is kept as given).
+const L3_LEVELS = L3_ON && !/\bL3\b/i.test(IMPLEMENTABLE_LEVELS) ? `${IMPLEMENTABLE_LEVELS},L3` : IMPLEMENTABLE_LEVELS;
+const L3_UNSUPPORTED = L3_ON && A.kf_unsupported_patterns == null
+  ? `L3 MegaKernel other than the ${L3_COLLECTIVE ? 'expert-parallel MoE (MegaMoE) and TP-collective stages, e.g. an attention ' +
+      'MegaKernel' : 'expert-parallel MoE (MegaMoE) pattern, e.g. a TP all-reduce overlapped with its GEMM or an attention ' +
+      'MegaKernel'}, which GEAK mode=mega does not implement here; L4 (whole-layer MonoKernel)`
+  : UNSUPPORTED_PATTERNS;
+// Search-policy defaults per stage kind (kernel_fusion/l3_mega_defaults.json, passed in by kf_stage.py).
+const L3_DEFAULTS = jsonArg(A.kf_l3_defaults) || {};
+// The workflow owns where mega runs, on which GPUs and for how long; l3_mega_args cannot move them
+// (l3_operator / l3_rounds / l3_budget_s are the knobs for those).
+const L3_OWNED_KEYS = ['mode', 'workflow_dir', 'kernel_path', 'benchmark_harness', 'gpu_ids', 'gpus_per_job',
+  'job_gpu_ids', 'exp_root', 'state_dir', 'budget', 'mega_time_budget_s'];
+const L3_OVERRIDES = Object.fromEntries(Object.entries(L3_MEGA_ARGS).filter(([k]) => !L3_OWNED_KEYS.includes(k)));
+const L3_IGNORED = Object.keys(L3_MEGA_ARGS).filter((k) => L3_OWNED_KEYS.includes(k));
+if (L3_ON && L3_IGNORED.length) {
+  log(`[kf] L3: l3_mega_args keys the workflow owns are ignored: ${L3_IGNORED.join(', ')}`);
+}
 
 // Stop STARTING author/apply work once 85% of the stage budget is gone; in-flight work finishes and the
 // stage returns whatever was accepted. Inert without time_budget_s.
@@ -498,17 +569,38 @@ Write ${OUT}/topk.json: {"candidates": [...], "recommended": [ids in the order t
         so confirm the module from the trace's launch frames, not from a name match; source_file; lines},
   inputs_outputs (tensors that cross the region boundary, with shapes/dtypes), launches_before, launches_after,
   region_pct_device_time (weighted), est_gain_pct_upper, est_gain_pct_expected (weighted e2e %),
-  difficulty (1-5), bitwise_exact (bool), exclusive_with [ids of conflicting candidates], language ("triton" unless you have a reason),
+  difficulty (1-5), bitwise_exact (bool), exclusive_with [ids of conflicting candidates], language (${KERNEL_LANGUAGE ? `"${KERNEL_LANGUAGE}": this run's kernels are written in it` : '"triton" unless you have a reason'}),
   fallback (id of the smaller-scope candidate to implement instead if this one fails, or null),
   fused_design (how the fused kernel works: tiling, what stays in registers/LDS, what it no longer writes to HBM).
 "recommended" = a list of candidate ids (not a per-candidate flag): the non-conflicting set the prompt's ranking
 recommends, best first. A candidate whose region
 cannot be reached through one Python seam can still be ranked, but must not be recommended.
-
+${L3_ON ? `
+## L3 stage fusion through GEAK mode=mega (on in this run)
+${L3_COLLECTIVE
+    ? `A MULTI-RANK stage IS implementable in this run: the kernels of one functional stage that include cross-GPU
+communication, e.g. an expert-parallel MoE (dispatch -> expert GEMMs -> combine over the EP group), or an
+all-reduce / all-gather / reduce-scatter together with the compute it feeds or follows (GEMM + reduce, reduce +
+norm + quant, attention output + all-reduce).`
+    : `The expert-parallel MoE MegaKernel (the MegaMoE pattern) IS implementable in this run, one stage over the EP group.
+Its region is everything the live path launches between the MoE layer's input and its output: routing (gate GEMM,
+top-k, sorting / routing metadata), the activation quant before dispatch, dispatch, expert GEMM1 + activation +
+GEMM2 (with their quant), combine and the weighted reduction, and the shared expert(s) when the layer computes them
+there (fused into the routed experts, or alongside them). List every one of these kernels the trace shows as ONE
+candidate: mode=mega decides how much of it to fuse (it may keep some launches), so do not split it into smaller
+L3 candidates. Other multi-rank stages (a TP collective with its compute, attention) stay not implemented as MegaKernels.`} GEAK mode=mega searches a fused multi-rank kernel for it on the
+serving GPUs, so UNSUPPORTED_PATTERNS no longer lists it: rank it as a candidate with
+level "L3", implementable_by "mega", kernels = the stage's device kernels in order (communication kernels
+included), seam.target_callable = the ONE Python callable that runs the whole stage on the served path,
+exclusive_with = every L1/L2 candidate whose region lies inside it, and the same gain fields as the others. It may
+be recommended together with the candidates it does not conflict with. Give implementable_by "mega" to this
+MegaKernel only: an L3 stage fusion that rewrites no expert GEMM (e.g. router + metadata + dispatch preparation)
+is authored on one GPU as usual.
+` : ''}
 ## Inputs
 ${cfg({ EVAL_DIR, TRACE_DIR, WORKLOAD_SUMMARY: workloadJson || '(none)', PROFILE_TOPN: profileTopN || '(none)',
     MODEL_PATH, BACKEND, SERVING_TP, SERVER_FLAGS: INIT_FLAGS, SERVER_ENV: INIT_ENV, LAUNCH_SCRIPT: LAUNCH_SCRIPT || '(none)',
-    WORKLOAD, OVERLAY: INIT_OVERLAY || '(none)', IMPLEMENTABLE_LEVELS, UNSUPPORTED_PATTERNS })}
+    WORKLOAD, OVERLAY: INIT_OVERLAY || '(none)', IMPLEMENTABLE_LEVELS: L3_LEVELS, UNSUPPORTED_PATTERNS: L3_UNSUPPORTED })}
 
 ${KF_TASK ? `## Operator constraints\n${KF_TASK}\n\n` : ''}Return JSON: {"topk_json": "${OUT}/topk.json", "report_path": "${OUT}/REPORT.md", "report_md": "<full report>",
 "model_notes_md": "<model notes>", "digest_md": "${OUT}/digest/digest.md", "candidates": <topk.json candidates>,
@@ -549,9 +641,12 @@ pick what you judge worth the effort and say why, and say why for each one you l
 The one hard line: a candidate is authored by rebinding ONE Python callable that covers its whole region
 (seam.target_callable) and is the one the live server actually runs (check the trace's launch frames: a model can
 have several implementations of the same layer); one without such a seam cannot be authored. Implementable scope:
-levels ${IMPLEMENTABLE_LEVELS}, except ${UNSUPPORTED_PATTERNS}; a candidate outside it is not authored (a level alone
+levels ${L3_LEVELS}, except ${L3_UNSUPPORTED}; a candidate outside it is not authored (a level alone
 is no reason to skip a candidate inside it). Mutually exclusive candidates (exclusive_with)
-may both be picked: which of them goes into the server is decided after their unit tests.
+may both be picked: which of them goes into the server is decided after their unit tests.${L3_ON ? `
+An L3 MegaKernel candidate with implementable_by "mega" (${L3_COLLECTIVE ? 'an EP MoE or TP-collective stage' : 'the expert-parallel MoE stage'}) is not written by an
+author agent: GEAK mode=mega searches it on all serving GPUs, which takes hours, and at most ${L3_MAX} such stage(s)
+run. Pick it when its weighted gain is worth that; its exclusive L1/L2/L3 candidates may be picked too.` : ''}
 Read ${topk.topk_json || '(the candidates below)'}${topk.report_md ? ' and the report below' : ''}; read anything else you need.
 
 ## Candidates
@@ -565,13 +660,22 @@ ${KF_TASK ? `## Operator constraints\n${KF_TASK}\n\n` : ''}Return JSON {"selecte
 let jobs = ((triage && triage.selected) ? triage.selected.map((x) => x && x.id) : (topk.recommended || []))
   .map((id) => byId.get(String(id))).filter((c, i, a) => c && seamOf(c) && a.indexOf(c) === i);
 if (AUTHOR_K > 0) jobs = jobs.slice(0, AUTHOR_K);
+// L3 stages go to mode=mega, serially and after every author agent: mega needs all the serving GPUs.
+const megaJobs = jobs.filter(isMegaStage);
+jobs = jobs.filter((c) => !isMegaStage(c));
+for (const c of megaJobs.slice(L3_MAX)) {
+  result.rejected.push({ id: String(c.id), stage: 'triage', reason: `L3 stage past kf_l3_max=${L3_MAX}` });
+}
+megaJobs.splice(L3_MAX);
+if (L3_ON) result.l3 = megaJobs.map((c) => ({ id: String(c.id), status: 'pending', reason: '' }));
 for (const x of (triage && triage.skipped) || []) {
   if (x && byId.has(String(x.id))) result.rejected.push({ id: String(x.id), stage: 'triage', reason: String(x.reason || '').slice(0, 600) });
 }
-log(`[kf] triage: authoring ${jobs.length} pattern(s): ${jobs.map((c) => c.id).join(', ')}`);
+log(`[kf] triage: authoring ${jobs.length} pattern(s): ${jobs.map((c) => c.id).join(', ')}` +
+    (megaJobs.length ? `; L3 through mode=mega: ${megaJobs.map((c) => c.id).join(', ')}` : ''));
 // Picks that all vanish here are a broken hand-off, not a measured "no gain": say so.
 const picked = ((triage && triage.selected) || []).length;
-if (picked && !jobs.length) {
+if (picked && !jobs.length && !megaJobs.length) {
   result.status = 'error';
   result.reason = `triage selected ${picked} pattern(s) but none has a usable seam.target_callable`;
   return result;
@@ -669,7 +773,7 @@ async function authorOne(c, i) {
         device_kernel: (c.kernels || [])[0] || '', device_kernels: c.kernels || [],
         target_callable: seamOf(c), source_hint: (c.seam || {}).source_file || '',
         seam_candidates: [seamOf(c)].filter(Boolean), inputs_outputs: c.inputs_outputs || '',
-        phases: c.phases || [], m_range: c.m_range || '', candidate_backends: [c.language || 'triton'] },
+        phases: c.phases || [], m_range: c.m_range || '', candidate_backends: [KERNEL_LANGUAGE || c.language || 'triton'] },
       CURRENT_OVERLAY: INIT_OVERLAY, CURRENT_FLAGS: INIT_FLAGS, CURRENT_ENV: INIT_ENV,
     }), { phase: 'Author', label: `kf:extract ${short}`, schema: EXTRACT_SCHEMA });
   // Same guard as e2e extractWithBaseline: without a frozen live baseline the unittest would time the
@@ -679,7 +783,7 @@ async function authorOne(c, i) {
   if (!extOk) {
     return { c, skip: `extraction failed (${ext ? ext.notes || ext.unittest_smoke : 'none'})` };
   }
-  const lang = c.language || 'triton';
+  const lang = KERNEL_LANGUAGE || c.language || 'triton';
   // The fused kernel is written by one agent from a plain instruction (not the GEAK kernel layer): the region,
   // the UT it must pass and the goal. It works on a copy of the task dir and hands back a diff for apply back.
   const work = `${EVAL_DIR}/kernels/${short}`;
@@ -734,7 +838,118 @@ whether or not it beats stock -- the next step judges it) or "" if you have no c
   const iso = kl ? (kl.final_weighted != null ? kl.final_weighted : kl.final_geomean) : 0;
   return { c, ext, kl, lang, iso };
 }
+// ---- L3: one multi-rank stage through GEAK mode=mega ----------------------------------------------------
+// prepare (the served operator, its frozen source tree, a multi-rank UT) -> kernel_mega.js on the serving
+// GPUs -> package the delivered candidate as an overlay of the same shape an author agent returns, so select,
+// the stack A/B and the correctness screen treat it like any other fused kernel. With kf_l3_mega_run only
+// package runs. Instructions: kernel_fusion/l3_mega.md.
+const L3_DOC = `${KF_HOME}/l3_mega.md`;
+const L3_PREP_SCHEMA = obj({ status: { type: 'string', enum: ['ready', 'blocked'] },
+  kernel_path: { type: 'string' }, benchmark_harness: { type: 'string' }, ep_size: { type: 'number' },
+  package: { type: 'string' }, call_site: { type: 'string' }, cases: arrObj,
+  mega_args: { type: 'object', additionalProperties: true }, reason: { type: 'string' } }, ['status']);
+function megaSummary(ret) {
+  if (!ret || typeof ret !== 'object') return null;
+  const sel = String(ret.mega_selected_candidate || '');
+  const row = (Array.isArray(ret.mega_candidate_registry) ? ret.mega_candidate_registry : [])
+    .find((x) => x && String(x.id || '') === sel) || null;
+  return { deliverable: ret.mega_deliverable === true, selected_candidate: sel,
+    selected: row ? { id: row.id, tree: row.tree, final_tree: row.final_tree, patch: row.patch,
+      activation: row.activation, absolute_score: row.absolute_score, per_case: row.per_case } : null,
+    final_speedup: ret.final_speedup != null && Number.isFinite(Number(ret.final_speedup)) ? Number(ret.final_speedup) : null,
+    eval_dir: String(ret.eval_dir || ''), report_path: String(ret.report_path || ''),
+    final_patch: String(ret.final_patch || ''), note: String(ret.mega_note || '') };
+}
+async function megaOne(c) {
+  const short = shortOf(c);
+  const work = `${EVAL_DIR}/kernels/${short}`;
+  const row = (result.l3 || []).find((x) => x.id === String(c.id)) || {};
+  const stop = (status, why) => {
+    Object.assign(row, { status, reason: String(why || '').slice(0, 600) });
+    log(`[kf] L3 ${c.id}: ${status} (${row.reason})`);
+    return { c, skip: `L3 ${status}: ${row.reason}`, stage: 'l3' };
+  };
+  if (DEADLINE_HIT) return stop('skipped', 'stage deadline');
+  const stage = { id: c.id, region: c.region, kernels: c.kernels || [], phases: c.phases || [], seam: c.seam || {},
+    m_range: c.m_range || '', occurrences: c.occurrences || {}, exclusive_with: c.exclusive_with || [] };
+  const pkgLabel = `kf:l3 package ${short}`;
+  let prep = null, mega = null;
+  if (!L3_MEGA_RUN && !REUSED[pkgLabel]) {
+    const prepare = (prior) => safeAgent(`You prepare one multi-rank stage for GEAK mode=mega.
+Read ${L3_DOC} and follow PHASE=prepare.${prior ? ` RETRY: the previous prepare returned blocked (${prior}); read what it left
+under L3_DIR, fix that cause and try once more.` : ''}
+
+## Inputs
+${cfg({ EVAL_DIR, L3_STAGE: stage, L3_DIR: work, MODEL_PATH, BACKEND, SERVING_TP, SERVING_GPU, EP_DEFAULT: L3_EP_DEFAULT,
+    ...(L3_LANGUAGE ? { KERNEL_LANGUAGE: L3_LANGUAGE } : {}),
+    SERVER_FLAGS: INIT_FLAGS, SERVER_ENV: INIT_ENV, CURRENT_OVERLAY: INIT_OVERLAY || '(none)', TRACE_DIR,
+    WORKLOAD_SUMMARY: workloadJson || '(none)', GEAK_KERNEL_WORKFLOW_DIR: L3_GEAK_DIR,
+    ...(L3_OPERATOR ? { OPERATOR_HINT: L3_OPERATOR } : {}) })}
+${KF_TASK ? `\n## Operator constraints\n${KF_TASK}\n` : ''}
+Return JSON {status: "ready"|"blocked", kernel_path, benchmark_harness, ep_size, package, call_site, cases, mega_args, reason}.`,
+      { phase: 'Author', label: `kf:l3 prepare ${short}${prior ? ' (retry)' : ''}`, schema: L3_PREP_SCHEMA });
+    const ok = (p) => !!(p && p.status === 'ready' && p.kernel_path && p.benchmark_harness);
+    prep = await prepare('');
+    if (!ok(prep) && !DEADLINE_HIT) prep = await prepare(String((prep && prep.reason) || 'no result').slice(0, 800));
+    if (!ok(prep)) return stop('prepare_blocked', (prep && prep.reason) || 'no result');
+    // policy defaults -> stage-kind defaults -> prepare's case-level args -> workflow-owned -> caller overrides
+    const kind = stageKind(c);
+    const megaArgs = {
+      ...(L3_DEFAULTS.common || {}), ...(L3_DEFAULTS[kind] || {}),
+      ...(prep.mega_args && typeof prep.mega_args === 'object' ? prep.mega_args : {}),
+      mode: 'mega', workflow_dir: L3_GEAK_DIR, kernel_path: prep.kernel_path, benchmark_harness: prep.benchmark_harness,
+      gpu_ids: SERVING_GPU, gpus_per_job: Math.min(SERVING_GPU.split(',').length,
+        Number(prep.ep_size) > 0 ? Number(prep.ep_size) : L3_EP_DEFAULT),
+      exp_root: `${work}/mega_runs`, state_dir: `${work}/mega_state`,
+      budget: L3_ROUNDS, mega_time_budget_s: L3_BUDGET_S, ...L3_OVERRIDES,
+    };
+    if (L3_LANGUAGE) {
+      megaArgs.task = `${megaArgs.task || ''}${megaArgs.task ? ' ' : ''}KERNEL LANGUAGE: write every candidate's fused ` +
+        `kernel in ${L3_LANGUAGE}; a candidate in another language does not count.`;
+    }
+    Object.assign(row, { stage_kind: kind, ...(L3_LANGUAGE ? { kernel_language: L3_LANGUAGE } : {}), mega_args: { kernel_path: megaArgs.kernel_path,
+      benchmark_harness: megaArgs.benchmark_harness, gpus_per_job: megaArgs.gpus_per_job, budget: megaArgs.budget,
+      mega_time_budget_s: megaArgs.mega_time_budget_s, state_dir: megaArgs.state_dir },
+      ...(L3_IGNORED.length ? { ignored_mega_args: L3_IGNORED } : {}) });
+    log(`[kf] L3 ${c.id}: GEAK mode=mega on GPU ${megaArgs.gpu_ids} (gpus_per_job ${megaArgs.gpus_per_job}), ` +
+        `${megaArgs.budget} rounds, ${Math.round(megaArgs.mega_time_budget_s / 60)} min`);
+    try {
+      mega = megaSummary(await workflow({ scriptPath: `${L3_GEAK_DIR}/kernel_mega.js` }, megaArgs));
+    } catch (e) {
+      return stop('mega_error', (e && e.message) || String(e));
+    }
+    row.mega = mega;
+    if (!(mega && mega.deliverable)) return stop('mega_no_deliverable', (mega && mega.note) || 'mega returned nothing');
+  }
+  const pkg = await safeAgent(`You package a delivered GEAK mode=mega candidate as a KernelFusion overlay.
+Read ${L3_DOC} and follow PHASE=package.
+
+## Inputs
+${cfg({ EVAL_DIR, L3_STAGE: stage, L3_DIR: work, MODEL_PATH, BACKEND, SERVING_TP, SERVING_GPU, EP_DEFAULT: L3_EP_DEFAULT,
+    SERVER_FLAGS: INIT_FLAGS, SERVER_ENV: INIT_ENV, CURRENT_OVERLAY: INIT_OVERLAY || '(none)',
+    OVERLAY_DIR: `${work}/overlay`, BANNER: `[kf-${short}] ENGAGED`, GEAK_KERNEL_WORKFLOW_DIR: L3_GEAK_DIR,
+    ...(mega ? { MEGA_RESULT: mega, PREPARED: prep } : { MEGA_RUN: L3_MEGA_RUN }),
+    ...(L3_OPERATOR ? { OPERATOR_HINT: L3_OPERATOR } : {}) })}${GRAPH_REQ ? `\n\n${GRAPH_REQ.trim()}` : ''}
+${KF_TASK ? `\n## Operator constraints\n${KF_TASK}\n` : ''}
+Return JSON {"final_patch": "${work}/final_patch.diff" or "" if there is no correct candidate, "work_dir", "overlay_dir":
+"${work}/overlay", "banner": "[kf-${short}] ENGAGED", "isolated_speedup": <mega's verified speedup on the target case,
+rank-max graph replay>, "correctness": "pass"|"fail", "launches_after", "ut_command", "notes"}.`,
+    { phase: 'Author', label: pkgLabel, schema: AUTHOR_SCHEMA });
+  if (!(pkg && pkg.correctness === 'pass' && pkg.final_patch && pkg.overlay_dir)) {
+    return stop('package_blocked', (pkg && pkg.notes) || 'no result');
+  }
+  const iso = Number(pkg.isolated_speedup) || (mega && mega.final_speedup) || 0;
+  Object.assign(row, { status: 'packaged', reason: '', overlay_dir: pkg.overlay_dir, isolated_speedup: iso,
+    source: mega ? 'search' : (L3_MEGA_RUN ? `mega_run ${L3_MEGA_RUN}` : 'reused') });
+  return { c, lang: 'mega', iso,
+    ext: { short_name: short, task_dir: (prep && prep.kernel_path) || work,
+      target_callable: (prep && prep.call_site) || seamOf(c) },
+    kl: { eval_dir: (mega && mega.eval_dir) || work, final_patch: pkg.final_patch, overlay_dir: pkg.overlay_dir,
+      banner: pkg.banner || `[kf-${short}] ENGAGED`, final_geomean: iso, validation_status: 'pass',
+      reason: pkg.notes || '' } };
+}
 const authored = await parallel(jobs.map((c, i) => () => authorOne(c, i)));
+for (const c of megaJobs) authored.push(await megaOne(c));
 const authoredById = new Map(authored.filter(Boolean).map((r) => [String(r.c.id), r]));
 // A kernel can go on only if it exists, passed its UT and has an overlay: everything else is the selector's call.
 const usable = (r) => r && !r.skip && r.kl && r.kl.authored !== false && r.kl.final_patch && r.kl.overlay_dir;
@@ -742,7 +957,7 @@ for (const r of authored) {
   if (r && !usable(r)) {
     const why = r.skip || `no correct kernel (${r.kl ? r.kl.reason || r.kl.validation_status || '' : 'none'})`;
     log(`[kf] ${r.c.id}: ${why}`);
-    result.rejected.push({ id: r.c.id, stage: r.skip ? 'extract' : 'author', reason: why, isolated_speedup: r.iso || 0 });
+    result.rejected.push({ id: r.c.id, stage: r.stage || (r.skip ? 'extract' : 'author'), reason: why, isolated_speedup: r.iso || 0 });
   }
 }
 const ready = authored.filter(usable);
@@ -758,7 +973,8 @@ const utView = (r) => ({ id: r.c.id, level: r.c.level, region: r.c.region, phase
   seam: seamOf(r.c), exclusive_with: r.c.exclusive_with || [], region_pct_device_time: r.c.region_pct_device_time || 0,
   est_gain_pct_expected: r.c.est_gain_pct_expected || 0, ut_correctness: r.kl.validation_status,
   isolated_speedup: r.iso, launches_before: r.c.launches_before || (r.c.kernels || []).length,
-  final_patch: r.kl.final_patch, author_notes: String(r.kl.reason || '').slice(0, 3000) });
+  final_patch: r.kl.final_patch, author_notes: String(r.kl.reason || '').slice(0, 3000),
+  ...(r.lang === 'mega' ? { authored_by: 'GEAK mode=mega: multi-rank stage, speedup is rank-max graph replay vs its frozen baseline' } : {}) });
 let winners = [];
 if (ready.length && want('apply') && !DEADLINE_HIT) {
   const sel = await safeAgent(`You decide which fused kernels go on to the e2e accuracy check and the e2e A/B of a
@@ -787,6 +1003,8 @@ Return JSON {"selected": [{"id", "reason"}], "skipped": [{"id", "reason"}]}.`,
   for (const r of ready) {
     if (!winners.includes(r)) result.rejected.push({ id: r.c.id, stage: 'select', isolated_speedup: r.iso,
       reason: (why.get(String(r.c.id)) || 'not selected').slice(0, 600) });
+    const l3row = r.lang === 'mega' && !winners.includes(r) && (result.l3 || []).find((x) => x.id === String(r.c.id));
+    if (l3row) Object.assign(l3row, { status: 'not_selected', reason: (why.get(String(r.c.id)) || '').slice(0, 600) });
   }
   log(`[kf] select: ${winners.map((r) => `${r.c.id} (${r.iso}x)`).join(', ') || 'none'}`);
 }
@@ -884,21 +1102,54 @@ if (correctnessFail(integ) && winners.length > 1 && !DEADLINE_HIT && !RERUN_LATE
     integ = await stackAB(winners, ' (screened)');
   }
 }
+// A win is a complete A/B whose gain clears the noise band (and the stage's minimum gain).
+const gainPctOf = (x) => (x && x.ref_med > 0 && x.cand_med > 0 ? 100 * (x.cand_med / x.ref_med - 1) : null);
+const wonOf = (x) => !!(x && (x.gate === 'accepted' || x.gate === 'stack') && x.ab_complete !== false &&
+  x.accepted_overlay && gainPctOf(x) != null && gainPctOf(x) > Math.max(Number(noiseBand) || 0, KF_MIN_GAIN_PCT));
+// A stack holding an L3 kernel that did not win: gate the L1/L2 kernels alone once (with the ones only the L3
+// kernel had excluded), so an L3 kernel that loses end to end does not cost them their A/B.
+const l3Winners = winners.filter((r) => r.lang === 'mega');
+if (!wonOf(integ) && l3Winners.length && !DEADLINE_HIT) {
+  const l3Ids = new Set(l3Winners.map((r) => String(r.c.id)));
+  const clashesL3 = (r) => l3Winners.some((q) => seamOf(q.c) === seamOf(r.c) ||
+    (q.c.exclusive_with || []).map(String).includes(String(r.c.id)) ||
+    (r.c.exclusive_with || []).map(String).some((x) => l3Ids.has(x)));
+  let rest = winners.filter((r) => r.lang !== 'mega')
+    .concat(ready.filter((r) => r.lang !== 'mega' && !winners.includes(r) && clashesL3(r)));
+  rest = rest.filter((r, i) => !rest.slice(0, i).some((q) => seamOf(q.c) === seamOf(r.c) ||
+    (q.c.exclusive_with || []).map(String).includes(String(r.c.id)) || (r.c.exclusive_with || []).map(String).includes(String(q.c.id))));
+  const why = `combined A/B with L3: ${integ ? `${integ.gate} ${integ.e2e_delta_pct}% ${integ.reason || ''}` : 'no result'}`.slice(0, 600);
+  for (const r of l3Winners) {
+    result.rejected.push({ id: r.c.id, level: r.c.level, stage: 'apply', isolated_speedup: r.iso, reason: why });
+    const row = (result.l3 || []).find((x) => x.id === String(r.c.id));
+    if (row) Object.assign(row, { status: 'ab_rejected', reason: why });
+  }
+  if (rest.length) {
+    const back = new Set(rest.filter((r) => !winners.includes(r)).map((r) => String(r.c.id)));
+    result.rejected = result.rejected.filter((x) => !(x.stage === 'select' && back.has(String(x.id))));
+    log(`[kf] ${why}; A/B again without L3: ${rest.map((r) => r.c.id).join(', ')}`);
+    winners = rest;
+    integ = await stackAB(winners, ' (without L3)');
+  } else {
+    winners = [];
+  }
+}
 const ab = { members: winners.map((r) => r.c.id), gate: integ ? integ.gate : 'incomplete',
   e2e_delta_pct: integ ? integ.e2e_delta_pct : null, ref_med: integ ? integ.ref_med : null,
   cand_med: integ ? integ.cand_med : null, parity: integ ? integ.output_parity : '',
   reason: integ ? integ.reason || '' : 'no integrator result' };
 result.validation = ab;
 const gainBand = Math.max(Number(noiseBand) || 0, KF_MIN_GAIN_PCT);
-const gainPct = integ && integ.ref_med > 0 && integ.cand_med > 0 ? 100 * (integ.cand_med / integ.ref_med - 1) : null;
-const won = integ && (integ.gate === 'accepted' || integ.gate === 'stack') && integ.ab_complete !== false &&
-  integ.accepted_overlay && gainPct != null && gainPct > gainBand;
+const gainPct = gainPctOf(integ);
+const won = wonOf(integ);
 ab.noise_band_pct = gainBand;
 if (integ && !won && gainPct != null && gainPct > 0 && (integ.gate === 'accepted' || integ.gate === 'stack')) {
   ab.reason = `gain ${gainPct.toFixed(2)}% is within the noise band ${gainBand}%; ${ab.reason}`;
 }
 for (const r of winners) {
   const rec = { id: r.c.id, level: r.c.level, isolated_speedup: r.iso, gate: ab.gate, e2e_delta_pct: ab.e2e_delta_pct };
+  const l3row = r.lang === 'mega' && (result.l3 || []).find((x) => x.id === String(r.c.id));
+  if (l3row) Object.assign(l3row, won ? { status: 'applied' } : { status: 'ab_rejected', reason: `combined A/B: ${ab.gate}` });
   if (won) result.accepted.push({ ...rec, overlay: integ.accepted_overlay });
   else result.rejected.push({ ...rec, stage: 'apply', reason: `combined A/B: ${ab.gate} ${ab.e2e_delta_pct}% ${ab.reason}`.slice(0, 600) });
 }

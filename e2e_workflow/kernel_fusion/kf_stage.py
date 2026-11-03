@@ -24,6 +24,8 @@ from typing import Any
 KF_HOME = Path(__file__).resolve().parent
 KF_SCRIPT = KF_HOME / "kf_workflow.js"
 DEFAULT_BUDGET_S = 12 * 3600
+L3_SEARCH_S = 8 * 3600          # default mode=mega time budget of one L3 search
+L3_DEFAULTS = KF_HOME / "l3_mega_defaults.json"   # mode=mega search-policy defaults per stage kind
 SCHEMA = "geak.kernel_fusion/1"
 
 # handoff key / env var -> kf_workflow.js arg
@@ -52,6 +54,18 @@ _KNOBS = {
     "task": ("GEAK_KF_TASK", "kf_task"),
     "budget_s": ("GEAK_KF_BUDGET_S", None),
     "kf_dir": ("GEAK_KF_DIR", "kf_dir"),
+    # L3 stage fusion through GEAK mode=mega (l3_mega.md); off by default
+    "kernel_language": ("GEAK_KF_KERNEL_LANGUAGE", "kf_kernel_language"),
+    "l3_mega": ("GEAK_KF_L3_MEGA", "kf_l3_mega"),
+    "l3_mega_run": ("GEAK_KF_L3_MEGA_RUN", "kf_l3_mega_run"),
+    "l3_max": ("GEAK_KF_L3_MAX", "kf_l3_max"),
+    "l3_budget_s": ("GEAK_KF_L3_BUDGET_S", "kf_l3_budget_s"),
+    "l3_rounds": ("GEAK_KF_L3_ROUNDS", "kf_l3_rounds"),
+    "l3_mega_args": ("GEAK_KF_L3_MEGA_ARGS", "kf_l3_mega_args"),
+    "l3_operator": ("GEAK_KF_L3_OPERATOR", "kf_l3_operator"),
+    "l3_kernel_regex": ("GEAK_KF_L3_KERNEL_REGEX", "kf_l3_kernel_regex"),
+    "l3_stage_kinds": ("GEAK_KF_L3_STAGE_KINDS", "kf_l3_stage_kinds"),
+    "l3_defaults": ("GEAK_KF_L3_DEFAULTS", None),
 }
 # Main-workflow-only args that mean nothing (or something wrong) to the stage.
 _MAIN_ONLY = ("eval_dir", "phases", "state", "tracelens", "time_budget_s", "final_reserve_s",
@@ -82,6 +96,9 @@ def config(h: dict, flags: set[str] | frozenset = frozenset()) -> dict | None:
 def stage_budget_s(cfg: dict, timeout_s: int) -> int:
     if cfg.get("budget_s"):
         return int(cfg["budget_s"])
+    if _truthy(cfg.get("l3_mega")) and not cfg.get("l3_mega_run"):
+        # an L3 search runs mode=mega for hours on top of the stage's usual ~7 h
+        return int(min(DEFAULT_BUDGET_S + int(cfg.get("l3_budget_s") or L3_SEARCH_S), max(timeout_s // 2, 1)))
     return int(min(DEFAULT_BUDGET_S, max(timeout_s // 3, 1)))
 
 
@@ -130,6 +147,12 @@ def build_args(cfg: dict, ps_args: dict, budget_s: int) -> dict:
             if j.strip():
                 reuse.update(reused_results(j.strip()))
         a["kf_reuse"] = {k: slim_result(v) for k, v in reuse.items()}
+    if _truthy(cfg.get("l3_mega")):
+        # the workflow script cannot read files: the L3 search-policy defaults travel in its args
+        src = cfg.get("l3_defaults", True)
+        if src not in (False, "", "0", "false", "off"):
+            d = _read_json(L3_DEFAULTS if src in (True, None, "1", "true", "on") else Path(src)) or {}
+            a["kf_l3_defaults"] = {k: v for k, v in d.items() if not k.startswith("_")}
     a["kf_dir"] = str(kf_dir_for(cfg, ps_args))
     a["time_budget_s"] = int(budget_s)
     return a
@@ -139,9 +162,10 @@ def build_args(cfg: dict, ps_args: dict, budget_s: int) -> dict:
 # only what kf_workflow.js reads.
 CAND_KEYS = ("id", "rank", "level", "region", "kernels", "phases", "occurrences", "m_range", "seam", "inputs_outputs",
              "launches_before", "launches_after", "region_pct_device_time", "est_gain_pct_expected", "difficulty",
-             "bitwise_exact", "exclusive_with", "language", "fallback", "fused_design")
+             "bitwise_exact", "exclusive_with", "language", "fallback", "fused_design", "implementable_by")
 UT_KEYS = ("task_dir", "editable", "baseline_frozen", "unittest_smoke", "smoke", "target_callable", "short_name")
 AUTHOR_KEYS = ("final_patch", "work_dir", "overlay_dir", "banner", "isolated_speedup", "correctness", "launches_after")
+L3_PREP_KEYS = ("status", "kernel_path", "benchmark_harness", "ep_size", "package", "call_site", "cases", "mega_args")
 
 
 def slim_topk(d: dict, author_k: int) -> dict:
@@ -175,12 +199,14 @@ def slim_result(r: dict) -> dict:
                for f in [*(p.get("failed_tasks") or []), *(p.get("deferred_tasks") or [])] if isinstance(f, dict)]
         return {"delivery_path": r.get("delivery_path", ""),
                 "prepared": {"head_candidates": [], "kernel_candidates": cands, "failed_tasks": why}}
+    if "benchmark_harness" in r:                                 # an L3 prepare
+        return {k: r[k] for k in L3_PREP_KEYS if k in r} | {"reason": str(r.get("reason") or "")[:300]}
     out = {k: r[k] for k in AUTHOR_KEYS if k in r}
     out["notes"] = str(r.get("notes") or "")[:300]
     return out
 
 
-REUSABLE = ("kf:kernel-extract prepare ", "kf:author ", "kf:integrate screen")
+REUSABLE = ("kf:kernel-extract prepare ", "kf:author ", "kf:integrate screen", "kf:l3 prepare ", "kf:l3 package ")
 
 
 def reused_results(journal: str) -> dict:
@@ -355,6 +381,8 @@ def run_stage(h: dict, ps_args: dict, timeout_s: int, G: dict, flags=frozenset()
         summary.update({k: wf.get(k) for k in (
             "status", "baseline_throughput_tok_s", "final_throughput_tok_s", "throughput_speedup",
             "final_overlay", "accepted", "rejected", "topk_json", "analysis_report", "trace_dir", "reason")})
+        if wf.get("l3") is not None:
+            summary["l3"] = wf["l3"]
     summary.setdefault("status", "error")
     summary["elapsed_s"] = elapsed
     if summary["status"] == "accepted" and summary.get("final_overlay"):

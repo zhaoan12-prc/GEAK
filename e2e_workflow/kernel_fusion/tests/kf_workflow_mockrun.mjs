@@ -7,6 +7,8 @@ const [scenario, WF_DIR] = process.argv.slice(2);
 const KF = '/tmp/kf_mock/kf';
 const calls = [];
 const workflows = [];
+const megaCalls = [];            // nested kernel_mega.js runs (l3* scenarios)
+const L3 = scenario.startsWith('l3');
 
 // c1 (difficulty 3) is recommended; c1s is its smaller exclusive alternative (the fallback).
 const CANDS = [
@@ -19,10 +21,27 @@ const CANDS = [
     exclusive_with: ['c1'], seam: { target_callable: 'pkg.moe:compact' }, est_gain_pct_expected: 1.6 },
   { id: 'c3', rank: 5, level: 'L3', region: 'moe stage', kernels: ['a', 'b'], difficulty: 2, seam: {}, est_gain_pct_expected: 9 },
 ];
+// l3*: an EP MoE stage mode=mega can take; it subsumes c1
+if (L3) CANDS.push({ id: 'c4', rank: 0, level: 'L3', implementable_by: 'mega', region: 'EP MoE dispatch..combine',
+  kernels: ['megamoe_dispatch', 'megamoe_gemm', 'ep_combine'], difficulty: 5, exclusive_with: ['c1'],
+  seam: { target_callable: 'pkg.moe:MoE.forward_ep' }, region_pct_device_time: 20, est_gain_pct_expected: 6 });
+// l3_kind_*: what the stage's kernels look like decides whether mode=mega takes it (default kind: ep_moe)
+const KIND = {
+  l3_kind_scratch: { ep: 2, kernels: ['moe_align_block_size', 'act_quant', '_fused_moe_kernel', 'scatter_tokens', 'gather_tokens'] },
+  l3_kind_tp_moe: { ep: 1, kernels: ['topk_softmax', '_fused_moe_kernel', 'cross_device_reduce_1stage'] },
+  l3_kind_attn: { ep: 2, kernels: ['paged_attention_decode', 'moe_fused_gate', 'cross_device_reduce_1stage'] },
+  l3_kind_dense: { ep: 2, kernels: ['gemm_a8w8', 'rmsnorm_quant'] },
+  l3_kind_light: { ep: 2, kernels: ['moe_fused_gate', 'topk_softmax', 'megamoe_prepare_compact_m32'] },
+}[scenario];
+if (KIND) Object.assign(CANDS[CANDS.length - 1], { kernels: KIND.kernels });
+// l3_ar*: the stage is a TP collective with its compute (l3_ar_open also opens the collective kind)
+if (scenario.startsWith('l3_ar')) Object.assign(CANDS[CANDS.length - 1], { implementable_by: undefined,
+  region: 'o_proj GEMM + all-reduce + rmsnorm', kernels: ['gemm_a8w8', 'cross_device_reduce_1stage', 'rmsnorm'],
+  seam: { target_callable: 'pkg.attn:Attention.o_proj_and_norm' } });
 const ISO = { c1: scenario === 'fallback' ? 0.97 : 1.4, c2: (scenario === 'accept' || scenario === 'stack_fail' || scenario === 'reuse') ? 1.2 : 0.95, c1s: 1.6 };
 // the select agent's picks (it sees every UT result; the script enforces only the exclusivity line)
 // default: every UT result that beats stock, in the order given
-const SELECT = { select_conflict: ['c1', 'c1s', 'c2'], select_slow: ['c1', 'c2'] }[scenario] || null;
+const SELECT = { select_conflict: ['c1', 'c1s', 'c2'], select_slow: ['c1', 'c2'] }[scenario] || (L3 ? ['c4', 'c2'] : null);
 const won = (gate, d) => ({ gate, ab_complete: true, e2e_throughput_tok_s: 100 + d, ref_med: 100, cand_med: 100 + d,
   e2e_delta_pct: d, accepted_overlay: `${KF}/overlay/cand_${gate}` });
 
@@ -63,7 +82,17 @@ const answers = {
   // which patterns get a kernel + UT: the agent's call (c3 has no seam, the script drops it)
   'kf:triage': () => (scenario === 'triage_none' ? null
     : scenario === 'no_seam' ? { selected: [{ id: 'c3' }], skipped: [] }
-    : { selected: [{ id: 'c1' }, { id: 'c1s' }, { id: 'c2' }, { id: 'c3' }], skipped: [] }),
+    : { selected: [{ id: 'c1' }, { id: 'c1s' }, { id: 'c2' }, { id: 'c3' }, ...(L3 ? [{ id: 'c4' }] : [])], skipped: [] }),
+  'kf:l3 prepare c4': () => (scenario === 'l3_prepretry' ? { status: 'blocked', reason: 'UT failed: wrong call site' }
+    : scenario === 'l3_ep4' ? { status: 'ready', kernel_path: `${KF}/kernels/c4/baseline_tree`,
+        benchmark_harness: `${KF}/kernels/c4/baseline_tree/moe_ut.py`, package: 'aiter' }
+    : { status: 'ready', kernel_path: `${KF}/kernels/c4/baseline_tree`, benchmark_harness: `${KF}/kernels/c4/baseline_tree/moe_ut.py`,
+        ep_size: 2, package: 'aiter', call_site: 'aiter.megamoe:mega_moe', mega_args: { target_guards: ['64_uniform'], budget: 99 } }),
+  'kf:l3 prepare c4 (retry)': () => ({ status: 'ready', kernel_path: `${KF}/kernels/c4/baseline_tree`,
+    benchmark_harness: `${KF}/kernels/c4/baseline_tree/moe_ut.py`, package: 'aiter', mega_args: {} }),
+  'kf:l3 package c4': () => ({ final_patch: `${KF}/kernels/c4/final_patch.diff`, overlay_dir: `${KF}/kernels/c4/overlay`,
+    banner: '[kf-c4] ENGAGED', isolated_speedup: 1.15, correctness: 'pass', notes: 'mega m3' }),
+  'kf:integrate kf_stack (without L3)': () => ({ ...won('accepted', 1.2), accepted_overlay: `${KF}/overlay/cand_kf_stack_nol3` }),
   'kf:select': (prompt) => {
     const ut = JSON.parse(prompt.split('## UT results\n')[1].split('\n')[0]);
     const ids = SELECT || ut.filter((u) => u.isolated_speedup > 1).map((u) => u.id);
@@ -75,6 +104,7 @@ const answers = {
   'kf:integrate kf_stack (screened)': () => ({ ...won('accepted', 1.5), accepted_overlay: `${KF}/overlay/cand_kf_stack` }),
   // ONE combined A/B of every winner
   'kf:integrate kf_stack': () => ({
+    l3_abreject: { gate: 'rejected', e2e_throughput_tok_s: 98, ref_med: 100, cand_med: 98, e2e_delta_pct: -2, ab_complete: true, reason: 'slower' },
     reject: { gate: 'rejected', e2e_throughput_tok_s: 99, ref_med: 100, cand_med: 99, e2e_delta_pct: -1, ab_complete: true, reason: 'slower' },
     parity_reject: { gate: 'rejected', e2e_throughput_tok_s: 100, ref_med: 100, ab_complete: false, output_parity: 'fail', reason: 'parity' },
     stack_fail: { gate: 'rejected', e2e_throughput_tok_s: 0, ref_med: 100, ab_complete: false, reason: 'correctness: gsm8k 0.80 < 0.93' },
@@ -105,7 +135,14 @@ async function agent(prompt, opts) {
   if (!f) throw new Error(`unscripted agent ${opts.label}`);
   return f(prompt);
 }
-async function workflow() { throw new Error('KernelFusion must not start a nested GEAK workflow'); }
+async function workflow(ref, wfArgs) {
+  if (!L3) throw new Error('KernelFusion must not start a nested GEAK workflow');
+  megaCalls.push({ ref, args: wfArgs });
+  if (scenario === 'l3_throw') throw new Error('args.kernel_path is required');
+  if (scenario === 'l3_nodeliver') return { mega_deliverable: false, mega_candidate_registry: [], mega_note: 'mega: no fully verified finalist' };
+  return { mega_deliverable: true, mega_selected_candidate: 'm3', final_speedup: 1.15, eval_dir: '/m/eval',
+    mega_candidate_registry: [{ id: 'm1' }, { id: 'm3', final_tree: '/m/f3', activation: { switch_name: 'X', switch_value: '1' } }] };
+}
 const parallel = (ts) => Promise.all(ts.map((t) => Promise.resolve().then(t).catch(() => null)));
 const pipeline = null;
 const phase = () => {};
@@ -116,6 +153,18 @@ const args = { workflow_dir: WF_DIR, kf_dir: KF, model_path: '/models/M', gpu_id
   kf_prompt: '/prompts/p.txt,/prompts/deploy.txt', agent_timeout_ms: 0, kf_task: 'Do not read /answers.',
   initial_extra_env: 'SGLANG_USE_AITER=1 SGLANG_SIMULATE_ACC_LEN=4.05 SGLANG_SIMULATE_ACC_METHOD=match-expected HF_HUB_OFFLINE=1',
   correctness_unset_env: 'SGLANG_SIMULATE_ACC_LEN,SGLANG_SIMULATE_ACC_METHOD' };
+if (L3) Object.assign(args, { kf_l3_mega: 'true',
+  kf_l3_mega_args: { use_expert_skills: 'true', required_pairs: 8, workflow_dir: '/other/GEAK/kernel_workflow' },
+  kf_l3_defaults: { common: { mega_profile: 'production', required_pairs: 5 },
+    ep_moe: { analysis_skill: 'moe_bottleneck', launch_target: 2 }, collective: { launch_target: 1 } } });
+if (scenario === 'l3_prepretry') args.ep = 2;
+if (scenario === 'l3_run') args.kf_l3_mega_run = '/old/mega_state';
+if (scenario === 'l3_ar_open') args.kf_l3_stage_kinds = 'ep_moe,collective';
+if (scenario === 'lang_flydsl') args.kf_kernel_language = 'flydsl';
+if (scenario === 'lang_auto_gfx942') Object.assign(args, { kf_kernel_language: 'auto', expected_gfx: 'gfx942' });
+if (scenario === 'l3_gfx950') args.expected_gfx = 'gfx950';
+if (scenario === 'l3_ep4') Object.assign(args, { gpu_ids: '0,1,2,3', tp: 4, ep: 4 });
+if (KIND) args.ep = KIND.ep;
 if (scenario === 'analysis_only') Object.assign(args, { kf_steps: 'topk', kf_trace_dir: '/traces/x' });
 if (scenario === 'reuse') args.kf_reuse = { 'kf:author c1': { final_patch: 'old c1', isolated_speedup: 1.3, correctness: 'pass',
   overlay_dir: '/old/c1/overlay', banner: '[kf-c1] ENGAGED' } };
@@ -128,4 +177,4 @@ const src = (await readFile(`${WF_DIR}/kernel_fusion/kf_workflow.js`, 'utf8'))
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 const fn = new AsyncFunction('agent', 'parallel', 'pipeline', 'phase', 'log', 'workflow', 'args', 'budget', src);
 const result = await fn(agent, parallel, pipeline, phase, log, workflow, args, {});
-process.stdout.write(JSON.stringify({ result, calls, workflows }) + '\n');
+process.stdout.write(JSON.stringify({ result, calls, workflows, megaCalls }) + '\n');
