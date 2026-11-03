@@ -130,4 +130,34 @@ def test_live_model_code_names_the_classes_and_files_the_server_runs(tmp_path):
     assert live == {"MuseSpark1xMoE": {"sglang/srt/rocm_muse_spark/model.py": 2}}
     md = (out / "digest.md").read_text()
     assert "## Live model code" in md and "`MuseSpark1xMoE` | `sglang/srt/rocm_muse_spark/model.py`" in md
-    assert "models/muse_spark.py" not in md
+    # a non-module helper frame is not a module class, but the file it ran in is live source
+    assert "`MuseSpark1xMoE` | `sglang/srt/models/muse_spark.py`" not in md
+    src = json.loads((out / "digest.json").read_text())["live_source_files"]
+    assert src == {"sglang/srt/rocm_muse_spark/model.py": {"forward": 2},
+                   "sglang/srt/models/muse_spark.py": {"_forward_experts": 1}}
+    assert "## Live source files" in md and "`_forward_experts`" in md
+
+
+def test_absence_from_the_live_tables_is_not_declared_dead_code(tmp_path):
+    # Decode runs in graph replay and attention backends / speculative workers are not nn.Module forwards: the
+    # digest must not tell the analyst that a seam has to be in the eager tables (it dropped every decode glue
+    # candidate on DSv4.1-Flash c32/c64).
+    ev = [
+        {"ph": "X", "cat": "python_function", "name": "nn.Module: MQALayer_0", "ts": 100, "dur": 50, "pid": 1, "tid": 2},
+        {"ph": "X", "cat": "python_function", "name": "sglang/srt/models/deepseek_v4.py(2449): forward",
+         "ts": 100, "dur": 49, "pid": 1, "tid": 2},
+        {"ph": "X", "cat": "python_function",
+         "name": "sglang/srt/layers/attention/deepseek_v4_backend_hip_radix.py(2089): _build_forward_metadata",
+         "ts": 300, "dur": 5, "pid": 1, "tid": 2},
+        {"ph": "X", "cat": "kernel", "name": "k", "ts": 500, "dur": 3, "pid": 3, "tid": 3, "args": {"stream": 7}},
+    ]
+    p = tmp_path / "pt" / "x-TP-0.trace.json.gz"
+    p.parent.mkdir()
+    with gzip.open(p, "wt") as f:
+        json.dump({"traceEvents": ev}, f)
+    out = tmp_path / "out"
+    assert D.main(["--trace-dir", str(tmp_path / "pt"), "--out", str(out)]) == 0
+    md = (out / "digest.md").read_text()
+    assert "must be a callable in one of these files" not in md
+    assert "Absence is NOT evidence of dead code" in md
+    assert "`sglang/srt/layers/attention/deepseek_v4_backend_hip_radix.py`" in md

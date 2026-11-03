@@ -479,10 +479,13 @@ your recommended candidates with the GEAK kernel layer and A/B-tests them on the
 ${OUT}/digest/digest.md has, per trace and per step kind: steps, busy/span/idle per step, kernels/step, short-kernel
 share, the per-layer repeating block, the top kernels, and seq_*.tsv (the median step's full ordered kernel
 sequence with gaps and, for eager launches, the launching cpu_op + framework frame). Use these numbers; quote
-them in your report. Its "Live model code" table lists the module classes this server actually runs and the file
-of each forward (from the eager steps' Python stacks). Graph-replayed steps have no launch frames but run those same
-classes: map their kernels to source by name WITHIN those files -- the framework may ship other implementations of the
-same layers that this server never loads, and a seam there is never called.
+them in your report. Its "Live model code" and "Live source files" tables list the module classes and the
+framework / library files this server ran in its eager steps (positive evidence). Graph-replayed steps have no launch
+frames: reach their kernels from those live entries through the source call chain (model runner, attention backend,
+speculative worker as the server flags select them) -- code that runs only in graph replay, or outside an
+nn.Module.forward, is live without appearing in the tables. The framework may also ship other implementations of the
+same layers that this server never loads: a seam there is never called, so do not seam an implementation when the
+trace shows a different one of that layer running.
 
 This environment does not let you write .md report files: return the full report the prompt asks for as markdown
 in report_md, and the model / deployment notes in model_notes_md; the stage writes them to ${OUT}/REPORT.md and
@@ -495,7 +498,9 @@ Write ${OUT}/topk.json: {"candidates": [...], "recommended": [ids in the order t
   seam (an OBJECT, never a bare string) {target_callable: "pkg.module:Class.method or pkg.module:function" -- ONE Python callable whose body
         covers the whole region, so the region can be rebound to a fused implementation -- the one the LIVE server
         runs: a model can have several implementations of the same layer (generic vs platform-specific modules),
-        so confirm the module from the trace's launch frames, not from a name match; source_file; lines},
+        so confirm the module from the trace's launch frames or, for graph-replayed regions, from the source call
+        chain out of a live entry, not from a name match. Always name one concrete callable (never "UNCONFIRMED");
+        say in "lines" which evidence you used; source_file; lines},
   inputs_outputs (tensors that cross the region boundary, with shapes/dtypes), launches_before, launches_after,
   region_pct_device_time (weighted), est_gain_pct_upper, est_gain_pct_expected (weighted e2e %),
   difficulty (1-5), bitwise_exact (bool), exclusive_with [ids of conflicting candidates], language ("triton" unless you have a reason),
@@ -547,8 +552,10 @@ fused kernel and a region unit test for each. Judge each candidate yourself from
 report's reasoning, the trace digest, the source) -- there is no limit on how many you pick and no minimum gain;
 pick what you judge worth the effort and say why, and say why for each one you leave out.
 The one hard line: a candidate is authored by rebinding ONE Python callable that covers its whole region
-(seam.target_callable) and is the one the live server actually runs (check the trace's launch frames: a model can
-have several implementations of the same layer); one without such a seam cannot be authored. Implementable scope:
+(seam.target_callable) and is the one the live server actually runs (a model can have several implementations of
+the same layer: skip a seam only when the trace shows a different implementation of that layer running). A
+graph-replayed region has no launch frames: a seam reached through the source call chain from live code is enough
+here, the prepare step's execution proof confirms it is called. One without such a seam cannot be authored. Implementable scope:
 levels ${IMPLEMENTABLE_LEVELS}, except ${UNSUPPORTED_PATTERNS}; a candidate outside it is not authored (a level alone
 is no reason to skip a candidate inside it). Mutually exclusive candidates (exclusive_with)
 may both be picked: which of them goes into the server is decided after their unit tests.
