@@ -546,9 +546,12 @@ const triage = await safeAgent(`You decide which fusion patterns of a Top-K anal
 fused kernel and a region unit test for each. Judge each candidate yourself from the analysis (its numbers, the
 report's reasoning, the trace digest, the source) -- there is no limit on how many you pick and no minimum gain;
 pick what you judge worth the effort and say why, and say why for each one you leave out.
-The one hard line: a candidate is authored by rebinding ONE Python callable that covers its whole region
-(seam.target_callable) and is the one the live server actually runs (check the trace's launch frames: a model can
-have several implementations of the same layer); one without such a seam cannot be authored. Implementable scope:
+A candidate is authored by rebinding ONE Python callable that covers its whole region (seam.target_callable) and is
+the one the live server actually runs (a model can have several implementations of the same layer). When the region's
+kernels are launched from several callables, use their nearest common caller as the seam (the overlay may copy its
+body); skip a candidate for its seam only when no such callable exists. A graph-replayed region has no launch frames:
+a seam found by reading the call chain in the source is enough here, the prepare step's execution proof confirms it is
+called. Implementable scope:
 levels ${IMPLEMENTABLE_LEVELS}, except ${UNSUPPORTED_PATTERNS}; a candidate outside it is not authored (a level alone
 is no reason to skip a candidate inside it). Mutually exclusive candidates (exclusive_with)
 may both be picked: which of them goes into the server is decided after their unit tests.

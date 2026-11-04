@@ -44,6 +44,8 @@ def test_all_winners_go_in_together_on_one_ab():
     assert "MEASUREMENT_MODE: isolated_server" in setup and "REPLICAS: 1" in setup     # no warmup round
     by = {c["label"]: c["prompt"] for c in out["calls"]}
     assert "no limit on how many" in by["kf:triage"] and "no minimum gain" in by["kf:triage"]
+    # a region launched from several callables is seamed at their common caller; graph-replayed seams need no frames
+    assert "nearest common caller" in by["kf:triage"] and "check the trace's launch frames" not in by["kf:triage"]
     assert "no minimum speedup" in by["kf:select"] and '"isolated_speedup":1.6' in by["kf:select"]
     for c in out["calls"]:
         if c["label"] not in ("kf:analyst", "kf:triage", "kf:select") and not c["label"].startswith("kf:author "):   # stock GEAK role files
