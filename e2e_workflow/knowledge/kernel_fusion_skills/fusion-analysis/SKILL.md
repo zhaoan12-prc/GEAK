@@ -30,7 +30,7 @@ The caller supplies these; the file names and paths are given in its instruction
 
 | Input | Use |
 |---|---|
-| Trace digest (`kf_trace_digest.py` output) | Per step kind: steps, busy/span/idle, kernels per step, short-kernel share, top kernels, the repeating per-layer block, the full ordered kernel sequence of the median step with gaps and launching frames; the **Live model code** table |
+| Trace digest (`kf_trace_digest.py` output) | Per step kind: steps, busy/span/idle, kernels per step, short-kernel share, top kernels, the repeating per-layer block, the full ordered kernel sequence of the median step with gaps and launching frames |
 | Raw traces | Any detail the digest does not carry |
 | Workload summary | Per-point weights: the share of serving time of each phase and shape |
 | Model configuration | Structural parameters |
@@ -49,8 +49,7 @@ A candidate that does not meet all of the following must not be recommended.
    recommend or to reject.
 2. **The deployed configuration decides.** Weights, shapes (the distribution of M), platform branches
    and the kernel actually called are taken from what this deployment runs, never from defaults,
-   another platform or the function definition alone. A model may ship several implementations of
-   the same layer; only the implementation listed in the Live model code table is live.
+   another platform or the function definition alone.
 3. **The target metric decides.** Rank by expected gain on the target metric. Candidates that do not
    affect it rank last.
 4. **Implementation scope.** Rank every level as found. Only candidates at an implementable level and not
@@ -74,9 +73,9 @@ Establish the model structure before judging fusibility; record it as model note
 - From the model configuration, record: layer count, hidden size, attention type, MoE configuration
   (expert count, top-k, shared experts), quantization, draft or MTP layers, and any other special
   structure.
-- In the framework source, locate the model implementation from `architectures` and the Live model
-  code table. Trace one layer's forward path: which functions and operators implement attention,
-  MLP/MoE, normalization, residuals and model-specific modules. Record any structural difference
+- In the framework source, locate the model implementation from `architectures`. Trace one layer's
+  forward path: which functions and operators implement attention, MLP/MoE, normalization, residuals
+  and model-specific modules. Record any structural difference
   between layers.
 - From the server flags and environment, determine:
   - parallelism and communication points (where all-reduce / all-gather run and which implementation);

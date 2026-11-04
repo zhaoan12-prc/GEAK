@@ -52,7 +52,9 @@ def test_all_winners_go_in_together_on_one_ab():
     analyst = out["calls"][2]["prompt"]
     assert "links: /prompts/p.txt, /prompts/deploy.txt" in analyst and "kf_trace_digest.py" in analyst and "fallback (id" in analyst
     assert f"TRACE_DIR: {KF}/profile" in analyst
-    assert "Live model code" in analyst and "this server never loads" in analyst      # seams on the live implementation
+    # no whitelist of "live" files and no launch-frame requirement: graph-replayed decode has no launch frames
+    assert "Live model code" not in analyst and "WITHIN those files" not in analyst
+    assert "check the trace's launch frames" not in by["kf:triage"]
     # the fused kernels are written by plain author agents, not the GEAK kernel layer
     assert len(out["workflows"]) == 3 and all("kernel_lane" not in w["task"] for w in out["workflows"])
     au = next(c["prompt"] for c in out["calls"] if c["label"] == "kf:author c1")
