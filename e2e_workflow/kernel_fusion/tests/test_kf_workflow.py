@@ -317,10 +317,11 @@ def test_the_workflow_owns_the_output_format_and_the_schema_types_the_seam():
     skill = E2E_DIR / "knowledge" / "kernel_fusion_skills" / "fusion-analysis"
     text = "".join(p.read_text() for p in [skill / "SKILL.md", *sorted((skill / "references").glob("*.md"))])
     assert "out/" not in text and "fusion_candidates" not in text and "recommended=true" not in text
-    # injected, not prose; an L3 MegaKernel is in scope (mode=mega), L4 is not
-    assert "IMPLEMENTABLE_LEVELS: L1,L2,L3" in p and "UNSUPPORTED_PATTERNS: L4 (whole-layer MonoKernel)" in p
+    # injected, not prose; an MoE MegaKernel is in scope (mode=mega), other MegaKernels and L4 are not
+    assert "IMPLEMENTABLE_LEVELS: L1,L2,L3" in p and "UNSUPPORTED_PATTERNS: L3 MegaKernel other than an EP MoE layer" in p
     tri = next(c["prompt"] for c in out["calls"] if c["label"] == "kf:feasibility-review")
-    assert "levels L1,L2,L3, except L4 (whole-layer MonoKernel)" in tri and "a level alone" in tri
+    assert "levels L1,L2,L3, except L3 MegaKernel other than an EP MoE layer" in tri and "a level alone" in tri
+    assert "; L4 (whole-layer MonoKernel)" in tri
     assert "knowledge/kernel_fusion_skills/fusion-analysis/SKILL.md" in (E2E_DIR / "kernel_fusion" / "kf_workflow.js").read_text()
     assert "reference files a SKILL.md among them links" in p
 
@@ -397,9 +398,10 @@ def test_kf_mega_routes_an_l3_megakernel_to_mode_mega_after_the_single_gpu_autho
     out = run("mega")
     r = out["result"]
     tri = next(c["prompt"] for c in out["calls"] if c["label"] == "kf:feasibility-review")
-    assert "except L4 (whole-layer MonoKernel)" in tri and '"route": "mega"' in tri
+    assert "except L3 MegaKernel other than an EP MoE layer" in tri and '"route": "mega"' in tri
+    assert "An MoE MegaKernel candidate" in tri
     analysis = next(c["prompt"] for c in out["calls"] if c["label"] == "kf:opportunity-analysis")
-    assert "UNSUPPORTED_PATTERNS: L4" in analysis
+    assert "UNSUPPORTED_PATTERNS: L3 MegaKernel other than an EP MoE layer" in analysis
     ls = labels(out, authors=True)
     assert ls.index("kf:author c2") < ls.index("kf:mega prepare c3") < ls.index("kf:mega package c3") < ls.index("kf:integration-review")
     assert "kf:author c3" not in ls and "kf:extract c3" not in ls
@@ -444,3 +446,11 @@ def test_mode_mega_is_cut_where_packaging_still_ends_before_the_85pct_stop():
     assert "Promise.race([workflow({ scriptPath: `${KERNEL_WF_DIR}/kernel_mega.js` }, megaArgs), MEGA_CUT])" in src
     assert "TIME_BUDGET_MS * 0.85 - MEGA_PACKAGE_S * 1000" in src
     assert "if (DEADLINE_HIT || MEGA_LATE) return out('stage deadline');" in src
+
+
+def test_only_an_moe_megakernel_goes_to_mode_mega():
+    out = run("mega_attn")
+    assert out["nested"] == [] and not [c for c in out["calls"] if c["label"].startswith("kf:mega")]
+    assert "kf:extract c3" not in labels(out)                     # nor to the single-GPU author
+    (rej,) = [x for x in out["result"]["rejected"] if x["id"] == "c3"]
+    assert rej["stage"] == "feasibility_review" and "only an MoE MegaKernel" in rej["reason"]

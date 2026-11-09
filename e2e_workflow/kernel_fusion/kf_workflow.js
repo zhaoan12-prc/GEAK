@@ -70,14 +70,15 @@ const AB_FINISH_RETRIES = parseInt(A.ab_finish_retries != null ? A.ab_finish_ret
 const PROMPT = String(A.kf_prompt || `${WORKFLOW_DIR}/knowledge/kernel_fusion_skills/fusion-analysis/SKILL.md`);
 // The fusion levels the author/apply steps implement; the analysis may recommend only these (the skill ranks all).
 const IMPLEMENTABLE_LEVELS = String(A.kf_implementable_levels || 'L1,L2,L3');
-// L3 MegaKernel candidates the analysis recommends go to the kernel workflow's mode=mega (multi-GPU, see megaOne);
-// kf_mega=0 turns that off and keeps them unsupported.
+// An MoE MegaKernel (EP MoE layer, e.g. MegaMoE) the analysis recommends goes to the kernel workflow's mode=mega
+// (multi-GPU, see megaOne); other MegaKernels stay unsupported until validated. kf_mega=0 turns mega off.
 const KF_MEGA = !/^(0|false|no|off)$/i.test(String(A.kf_mega != null ? A.kf_mega : '').trim());
 const MEGAKERNEL_PATTERN = 'L3 MegaKernel (one persistent kernel that absorbs a heavy expert/GEMM or attention stage together with its dispatch, combine or communication, e.g. MegaMoE)';
 // Patterns inside those levels the author/apply steps do not implement yet; the analysis ranks them but does not
 // recommend them, and the Feasibility Review does not author them.
+const NON_MOE_MEGAKERNEL_PATTERN = 'L3 MegaKernel other than an EP MoE layer (e.g. attention, or a GEMM fused with its all-reduce)';
 const UNSUPPORTED_PATTERNS = String(A.kf_unsupported_patterns ||
-  `${KF_MEGA ? '' : `${MEGAKERNEL_PATTERN}; `}L4 (whole-layer MonoKernel)`);
+  `${KF_MEGA ? NON_MOE_MEGAKERNEL_PATTERN : MEGAKERNEL_PATTERN}; L4 (whole-layer MonoKernel)`);
 const PROMPTS = PROMPT.split(',').map((p) => p.trim()).filter(Boolean);   // several files drive one analysis
 const TRACE_DIR_IN = String(A.kf_trace_dir || '');          // existing traces: skip the capture
 const WORKLOAD_SUMMARY = String(A.kf_workload_summary || ''); // per-point weights, when the caller has them
@@ -590,11 +591,10 @@ have several implementations of the same layer); one without such a seam cannot 
 levels ${IMPLEMENTABLE_LEVELS}, except ${UNSUPPORTED_PATTERNS}; a candidate outside it is not authored (a level alone
 is no reason to skip a candidate inside it). Mutually exclusive candidates (exclusive_with)
 may both be picked: which of them goes into the server is decided after their unit tests.
-${KF_MEGA ? `An L3 MegaKernel candidate (one persistent kernel absorbing a multi-rank stage with its dispatch, combine or
-communication, e.g. an EP MoE layer) is not written by the single-GPU author: give it "route": "mega" and the
-multi-GPU Mega workflow authors it against a multi-rank unit test. Its seam is the layer callable every rank runs
-(e.g. the MoE layer forward). It takes hours on the whole EP group: weigh that against its gain. Every other pick
-gets "route": "author".
+${KF_MEGA ? `An MoE MegaKernel candidate (one persistent kernel for an EP MoE layer: token dispatch, expert GEMMs and
+combine across ranks, e.g. MegaMoE) is not written by the single-GPU author: give it "route": "mega" and the
+multi-GPU Mega workflow authors it against a multi-rank unit test. Its seam is the MoE layer callable every rank
+runs. It takes hours on the whole EP group: weigh that against its gain. Every other pick gets "route": "author".
 ` : ''}Read ${topk.topk_json || '(the candidates below)'}${topk.report_md ? ' and the report below' : ''}; read anything else you need.
 
 ## Candidates
@@ -620,10 +620,17 @@ if (picked && !jobs.length) {
   return result;
 }
 // kf_mega: the review's route decides; a pick without one goes to mega when it is an L3 MegaKernel by its description.
+// Only an MoE MegaKernel runs mode=mega for now; any other one is rejected here, never handed to the single-GPU author.
 const routeOf = new Map(((feasibility && feasibility.selected) || []).map((x) => [String(x && x.id), x && x.route]));
+const descOf = (c) => `${c.region || ''} ${c.fused_design || ''} ${c.pattern || ''}`;
 const isMega = (c) => KF_MEGA && (routeOf.get(String(c.id)) === 'mega' || (!routeOf.get(String(c.id)) &&
-  String(c.level) === 'L3' && /mega\s*kernel/i.test(`${c.region || ''} ${c.fused_design || ''} ${c.pattern || ''}`)));
-const megaJobs = jobs.filter(isMega);
+  String(c.level) === 'L3' && /mega\s*kernel/i.test(descOf(c))));
+const isMoe = (c) => /\bmoe\b|mixture.of.experts|expert/i.test(`${descOf(c)} ${seamOf(c)} ${(c.kernels || []).join(' ')}`);
+const megaJobs = jobs.filter((c) => isMega(c) && isMoe(c));
+for (const c of jobs.filter((x) => isMega(x) && !isMoe(x))) {
+  result.rejected.push({ id: String(c.id), stage: 'feasibility_review',
+    reason: 'only an MoE MegaKernel goes to mode=mega for now; other MegaKernels are not authored yet' });
+}
 jobs = jobs.filter((c) => !isMega(c));
 if (megaJobs.length) log(`[kf] mode=mega authors ${megaJobs.map((c) => c.id).join(', ')} after the single-GPU authors`);
 

@@ -23,6 +23,8 @@ const CANDS = [
 ];
 // mega scenarios: c3 is an L3 MegaKernel with a seam every rank runs
 if (MEGA) Object.assign(CANDS[3], { region: 'dispatch + expert GEMM + combine (MegaKernel)', seam: { target_callable: 'pkg.moe:EPMoE.forward' } });
+// mega_attn: a MegaKernel that is not an MoE layer
+if (scenario === 'mega_attn') Object.assign(CANDS[3], { region: 'attention + all-reduce (MegaKernel)', seam: { target_callable: 'pkg.attn:Attention.forward' } });
 const ISO = { c1: scenario === 'fallback' ? 0.97 : 1.4, c2: (scenario === 'accept' || scenario === 'stack_fail' || scenario === 'reuse') ? 1.2 : 0.95, c1s: 1.6 };
 // the select agent's picks (it sees every UT result; the script enforces only the exclusivity line)
 // default: every UT result that beats stock, in the order given
@@ -68,7 +70,7 @@ const answers = {
   'kf:feasibility-review': () => (scenario === 'triage_none' ? null
     : scenario === 'no_seam' ? { selected: [{ id: 'c3' }], skipped: [] }
     // c3 overlaps c1 (exclusive_with): the mega scenarios leave c1 out so c3 can reach the stack
-    : ['mega', 'mega_fail', 'mega_off', 'mega_1gpu'].includes(scenario) ? { selected: [{ id: 'c2', route: 'author' }, { id: 'c3', route: 'mega' }], skipped: [] }
+    : ['mega', 'mega_fail', 'mega_off', 'mega_1gpu', 'mega_attn'].includes(scenario) ? { selected: [{ id: 'c2', route: 'author' }, { id: 'c3', route: 'mega' }], skipped: [] }
     : scenario === 'mega_noroute' || scenario === 'mega_default' ? { selected: [{ id: 'c2' }, { id: 'c3' }], skipped: [] }
     : { selected: [{ id: 'c1' }, { id: 'c1s' }, { id: 'c2' }, { id: 'c3' }], skipped: [] }),
   'kf:integration-review': (prompt) => {

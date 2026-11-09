@@ -49,8 +49,8 @@ GEAK_KERNEL_FUSION=0|1                                     # env
 | `author_k` | `GEAK_KF_AUTHOR_K` | 0 (no cap) | optional cap on the patterns the Feasibility Review sends to authoring |
 | `baseline_mode` | `GEAK_KF_BASELINE_MODE` | `isolated_server` | lifecycle of the stage's baseline: one fresh server, one timed round, no discarded warmup round |
 | `implementable_levels` | `GEAK_KF_IMPLEMENTABLE_LEVELS` | `L1,L2,L3` | fusion levels the analysis may recommend and the Feasibility Review may author (all levels are still ranked) |
-| `unsupported_patterns` | `GEAK_KF_UNSUPPORTED_PATTERNS` | L4 MonoKernel (with `mega` off also L3 MegaKernel, e.g. MegaMoE) | patterns inside those levels that are ranked but not recommended or authored |
-| `mega` | `GEAK_KF_MEGA` | on | L3 MegaKernel candidates the analysis recommends are authored by the kernel workflow's `mode=mega` (see below); `0` keeps them unsupported |
+| `unsupported_patterns` | `GEAK_KF_UNSUPPORTED_PATTERNS` | L3 MegaKernel other than an EP MoE layer, L4 MonoKernel (with `mega` off every L3 MegaKernel) | patterns inside those levels that are ranked but not recommended or authored |
+| `mega` | `GEAK_KF_MEGA` | on | an MoE MegaKernel (e.g. MegaMoE) the analysis recommends is authored by the kernel workflow's `mode=mega` (see below); `0` keeps it unsupported |
 | `mega_budget_s` | `GEAK_KF_MEGA_BUDGET_S` | 85% of the stage budget − 2 h | `mega_time_budget_s` of each mode=mega run |
 | `mega_min_s` | `GEAK_KF_MEGA_MIN_S` | 14400 | stage time a mode=mega run needs; with less left before its cut the region is skipped |
 | `mega_args` | `GEAK_KF_MEGA_ARGS` | — | JSON object merged last into the mode=mega args (e.g. `{"budget": 6, "launch_target": 1}`) |
@@ -61,11 +61,12 @@ GEAK_KERNEL_FUSION=0|1                                     # env
 | `budget_s` | `GEAK_KF_BUDGET_S` | min(12 h, ⅓ of the run) | stage wall clock, capped so the hard stop (1.1 × budget + 900 s) stays within 40% of the run; below 2 h the stage is skipped. The main workflow gets the run's timeout minus what the stage used |
 | `kf_dir` | `GEAK_KF_DIR` | `<exp_root>/kf_<main eval dir suffix>` | stage output dir |
 
-## L3 MegaKernel via mode=mega
+## MoE MegaKernel via mode=mega
 
-The analysis may recommend an L3 MegaKernel (one persistent kernel that absorbs a multi-rank stage with its
-dispatch, combine or communication, e.g. an EP MoE layer) like any other pattern; when the Feasibility Review picks
-it, it goes to `mode=mega` with no switch to set. It is skipped, with the reason, on a single-GPU `gpu_ids` or when
+The analysis may recommend an MoE MegaKernel (one persistent kernel for an EP MoE layer: token dispatch, expert
+GEMMs and combine across ranks, e.g. MegaMoE) like any other pattern; when the Feasibility Review picks it, it goes
+to `mode=mega` with no switch to set. Other MegaKernels (attention, GEMM + all-reduce, ...) stay unsupported until
+mode=mega is validated on them. It is skipped, with the reason, on a single-GPU `gpu_ids` or when
 less than `mega_min_s` is left. After the single-GPU authors, for each such pattern, in turn:
 
 1. `kf:mega prepare`: a frozen copy of the operator source and a multi-rank UT (`mega_ut_template.py` contract:
