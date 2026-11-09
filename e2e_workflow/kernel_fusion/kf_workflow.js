@@ -6,7 +6,7 @@ export const meta = {
     { title: 'Setup', detail: 'e2e Director builds the KF eval dir + baseline throughput, one fresh server and one timed round, no warmup round (roles/director.md PHASE=setup)' },
     { title: 'Trace', detail: 'AgentX: kernel-extract skill sampling capture (points from the baseline log, one probe each); else roles/profiler.md; or kf_trace_dir' },
     { title: 'OpportunityAnalysis', detail: 'Opportunity Analysis: kf_trace_digest.py + the user prompt -> ranked fusion opportunities (topk.json)' },
-    { title: 'Author', detail: 'the Feasibility Review agent picks the opportunities worth authoring (no cap, no gain floor); each: region UT (AgentX: kernel-extract skill prepare; else roles/kernel_extractor.md), then one author agent writes the fused kernel against that UT' },
+    { title: 'Author', detail: 'the Feasibility Review agent picks the opportunities worth authoring (no cap, no gain floor); each: region UT (AgentX: kernel-extract skill prepare; else roles/kernel_extractor.md), then one author agent writes the fused kernel against that UT; with kf_mega an L3 MegaKernel gets a multi-rank UT and the kernel workflow mode=mega (kernel_mega.js) instead' },
     { title: 'ApplyBack', detail: 'the Integration Review agent picks from the UT results which kernels go on; they go in as one combined overlay on one e2e_integrator A/B (gsm8k on the whole stack first); only if the stack fails accuracy is each kernel checked alone and the A/B re-run without the failing ones' },
   ],
 };
@@ -70,9 +70,13 @@ const AB_FINISH_RETRIES = parseInt(A.ab_finish_retries != null ? A.ab_finish_ret
 const PROMPT = String(A.kf_prompt || `${WORKFLOW_DIR}/knowledge/kernel_fusion_skills/fusion-analysis/SKILL.md`);
 // The fusion levels the author/apply steps implement; the analysis may recommend only these (the skill ranks all).
 const IMPLEMENTABLE_LEVELS = String(A.kf_implementable_levels || 'L1,L2,L3');
+// L3 MegaKernel candidates go to the kernel workflow's mode=mega (multi-GPU, see megaOne) when kf_mega is on.
+const KF_MEGA = /^(1|true|yes|on)$/i.test(String(A.kf_mega != null ? A.kf_mega : '').trim());
+const MEGAKERNEL_PATTERN = 'L3 MegaKernel (one persistent kernel that absorbs a heavy expert/GEMM or attention stage together with its dispatch, combine or communication, e.g. MegaMoE)';
 // Patterns inside those levels the author/apply steps do not implement yet; the analysis ranks them but does not
 // recommend them, and the Feasibility Review does not author them.
-const UNSUPPORTED_PATTERNS = String(A.kf_unsupported_patterns || 'L3 MegaKernel (one persistent kernel that absorbs a heavy expert/GEMM or attention stage together with its dispatch, combine or communication, e.g. MegaMoE); L4 (whole-layer MonoKernel)');
+const UNSUPPORTED_PATTERNS = String(A.kf_unsupported_patterns ||
+  `${KF_MEGA ? '' : `${MEGAKERNEL_PATTERN}; `}L4 (whole-layer MonoKernel)`);
 const PROMPTS = PROMPT.split(',').map((p) => p.trim()).filter(Boolean);   // several files drive one analysis
 const TRACE_DIR_IN = String(A.kf_trace_dir || '');          // existing traces: skip the capture
 const WORKLOAD_SUMMARY = String(A.kf_workload_summary || ''); // per-point weights, when the caller has them
@@ -129,6 +133,28 @@ if (TIME_BUDGET_MS && typeof setTimeout === 'function') {
   setTimeout(() => { AB_LATE = true; }, Math.max(0, Math.floor(hardMs - AB_NEEDS_S * 1000)));
   setTimeout(() => { RERUN_LATE = true; }, Math.max(0, Math.floor(hardMs - (AB_NEEDS_S + SCREEN_NEEDS_S) * 1000)));
 }
+
+// mode=mega (kf_mega): the kernel workflow's multi-GPU worker, called directly -- through the kernel_workflow.js
+// dispatcher it would nest 3 levels, which the runtime forbids. Its clock is modeled, so the nested run is also cut
+// (MEGA_CUT) where packaging (MEGA_PACKAGE_S) still ends before the 85% stop, so the ApplyBack can start. The default
+// budget also leaves an hour for the steps before Author.
+const KERNEL_WF_DIR = String(A.kernel_workflow_dir ||
+  (WORKFLOW_DIR.replace(/\/[^/]*$/, '') + '/kernel_workflow')).replace(/\/+$/, '');
+const MEGA_PACKAGE_S = 3600;
+const MEGA_BUDGET_S = parseInt(A.kf_mega_time_budget_s, 10) > 0 ? parseInt(A.kf_mega_time_budget_s, 10)
+  : TIME_BUDGET_MS ? Math.max(1800, Math.floor(TIME_BUDGET_MS * 0.85 / 1000) - MEGA_PACKAGE_S - 3600)
+    : 28800;
+let MEGA_ARGS = A.kf_mega_args || {};          // merged last into the mega args (guards, a pinned skill, ...)
+if (typeof MEGA_ARGS === 'string') {
+  try { MEGA_ARGS = JSON.parse(MEGA_ARGS); } catch (e) { throw new Error(`kf_mega_args is not JSON: ${e}`); }
+}
+if (!MEGA_ARGS || typeof MEGA_ARGS !== 'object' || Array.isArray(MEGA_ARGS)) throw new Error('kf_mega_args must be a JSON object');
+let MEGA_LATE = false;
+const MEGA_CUT = new Promise((resolve) => {
+  if (!KF_MEGA || !TIME_BUDGET_MS || typeof setTimeout !== 'function') return;
+  setTimeout(() => { MEGA_LATE = true; resolve(null); },
+    Math.max(0, Math.floor(TIME_BUDGET_MS * 0.85 - MEGA_PACKAGE_S * 1000)));
+});
 
 // Same deployment requirement e2e_workflow.js injects into every kernel task (derived the same way).
 const GRAPH_REQ = ((BACKEND === 'vllm' || BACKEND === 'sglang') && !/enforce[-_]eager/i.test(INIT_FLAGS))
@@ -289,7 +315,8 @@ const EXTRACT_SCHEMA = obj({ short_name: { type: 'string' }, editable: { type: '
 const SCREEN_SCHEMA = obj({ members: { type: 'array', items: obj({ short_name: { type: 'string' },
   correctness: { type: 'string' }, engaged: { type: 'boolean' }, reason: { type: 'string' } }, ['short_name', 'correctness']) },
   notes: { type: 'string' } }, ['members']);
-const REVIEW_SCHEMA = obj({ selected: { type: 'array', items: obj({ id: { type: 'string' }, reason: { type: 'string' } }, ['id']) },
+const REVIEW_SCHEMA = obj({ selected: { type: 'array', items: obj({ id: { type: 'string' }, reason: { type: 'string' },
+  route: { type: 'string', enum: ['author', 'mega'] } }, ['id']) },
   skipped: { type: 'array', items: obj({ id: { type: 'string' }, reason: { type: 'string' } }, ['id']) },
   notes: { type: 'string' } }, ['selected']);
 const AUTHOR_SCHEMA = obj({ final_patch: { type: 'string' }, work_dir: { type: 'string' },
@@ -297,6 +324,11 @@ const AUTHOR_SCHEMA = obj({ final_patch: { type: 'string' }, work_dir: { type: '
   isolated_speedup: { type: 'number' }, correctness: { type: 'string' }, launches_after: { type: 'number' },
   ut_command: { type: 'string' }, engaged_envelope: { type: 'string' }, notes: { type: 'string' } },
   ['final_patch', 'isolated_speedup', 'correctness']);
+const MEGA_PREPARE_SCHEMA = obj({ ok: { type: 'boolean' }, kernel_path: { type: 'string' },
+  benchmark_harness: { type: 'string' }, case_ids: arrStr, case_weights: { type: 'object', additionalProperties: true },
+  target_guards: arrStr, regression_guards: arrStr, required_accuracy_cases: arrStr,
+  gpus_per_job: { type: 'number' }, candidate_import_modules: arrStr, ut_command: { type: 'string' },
+  task: { type: 'string' }, notes: { type: 'string' } }, ['ok', 'kernel_path', 'benchmark_harness', 'target_guards', 'gpus_per_job']);
 const VALIDATE_SCHEMA = obj({ validation_status: { type: 'string' }, throughput_speedup: { type: 'number' },
   director_verified_throughput_tok_s: { type: 'number' }, output_parity: { type: 'string' }, notes: { type: 'string' } },
   ['validation_status']);
@@ -553,7 +585,11 @@ have several implementations of the same layer); one without such a seam cannot 
 levels ${IMPLEMENTABLE_LEVELS}, except ${UNSUPPORTED_PATTERNS}; a candidate outside it is not authored (a level alone
 is no reason to skip a candidate inside it). Mutually exclusive candidates (exclusive_with)
 may both be picked: which of them goes into the server is decided after their unit tests.
-Read ${topk.topk_json || '(the candidates below)'}${topk.report_md ? ' and the report below' : ''}; read anything else you need.
+${KF_MEGA ? `An L3 MegaKernel candidate (one persistent kernel absorbing a multi-rank stage with its dispatch, combine or
+communication, e.g. an EP MoE layer) is not written by the single-GPU author: give it "route": "mega" and the
+multi-GPU Mega workflow authors it against a multi-rank unit test. Its seam is the layer callable every rank runs
+(e.g. the MoE layer forward). Every other pick gets "route": "author".
+` : ''}Read ${topk.topk_json || '(the candidates below)'}${topk.report_md ? ' and the report below' : ''}; read anything else you need.
 
 ## Candidates
 ${JSON.stringify(topk.candidates || [])}
@@ -561,7 +597,7 @@ ${JSON.stringify(topk.candidates || [])}
 ## Analyst's recommendation
 ${JSON.stringify(topk.recommended || [])}
 ${topk.report_md ? `\n## Report\n${topk.report_md}\n` : ''}
-${KF_TASK ? `## Operator constraints\n${KF_TASK}\n\n` : ''}Return JSON {"selected": [{"id", "reason"}], "skipped": [{"id", "reason"}]}.`,
+${KF_TASK ? `## Operator constraints\n${KF_TASK}\n\n` : ''}Return JSON {"selected": [{"id", "reason"${KF_MEGA ? ', "route"' : ''}}], "skipped": [{"id", "reason"}]}.`,
   { phase: 'Author', label: 'kf:feasibility-review', schema: REVIEW_SCHEMA });
 let jobs = ((feasibility && feasibility.selected) ? feasibility.selected.map((x) => x && x.id) : (topk.recommended || []))
   .map((id) => byId.get(String(id))).filter((c, i, a) => c && seamOf(c) && a.indexOf(c) === i);
@@ -577,6 +613,13 @@ if (picked && !jobs.length) {
   result.reason = `feasibility review selected ${picked} pattern(s) but none has a usable seam.target_callable`;
   return result;
 }
+// kf_mega: the review's route decides; a pick without one goes to mega when it is an L3 MegaKernel by its description.
+const routeOf = new Map(((feasibility && feasibility.selected) || []).map((x) => [String(x && x.id), x && x.route]));
+const isMega = (c) => KF_MEGA && (routeOf.get(String(c.id)) === 'mega' || (!routeOf.get(String(c.id)) &&
+  String(c.level) === 'L3' && /mega\s*kernel/i.test(`${c.region || ''} ${c.fused_design || ''} ${c.pattern || ''}`)));
+const megaJobs = jobs.filter(isMega);
+jobs = jobs.filter((c) => !isMega(c));
+if (megaJobs.length) log(`[kf] mode=mega authors ${megaJobs.map((c) => c.id).join(', ')} after the single-GPU authors`);
 
 const shortOf = (c) => String(c.id).replace(/[^A-Za-z0-9_]+/g, '_');
 
@@ -658,6 +701,18 @@ if (IS_AGENTX && jobs.length && !DEADLINE_HIT) {
   log(`[kf] kernel-extract prepared ${[...preparedById.values()].filter((r) => r && r.ok).length}/${jobs.length} fusion UT(s)`);
 }
 
+// How a fused kernel goes into the server (the author and the mega package step).
+const overlayRules = (work, short) => `The overlay that puts it in the server: ${work}/overlay/sitecustomize.py (the dir goes first on the server's
+   PYTHONPATH). sitecustomize runs in EVERY Python process the server spawns (each rank, tokenizer, detokenizer,
+   tools): at its top level import only the standard library -- torch / triton / the op libraries and your kernel
+   module are imported inside the hook, when it fires. Patch the seam lazily -- after its module is first imported,
+   never by importing it eagerly -- and GUARD it: call the fused kernel only inside the envelope your unit test
+   measured it correct AND faster in (phase, row count / M range, dtypes, shapes); every other call -- another
+   phase, a larger M such as a prefill chunk, a batch size you did not time, inputs it does not support -- goes to
+   the stock path. State that envelope in the return as engaged_envelope. Print
+   "[kf-${short}] ENGAGED" to stderr once, the first time the patched path actually runs. It must survive graph
+   capture.${GRAPH_REQ}`;
+
 async function authorOne(c, i) {
   if (DEADLINE_HIT) return { c, skip: 'stage deadline' };
   const gpu = GPU_LIST[i % GPU_LIST.length];
@@ -716,16 +771,7 @@ iterate and measure as you see fit, and deliver three things:
    speedup by each shape's served share. Report the per-shape times. Cover EVERY phase in which the server calls
    the seam (prefill / extend chunks of every served width, decode, target verify, draft): find them from the trace
    digest's step kinds and the source, not only from the region's listed phases.
-3. The overlay that puts it in the server: ${work}/overlay/sitecustomize.py (the dir goes first on the server's
-   PYTHONPATH). sitecustomize runs in EVERY Python process the server spawns (each rank, tokenizer, detokenizer,
-   tools): at its top level import only the standard library -- torch / triton / the op libraries and your kernel
-   module are imported inside the hook, when it fires. Patch the seam lazily -- after its module is first imported,
-   never by importing it eagerly -- and GUARD it: call the fused kernel only inside the envelope your unit test
-   measured it correct AND faster in (phase, row count / M range, dtypes, shapes); every other call -- another
-   phase, a larger M such as a prefill chunk, a batch size you did not time, inputs it does not support -- goes to
-   the stock path. State that envelope in the return as engaged_envelope. Print
-   "[kf-${short}] ENGAGED" to stderr once, the first time the patched path actually runs. It must survive graph
-   capture.${GRAPH_REQ}
+3. ${overlayRules(work, short)}
 
 ## Return
 Write the diff of WORK_DIR against TASK_DIR (diff -ruN) plus the kernel and overlay files to
@@ -744,7 +790,134 @@ whether or not it beats stock -- the next step judges it) or "" if you have no c
   const iso = kl ? (kl.final_weighted != null ? kl.final_weighted : kl.final_geomean) : 0;
   return { c, ext, kl, lang, iso };
 }
+// An L3 MegaKernel region (kf_mega): a multi-rank UT, then the kernel workflow's mode=mega authors and verifies the
+// fused operator against it, then the delivered candidate is packaged as an overlay in the author's result shape, so
+// the ApplyBack takes it like any other kernel. It needs the whole EP group: it runs after the single-GPU authors.
+function regionOf(c) {
+  return cfg({ id: c.id, level: c.level, region: c.region, kernels_in_order: c.kernels || [], phases: c.phases || [],
+    m_range: c.m_range || '', seam: c.seam || {}, inputs_outputs: c.inputs_outputs || '',
+    launches_before: c.launches_before || (c.kernels || []).length, suggested_design: c.fused_design || '' });
+}
+function megaPreparePrompt(c, work, previous) {
+  return `${previous ? `A previous attempt did not produce a passing UT. Its outcome: ${previous}. Reuse what it saved under ${work}, fix that blocker and finish.\n\n` : ''}You build the multi-rank unit test that the Mega workflow (the kernel workflow's mode=mega) optimizes against,
+for ONE L3 MegaKernel region of a live LLM serving stack. Do not optimize or integrate anything.
+
+## The region
+${regionOf(c)}
+
+## Build
+1. KERNEL_PATH=${work}/mega_base: a frozen copy of the operator source the seam runs (the package subtree the live
+   path imports for this layer, with the kernels it launches), importable from there; note its origin (path, commit)
+   in ${work}/mega_base/ORIGIN.md. The Mega workflow copies it and never edits it; a candidate is a changed copy.
+2. The UT ${work}/mega_ut.py, one process per rank under torchrun: start from ${KF_HOME}/mega_ut_template.py (keep its
+   output contract, replace its three hooks) and follow ${KERNEL_EXTRACT_DIR}/references/collective-ut.md.
+   - Build the layer the way the server does on each rank (same EP/TP group size, dtype, quantization, routing),
+     from the real weights of one layer of MODEL_PATH where feasible, importing the operator from KERNEL_PATH.
+   - Cases: tokens per rank for EVERY phase in which the server calls the seam (decode, target verify, draft,
+     prefill / extend chunks of every served width), each with its served share (WORKLOAD_SUMMARY, the baseline
+     server log, the trace digest).
+3. Run it on the stock path until both modes pass, all ranks under one group lease (GPUS_PER_JOB = the serving EP/TP
+   group size, at most the number of GPU_IDS; the first GPUS_PER_JOB of GPU_IDS):
+   bash ${KERNEL_WF_DIR}/scripts/gpu_lock.sh group:<ids> torchrun --standalone --nproc_per_node=<GPUS_PER_JOB> ${work}/mega_ut.py correctness
+   and the same with performance (a lease stops its job after GEAK_GPU_RUN_TIMEOUT, default 900 s: export a
+   larger value for a long run).
+
+## Inputs
+${cfg({ EVAL_DIR, MODEL_PATH, BACKEND, SERVING_TP, SERVER_FLAGS: INIT_FLAGS, SERVER_ENV: INIT_ENV, GPU_IDS,
+    WORKLOAD, WORKLOAD_SUMMARY: workloadJson || '(none: derive it from the baseline server log)', TRACE_DIR })}
+
+## Return
+JSON {"ok", "kernel_path", "benchmark_harness": "${work}/mega_ut.py", "case_ids", "case_weights": {case: served share},
+"target_guards": [cases with the most served weight, which a fused kernel must win], "regression_guards": [the other
+served cases: they may not regress], "required_accuracy_cases": [case ids], "gpus_per_job", "candidate_import_modules":
+[modules a candidate tree is imported as], "ut_command", "task": "<model, layer, dtype, quantization, EP size,
+environment, how to run the UT>", "notes"}; ok=false with the concrete blocker when the UT does not pass.`
+    + (KF_TASK ? `\n\n## Operator constraints\n${KF_TASK}` : '');
+}
+async function megaOne(c) {
+  const short = shortOf(c);
+  const work = `${EVAL_DIR}/kernels/${short}`;
+  const out = (why, extra) => ({ c, stage: 'mega', skip: why, ...(extra || {}) });
+  let prep = null;
+  for (let t = 0; t < 2 && !(prep && prep.ok); t++) {
+    if (DEADLINE_HIT || MEGA_LATE) return out('stage deadline');
+    prep = await safeAgent(megaPreparePrompt(c, work, t ? String((prep && prep.notes) || 'no result').slice(0, 1500) : ''),
+      { phase: 'Author', label: `kf:mega prepare ${short}${t ? ' (retry)' : ''}`, schema: MEGA_PREPARE_SCHEMA });
+  }
+  if (!(prep && prep.ok)) return out(`multi-rank UT not ready (${(prep && prep.notes) || 'no result'})`);
+  const gpj = parseInt(prep.gpus_per_job, 10);
+  if (!(gpj > 0 && gpj <= GPU_LIST.length)) return out(`gpus_per_job=${prep.gpus_per_job} does not fit gpu_ids ${GPU_IDS}`);
+  if (DEADLINE_HIT || MEGA_LATE) return out('stage deadline');
+  const megaArgs = {
+    mode: 'mega', workflow_dir: KERNEL_WF_DIR, kernel_path: prep.kernel_path, benchmark_harness: prep.benchmark_harness,
+    exp_root: `${work}/mega`, state_dir: `${work}/mega_state`, gpu_ids: GPU_IDS, gpus_per_job: gpj,
+    candidate_import_modules: prep.candidate_import_modules || [],
+    target_guards: prep.target_guards || [], regression_guards: prep.regression_guards || [],
+    required_accuracy_cases: prep.required_accuracy_cases || prep.target_guards || [],
+    use_expert_skills: 'false', objective: 'speedup', promotion_metric: 'operator_e2e',
+    launch_target: 2, allow_partial_fusion: 'true', mega_time_budget_s: MEGA_BUDGET_S,
+    task: `Fuse this L3 MegaKernel region of a live ${BACKEND} server into fewer launches, starting from the frozen ` +
+      `baseline at the kernel path. ${prep.task || ''} Run the UT as: ${prep.ut_command || prep.benchmark_harness}. ` +
+      `Do not change the frozen baseline or the UT. Region: ${c.region || c.id}; seam ${seamOf(c)}.${GRAPH_REQ}` +
+      (KF_TASK ? ` Operator constraints: ${KF_TASK}` : ''),
+    ...MEGA_ARGS,
+  };
+  let mr = null;
+  try {
+    mr = await Promise.race([workflow({ scriptPath: `${KERNEL_WF_DIR}/kernel_mega.js` }, megaArgs), MEGA_CUT]);
+  } catch (e) { return out(`mode=mega failed: ${String(e).slice(0, 600)}`); }
+  if (!mr) return out(MEGA_LATE ? 'mode=mega cut at the stage deadline' : 'mode=mega returned nothing');
+  const sel = (Array.isArray(mr.mega_candidate_registry) ? mr.mega_candidate_registry : [])
+    .find((x) => x && x.id === mr.mega_selected_candidate) || null;
+  if (mr.mega_deliverable !== true) {
+    const best = (Array.isArray(mr.mega_candidate_registry) ? mr.mega_candidate_registry : [])
+      .filter((x) => x && x.next_blocker).slice(-1)[0];
+    return out(`mode=mega delivered nothing: ${mr.mega_note || mr.validation_status || ''}` +
+      `${best ? ` (last blocker: ${String(best.next_blocker).slice(0, 400)})` : ''}`, { iso: mr.final_speedup || 0 });
+  }
+  if (DEADLINE_HIT) return out('stage deadline before packaging', { iso: mr.final_speedup || 0 });
+  const pick = sel ? { id: sel.id, tree: sel.tree, head: sel.head, patch: sel.patch, activation: sel.activation,
+    launches: sel.launches, absolute_score: sel.absolute_score } : { id: mr.mega_selected_candidate };
+  const au = await safeAgent(`You put a fused operator that the Mega workflow (the kernel workflow's mode=mega) delivered into a live LLM
+serving stack, as an overlay. Do not change the operator.
+
+## The region
+${regionOf(c)}
+
+## What mode=mega delivered
+${cfg({ MEGA_EVAL_DIR: mr.eval_dir || '', REPORT: mr.report_path || '', FINAL_PATCH: mr.final_patch || '',
+    SELECTED: pick, FINAL_SPEEDUP_TARGET: mr.final_speedup, STATE_DIR: `${work}/mega_state`,
+    KERNEL_PATH: prep.kernel_path, UT: prep.ut_command || prep.benchmark_harness, CASE_WEIGHTS: prep.case_weights || {} })}
+The report holds the per-case ratios against the frozen baseline, the path that ran and the launches.
+
+## Do
+1. ${work}/kernel/: the selected candidate's operator (its tree, or FINAL_PATCH applied to a copy of KERNEL_PATH) and
+   whatever its activation record needs (env switches are set inside the hook, never server-wide).
+2. ${overlayRules(work, short)}
+   The envelope is the cases (phase, tokens per rank) where the report shows the candidate correct AND faster than the
+   frozen baseline; the overlay rebinds the seam ${seamOf(c)} on every rank to the operator in ${work}/kernel/.
+3. Run the UT once more (correctness, then performance) with the candidate reached through the overlay-bound seam,
+   not imported directly, all ranks under one group lease (${KERNEL_WF_DIR}/scripts/gpu_lock.sh group:<ids>).
+
+## Return
+Write FINAL_PATCH plus the kernel and overlay files to ${work}/final_patch.diff and return JSON
+{"final_patch": "${work}/final_patch.diff" or "" if the overlay-bound run is not correct, "work_dir": "${work}/kernel",
+"overlay_dir": "${work}/overlay", "banner": "[kf-${short}] ENGAGED", "isolated_speedup": <frozen baseline time /
+candidate time per case from the report, weighted by CASE_WEIGHTS; cases outside the envelope count 1.0>,
+"correctness": "pass" | "fail", "launches_after": <launches per rank>, "ut_command": "<how you ran it>",
+"engaged_envelope": "<cases the overlay sends to the fused operator; all else stock>", "notes": "<per-case ratios>"}.`
+    + (KF_TASK ? `\n\n## Operator constraints\n${KF_TASK}` : ''),
+  { phase: 'Author', label: `kf:mega package ${short}`, schema: AUTHOR_SCHEMA });
+  const kl = au ? { eval_dir: work, final_patch: au.correctness === 'pass' ? au.final_patch || '' : '',
+    overlay_dir: au.overlay_dir || '', banner: au.banner || '', envelope: au.engaged_envelope || '',
+    final_geomean: au.isolated_speedup || 0, validation_status: au.correctness, reason: au.notes || '' }
+    : { validation_status: 'error', reason: 'mega package agent returned nothing' };
+  return { c, stage: 'mega', ext: { short_name: short, task_dir: work, target_callable: seamOf(c) }, kl, lang: 'mega',
+    iso: kl.final_geomean || 0 };
+}
+
 const authored = await parallel(jobs.map((c, i) => () => authorOne(c, i)));
+for (const c of megaJobs) authored.push(await megaOne(c));
 const authoredById = new Map(authored.filter(Boolean).map((r) => [String(r.c.id), r]));
 // A kernel can go on only if it exists, passed its UT and has an overlay: everything else is the Integration Review's call.
 const usable = (r) => r && !r.skip && r.kl && r.kl.authored !== false && r.kl.final_patch && r.kl.overlay_dir;
@@ -752,7 +925,7 @@ for (const r of authored) {
   if (r && !usable(r)) {
     const why = r.skip || `no correct kernel (${r.kl ? r.kl.reason || r.kl.validation_status || '' : 'none'})`;
     log(`[kf] ${r.c.id}: ${why}`);
-    result.rejected.push({ id: r.c.id, stage: r.skip ? 'extract' : 'author', reason: why, isolated_speedup: r.iso || 0 });
+    result.rejected.push({ id: r.c.id, stage: r.stage || (r.skip ? 'extract' : 'author'), reason: why, isolated_speedup: r.iso || 0 });
   }
 }
 const ready = authored.filter(usable);

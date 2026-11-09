@@ -56,6 +56,9 @@ _KNOBS = {
     "accuracy_confirm_limit": ("GEAK_KF_ACCURACY_CONFIRM_LIMIT", "kf_accuracy_confirm_limit"),
     "min_gain_pct": ("GEAK_KF_MIN_GAIN_PCT", "kf_min_gain_pct"),
     "task": ("GEAK_KF_TASK", "kf_task"),
+    "mega": ("GEAK_KF_MEGA", "kf_mega"),
+    "mega_budget_s": ("GEAK_KF_MEGA_BUDGET_S", "kf_mega_time_budget_s"),
+    "mega_args": ("GEAK_KF_MEGA_ARGS", "kf_mega_args"),
     "budget_s": ("GEAK_KF_BUDGET_S", None),
     "kf_dir": ("GEAK_KF_DIR", "kf_dir"),
 }
@@ -155,6 +158,8 @@ CAND_KEYS = ("id", "rank", "level", "region", "kernels", "phases", "occurrences"
              "bitwise_exact", "exclusive_with", "language", "fallback", "fused_design")
 UT_KEYS = ("task_dir", "editable", "baseline_frozen", "unittest_smoke", "smoke", "target_callable", "short_name")
 AUTHOR_KEYS = ("final_patch", "work_dir", "overlay_dir", "banner", "isolated_speedup", "correctness", "launches_after")
+MEGA_UT_KEYS = ("ok", "kernel_path", "benchmark_harness", "case_ids", "case_weights", "target_guards", "regression_guards",
+                "required_accuracy_cases", "gpus_per_job", "candidate_import_modules", "ut_command", "task")
 
 
 def slim_topk(d: dict, author_k: int) -> dict:
@@ -188,12 +193,12 @@ def slim_result(r: dict) -> dict:
                for f in [*(p.get("failed_tasks") or []), *(p.get("deferred_tasks") or [])] if isinstance(f, dict)]
         return {"delivery_path": r.get("delivery_path", ""),
                 "prepared": {"head_candidates": [], "kernel_candidates": cands, "failed_tasks": why}}
-    out = {k: r[k] for k in AUTHOR_KEYS if k in r}
+    out = {k: r[k] for k in (MEGA_UT_KEYS if "benchmark_harness" in r else AUTHOR_KEYS) if k in r}
     out["notes"] = str(r.get("notes") or "")[:300]
     return out
 
 
-REUSABLE = ("kf:kernel-extract prepare ", "kf:author ", "kf:integrate screen")
+REUSABLE = ("kf:kernel-extract prepare ", "kf:author ", "kf:mega prepare ", "kf:integrate screen")
 
 
 def reused_results(journal: str) -> dict:
