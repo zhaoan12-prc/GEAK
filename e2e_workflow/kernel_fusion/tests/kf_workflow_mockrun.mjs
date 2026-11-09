@@ -68,8 +68,8 @@ const answers = {
   'kf:feasibility-review': () => (scenario === 'triage_none' ? null
     : scenario === 'no_seam' ? { selected: [{ id: 'c3' }], skipped: [] }
     // c3 overlaps c1 (exclusive_with): the mega scenarios leave c1 out so c3 can reach the stack
-    : scenario === 'mega' || scenario === 'mega_fail' ? { selected: [{ id: 'c2', route: 'author' }, { id: 'c3', route: 'mega' }], skipped: [] }
-    : scenario === 'mega_noroute' ? { selected: [{ id: 'c2' }, { id: 'c3' }], skipped: [] }
+    : ['mega', 'mega_fail', 'mega_off', 'mega_1gpu'].includes(scenario) ? { selected: [{ id: 'c2', route: 'author' }, { id: 'c3', route: 'mega' }], skipped: [] }
+    : scenario === 'mega_noroute' || scenario === 'mega_default' ? { selected: [{ id: 'c2' }, { id: 'c3' }], skipped: [] }
     : { selected: [{ id: 'c1' }, { id: 'c1s' }, { id: 'c2' }, { id: 'c3' }], skipped: [] }),
   'kf:integration-review': (prompt) => {
     const ut = JSON.parse(prompt.split('## UT results\n')[1].split('\n')[0]);
@@ -145,7 +145,9 @@ const args = { workflow_dir: WF_DIR, kf_dir: KF, model_path: '/models/M', gpu_id
   kf_prompt: '/prompts/p.txt,/prompts/deploy.txt', agent_timeout_ms: 0, kf_task: 'Do not read /answers.',
   initial_extra_env: 'SGLANG_USE_AITER=1 SGLANG_SIMULATE_ACC_LEN=4.05 SGLANG_SIMULATE_ACC_METHOD=match-expected HF_HUB_OFFLINE=1',
   correctness_unset_env: 'SGLANG_SIMULATE_ACC_LEN,SGLANG_SIMULATE_ACC_METHOD' };
-if (MEGA) Object.assign(args, { kf_mega: '1', kf_mega_args: '{"budget": 2}' });
+// mega_default: no kf_mega given (on by default); mega_off: switched off
+if (MEGA && scenario !== 'mega_default') Object.assign(args, { kf_mega: scenario === 'mega_off' ? '0' : '1', kf_mega_args: '{"budget": 2}' });
+if (scenario === 'mega_1gpu') Object.assign(args, { gpu_ids: '0', tp: 1 });
 if (scenario === 'analysis_only') Object.assign(args, { kf_steps: 'topk', kf_trace_dir: '/traces/x' });
 if (scenario === 'reuse') args.kf_reuse = { 'kf:author c1': { final_patch: 'old c1', isolated_speedup: 1.3, correctness: 'pass',
   overlay_dir: '/old/c1/overlay', banner: '[kf-c1] ENGAGED' } };

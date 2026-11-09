@@ -317,9 +317,10 @@ def test_the_workflow_owns_the_output_format_and_the_schema_types_the_seam():
     skill = E2E_DIR / "knowledge" / "kernel_fusion_skills" / "fusion-analysis"
     text = "".join(p.read_text() for p in [skill / "SKILL.md", *sorted((skill / "references").glob("*.md"))])
     assert "out/" not in text and "fusion_candidates" not in text and "recommended=true" not in text
-    assert "IMPLEMENTABLE_LEVELS: L1,L2,L3" in p and "UNSUPPORTED_PATTERNS: L3 MegaKernel" in p   # injected, not prose
+    # injected, not prose; an L3 MegaKernel is in scope (mode=mega), L4 is not
+    assert "IMPLEMENTABLE_LEVELS: L1,L2,L3" in p and "UNSUPPORTED_PATTERNS: L4 (whole-layer MonoKernel)" in p
     tri = next(c["prompt"] for c in out["calls"] if c["label"] == "kf:feasibility-review")
-    assert "levels L1,L2,L3, except L3 MegaKernel" in tri and "a level alone" in tri
+    assert "levels L1,L2,L3, except L4 (whole-layer MonoKernel)" in tri and "a level alone" in tri
     assert "knowledge/kernel_fusion_skills/fusion-analysis/SKILL.md" in (E2E_DIR / "kernel_fusion" / "kf_workflow.js").read_text()
     assert "reference files a SKILL.md among them links" in p
 
@@ -368,11 +369,28 @@ def test_fused_kernels_are_guarded_to_their_measured_envelope_and_uts_cover_ever
     assert "engaged_envelope" in sel
 
 
-def test_without_kf_mega_a_megakernel_is_not_authored_and_no_workflow_is_nested():
-    out = run("accept")
+def test_with_kf_mega_off_a_megakernel_is_not_authored_and_no_workflow_is_nested():
+    out = run("mega_off")
     assert out["nested"] == [] and not [c for c in out["calls"] if c["label"].startswith("kf:mega")]
+    assert "kf:extract c3" in labels(out)                         # not routed: it takes the single-GPU author path
     tri = next(c["prompt"] for c in out["calls"] if c["label"] == "kf:feasibility-review")
     assert "except L3 MegaKernel" in tri and '"route"' not in tri
+
+
+def test_a_megakernel_goes_to_mode_mega_without_any_switch():
+    out = run("mega_default")
+    assert len(out["nested"]) == 1 and "kf:author c3" not in labels(out, authors=True)
+    assert [x["id"] for x in out["result"]["accepted"]] == ["c3"]
+
+
+def test_mode_mega_is_skipped_on_a_single_gpu_or_without_room_in_the_stage_budget():
+    out = run("mega_1gpu")
+    assert out["nested"] == [] and "kf:mega prepare c3" not in labels(out)
+    (rej,) = [x for x in out["result"]["rejected"] if x["id"] == "c3"]
+    assert rej["stage"] == "mega" and "needs several GPUs" in rej["reason"]
+    src = (E2E_DIR / "kernel_fusion" / "kf_workflow.js").read_text()
+    assert "setTimeout(() => { MEGA_NO_ROOM = true; }, Math.max(0, cutMs - MEGA_MIN_S * 1000));" in src
+    assert src.count("if (noRoom()) return out(noRoom());") == 2                 # before the UT and before the run
 
 
 def test_kf_mega_routes_an_l3_megakernel_to_mode_mega_after_the_single_gpu_authors():

@@ -6,7 +6,7 @@ export const meta = {
     { title: 'Setup', detail: 'e2e Director builds the KF eval dir + baseline throughput, one fresh server and one timed round, no warmup round (roles/director.md PHASE=setup)' },
     { title: 'Trace', detail: 'AgentX: kernel-extract skill sampling capture (points from the baseline log, one probe each); else roles/profiler.md; or kf_trace_dir' },
     { title: 'OpportunityAnalysis', detail: 'Opportunity Analysis: kf_trace_digest.py + the user prompt -> ranked fusion opportunities (topk.json)' },
-    { title: 'Author', detail: 'the Feasibility Review agent picks the opportunities worth authoring (no cap, no gain floor); each: region UT (AgentX: kernel-extract skill prepare; else roles/kernel_extractor.md), then one author agent writes the fused kernel against that UT; with kf_mega an L3 MegaKernel gets a multi-rank UT and the kernel workflow mode=mega (kernel_mega.js) instead' },
+    { title: 'Author', detail: 'the Feasibility Review agent picks the opportunities worth authoring (no cap, no gain floor); each: region UT (AgentX: kernel-extract skill prepare; else roles/kernel_extractor.md), then one author agent writes the fused kernel against that UT; an L3 MegaKernel gets a multi-rank UT and the kernel workflow mode=mega (kernel_mega.js) instead (kf_mega=0: off)' },
     { title: 'ApplyBack', detail: 'the Integration Review agent picks from the UT results which kernels go on; they go in as one combined overlay on one e2e_integrator A/B (gsm8k on the whole stack first); only if the stack fails accuracy is each kernel checked alone and the A/B re-run without the failing ones' },
   ],
 };
@@ -70,8 +70,9 @@ const AB_FINISH_RETRIES = parseInt(A.ab_finish_retries != null ? A.ab_finish_ret
 const PROMPT = String(A.kf_prompt || `${WORKFLOW_DIR}/knowledge/kernel_fusion_skills/fusion-analysis/SKILL.md`);
 // The fusion levels the author/apply steps implement; the analysis may recommend only these (the skill ranks all).
 const IMPLEMENTABLE_LEVELS = String(A.kf_implementable_levels || 'L1,L2,L3');
-// L3 MegaKernel candidates go to the kernel workflow's mode=mega (multi-GPU, see megaOne) when kf_mega is on.
-const KF_MEGA = /^(1|true|yes|on)$/i.test(String(A.kf_mega != null ? A.kf_mega : '').trim());
+// L3 MegaKernel candidates the analysis recommends go to the kernel workflow's mode=mega (multi-GPU, see megaOne);
+// kf_mega=0 turns that off and keeps them unsupported.
+const KF_MEGA = !/^(0|false|no|off)$/i.test(String(A.kf_mega != null ? A.kf_mega : '').trim());
 const MEGAKERNEL_PATTERN = 'L3 MegaKernel (one persistent kernel that absorbs a heavy expert/GEMM or attention stage together with its dispatch, combine or communication, e.g. MegaMoE)';
 // Patterns inside those levels the author/apply steps do not implement yet; the analysis ranks them but does not
 // recommend them, and the Feasibility Review does not author them.
@@ -149,11 +150,15 @@ if (typeof MEGA_ARGS === 'string') {
   try { MEGA_ARGS = JSON.parse(MEGA_ARGS); } catch (e) { throw new Error(`kf_mega_args is not JSON: ${e}`); }
 }
 if (!MEGA_ARGS || typeof MEGA_ARGS !== 'object' || Array.isArray(MEGA_ARGS)) throw new Error('kf_mega_args must be a JSON object');
-let MEGA_LATE = false;
+// A mode=mega run needs hours (Setup + controls, then at least one candidate): it starts only while MEGA_MIN_S is
+// left before the cut (MEGA_NO_ROOM), else the region is skipped with that reason.
+const MEGA_MIN_S = parseInt(A.kf_mega_min_s != null ? A.kf_mega_min_s : 14400, 10);
+let MEGA_LATE = false, MEGA_NO_ROOM = false;
 const MEGA_CUT = new Promise((resolve) => {
   if (!KF_MEGA || !TIME_BUDGET_MS || typeof setTimeout !== 'function') return;
-  setTimeout(() => { MEGA_LATE = true; resolve(null); },
-    Math.max(0, Math.floor(TIME_BUDGET_MS * 0.85 - MEGA_PACKAGE_S * 1000)));
+  const cutMs = Math.max(0, Math.floor(TIME_BUDGET_MS * 0.85 - MEGA_PACKAGE_S * 1000));
+  setTimeout(() => { MEGA_NO_ROOM = true; }, Math.max(0, cutMs - MEGA_MIN_S * 1000));
+  setTimeout(() => { MEGA_LATE = true; resolve(null); }, cutMs);
 });
 
 // Same deployment requirement e2e_workflow.js injects into every kernel task (derived the same way).
@@ -588,7 +593,8 @@ may both be picked: which of them goes into the server is decided after their un
 ${KF_MEGA ? `An L3 MegaKernel candidate (one persistent kernel absorbing a multi-rank stage with its dispatch, combine or
 communication, e.g. an EP MoE layer) is not written by the single-GPU author: give it "route": "mega" and the
 multi-GPU Mega workflow authors it against a multi-rank unit test. Its seam is the layer callable every rank runs
-(e.g. the MoE layer forward). Every other pick gets "route": "author".
+(e.g. the MoE layer forward). It takes hours on the whole EP group: weigh that against its gain. Every other pick
+gets "route": "author".
 ` : ''}Read ${topk.topk_json || '(the candidates below)'}${topk.report_md ? ' and the report below' : ''}; read anything else you need.
 
 ## Candidates
@@ -838,6 +844,9 @@ async function megaOne(c) {
   const short = shortOf(c);
   const work = `${EVAL_DIR}/kernels/${short}`;
   const out = (why, extra) => ({ c, stage: 'mega', skip: why, ...(extra || {}) });
+  if (GPU_LIST.length < 2) return out(`mode=mega needs several GPUs, gpu_ids is ${GPU_IDS}`);
+  const noRoom = () => MEGA_NO_ROOM && `not enough stage budget left for mode=mega (needs ${MEGA_MIN_S}s before the cut)`;
+  if (noRoom()) return out(noRoom());
   let prep = null;
   for (let t = 0; t < 2 && !(prep && prep.ok); t++) {
     if (DEADLINE_HIT || MEGA_LATE) return out('stage deadline');
@@ -848,6 +857,7 @@ async function megaOne(c) {
   const gpj = parseInt(prep.gpus_per_job, 10);
   if (!(gpj > 0 && gpj <= GPU_LIST.length)) return out(`gpus_per_job=${prep.gpus_per_job} does not fit gpu_ids ${GPU_IDS}`);
   if (DEADLINE_HIT || MEGA_LATE) return out('stage deadline');
+  if (noRoom()) return out(noRoom());
   const megaArgs = {
     mode: 'mega', workflow_dir: KERNEL_WF_DIR, kernel_path: prep.kernel_path, benchmark_harness: prep.benchmark_harness,
     exp_root: `${work}/mega`, state_dir: `${work}/mega_state`, gpu_ids: GPU_IDS, gpus_per_job: gpj,

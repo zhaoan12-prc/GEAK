@@ -59,6 +59,7 @@ _KNOBS = {
     "mega": ("GEAK_KF_MEGA", "kf_mega"),
     "mega_budget_s": ("GEAK_KF_MEGA_BUDGET_S", "kf_mega_time_budget_s"),
     "mega_args": ("GEAK_KF_MEGA_ARGS", "kf_mega_args"),
+    "mega_min_s": ("GEAK_KF_MEGA_MIN_S", "kf_mega_min_s"),
     "budget_s": ("GEAK_KF_BUDGET_S", None),
     "kf_dir": ("GEAK_KF_DIR", "kf_dir"),
 }
