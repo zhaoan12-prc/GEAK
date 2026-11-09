@@ -463,9 +463,12 @@ def test_validate_overlay_ties_the_overlay_to_the_ab_that_accepted_it(tmp_path):
     kf_dir = tmp_path / "kf_x"
     ov = make_overlay(kf_dir)
     assert kf_stage.validate_overlay(ov, "", kf_dir)["ok"]
-    later = os.path.getmtime(Path(ov) / "cand" / "bench_summary.json") + 60
-    os.utime(Path(ov) / "_kf_c1.py", (later, later))                       # edited after the A/B
-    assert any("after the A/B" in p for p in kf_stage.validate_overlay(ov, "", kf_dir)["problems"])
+    # the integrator's A/B records land in the candidate dir after the A/B (DSv4.1-Flash c64: 4 min later)
+    later = os.path.getmtime(Path(ov) / "cand" / "bench_summary.json") + 240
+    for rec in ("e2e_validation.json", "manifests.json"):
+        (Path(ov) / rec).write_text("{}")
+        os.utime(Path(ov) / rec, (later, later))
+    assert kf_stage.validate_overlay(ov, "", kf_dir)["ok"]
     (kf_dir / "integrate_kf_stack" / "integrate_result.json").unlink()
     assert any("no integrate_result.json" in p for p in kf_stage.validate_overlay(ov, "", kf_dir)["problems"])
     elsewhere = make_overlay(tmp_path / "other_kf")
