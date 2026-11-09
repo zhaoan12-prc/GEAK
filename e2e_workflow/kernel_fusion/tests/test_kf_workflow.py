@@ -366,3 +366,63 @@ def test_fused_kernels_are_guarded_to_their_measured_envelope_and_uts_cover_ever
     assert preps and all("(6) The cases cover EVERY phase" in p for p in preps)
     sel = next(c["prompt"] for c in out["calls"] if c["label"] == "kf:integration-review")
     assert "engaged_envelope" in sel
+
+
+def test_without_kf_mega_a_megakernel_is_not_authored_and_no_workflow_is_nested():
+    out = run("accept")
+    assert out["nested"] == [] and not [c for c in out["calls"] if c["label"].startswith("kf:mega")]
+    tri = next(c["prompt"] for c in out["calls"] if c["label"] == "kf:feasibility-review")
+    assert "except L3 MegaKernel" in tri and '"route"' not in tri
+
+
+def test_kf_mega_routes_an_l3_megakernel_to_mode_mega_after_the_single_gpu_authors():
+    out = run("mega")
+    r = out["result"]
+    tri = next(c["prompt"] for c in out["calls"] if c["label"] == "kf:feasibility-review")
+    assert "except L4 (whole-layer MonoKernel)" in tri and '"route": "mega"' in tri
+    analysis = next(c["prompt"] for c in out["calls"] if c["label"] == "kf:opportunity-analysis")
+    assert "UNSUPPORTED_PATTERNS: L4" in analysis
+    ls = labels(out, authors=True)
+    assert ls.index("kf:author c2") < ls.index("kf:mega prepare c3") < ls.index("kf:mega package c3") < ls.index("kf:integration-review")
+    assert "kf:author c3" not in ls and "kf:extract c3" not in ls
+    (n,) = out["nested"]
+    assert n["scriptPath"].endswith("/kernel_workflow/kernel_mega.js")       # the worker, not the dispatcher
+    a = n["args"]
+    assert a["mode"] == "mega" and a["gpus_per_job"] == 2 and a["gpu_ids"] == "0,1" and a["budget"] == 2
+    assert a["kernel_path"] == f"{KF}/kernels/c3/mega_base" and a["target_guards"] == ["decode_64"]
+    assert a["regression_guards"] == ["prefill_4096"] and a["use_expert_skills"] == "false"
+    assert a["state_dir"] == f"{KF}/kernels/c3/mega_state" and "pkg.moe:EPMoE.forward" in a["task"]
+    pkg = next(c["prompt"] for c in out["calls"] if c["label"] == "kf:mega package c3")
+    assert "SELECTED:" in pkg and "[kf-c3] ENGAGED" in pkg and "sitecustomize" in pkg
+    assert [x["id"] for x in r["accepted"]] == ["c3"] and r["status"] == "accepted"
+    stack = next(c["prompt"] for c in out["calls"] if c["label"] == "kf:integrate kf_stack")
+    assert f"{KF}/kernels/c3/overlay" in stack
+
+
+def test_a_megakernel_pick_without_a_route_goes_to_mode_mega_by_its_description():
+    out = run("mega_noroute")
+    assert len(out["nested"]) == 1 and "kf:author c3" not in labels(out, authors=True)
+
+
+def test_a_mode_mega_run_that_delivers_nothing_is_rejected_with_its_blocker():
+    out = run("mega_fail")
+    assert "kf:mega package c3" not in labels(out)
+    (rej,) = [x for x in out["result"]["rejected"] if x["id"] == "c3"]
+    assert rej["stage"] == "mega" and "no fully verified finalist" in rej["reason"]
+    assert "graph replay hangs at decode_64" in rej["reason"] and rej["isolated_speedup"] == 0.91
+
+
+def test_a_megakernel_whose_multi_rank_ut_fails_twice_never_starts_mode_mega():
+    out = run("mega_noprep")
+    assert out["nested"] == [] and "kf:mega prepare c3 (retry)" in labels(out)
+    retry = next(c["prompt"] for c in out["calls"] if c["label"] == "kf:mega prepare c3 (retry)")
+    assert "weights not loadable" in retry
+    (rej,) = [x for x in out["result"]["rejected"] if x["id"] == "c3"]
+    assert rej["stage"] == "mega" and "still not loadable" in rej["reason"]
+
+
+def test_mode_mega_is_cut_where_packaging_still_ends_before_the_85pct_stop():
+    src = (E2E_DIR / "kernel_fusion" / "kf_workflow.js").read_text()
+    assert "Promise.race([workflow({ scriptPath: `${KERNEL_WF_DIR}/kernel_mega.js` }, megaArgs), MEGA_CUT])" in src
+    assert "TIME_BUDGET_MS * 0.85 - MEGA_PACKAGE_S * 1000" in src
+    assert "if (DEADLINE_HIT || MEGA_LATE) return out('stage deadline');" in src

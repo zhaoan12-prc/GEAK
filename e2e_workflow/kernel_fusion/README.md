@@ -49,13 +49,34 @@ GEAK_KERNEL_FUSION=0|1                                     # env
 | `author_k` | `GEAK_KF_AUTHOR_K` | 0 (no cap) | optional cap on the patterns the Feasibility Review sends to authoring |
 | `baseline_mode` | `GEAK_KF_BASELINE_MODE` | `isolated_server` | lifecycle of the stage's baseline: one fresh server, one timed round, no discarded warmup round |
 | `implementable_levels` | `GEAK_KF_IMPLEMENTABLE_LEVELS` | `L1,L2,L3` | fusion levels the analysis may recommend and the Feasibility Review may author (all levels are still ranked) |
-| `unsupported_patterns` | `GEAK_KF_UNSUPPORTED_PATTERNS` | L3 MegaKernel (e.g. MegaMoE), L4 MonoKernel | patterns inside those levels that are ranked but not recommended or authored |
+| `unsupported_patterns` | `GEAK_KF_UNSUPPORTED_PATTERNS` | L3 MegaKernel (e.g. MegaMoE), L4 MonoKernel; with `mega` on, L4 only | patterns inside those levels that are ranked but not recommended or authored |
+| `mega` | `GEAK_KF_MEGA` | off | L3 MegaKernel candidates are authored by the kernel workflow's `mode=mega` (see below) |
+| `mega_budget_s` | `GEAK_KF_MEGA_BUDGET_S` | 85% of the stage budget − 2 h | `mega_time_budget_s` of each mode=mega run |
+| `mega_args` | `GEAK_KF_MEGA_ARGS` | — | JSON object merged last into the mode=mega args (e.g. `{"budget": 6, "launch_target": 1}`) |
 | `accuracy_confirm_limit` | `GEAK_KF_ACCURACY_CONFIRM_LIMIT` | 1319 (full gsm8k test set) | when the fused stack misses the gsm8k gate on the 200-question sample, both sides are re-scored on this many questions and that result decides; the per-kernel screen (only if it still fails) uses it too |
 | `min_gain_pct` | `GEAK_KF_MIN_GAIN_PCT` | 0.5 | the combined A/B hands the overlay on only when its gain exceeds max(measured noise band, this) |
 | `validation_mode` / `validation_replicas` | `GEAK_KF_VALIDATION_MODE` / `_REPLICAS` | `isolated_server` / 1 | measurement mode / replicas of the combined A/B (one A/B) |
 | `task` | `GEAK_KF_TASK` | — | operator constraints appended to every agent prompt (e.g. directories it must not read) |
 | `budget_s` | `GEAK_KF_BUDGET_S` | min(12 h, ⅓ of the run) | stage wall clock, capped so the hard stop (1.1 × budget + 900 s) stays within 40% of the run; below 2 h the stage is skipped. The main workflow gets the run's timeout minus what the stage used |
 | `kf_dir` | `GEAK_KF_DIR` | `<exp_root>/kf_<main eval dir suffix>` | stage output dir |
+
+## L3 MegaKernel via mode=mega
+
+With `mega` on, the analysis may recommend an L3 MegaKernel (one persistent kernel that absorbs a multi-rank stage
+with its dispatch, combine or communication, e.g. an EP MoE layer) and the Feasibility Review routes it to
+`mode=mega`. After the single-GPU authors, for each such pattern, in turn:
+
+1. `kf:mega prepare`: a frozen copy of the operator source and a multi-rank UT (`mega_ut_template.py` contract:
+   `[RESULT] ... relL2`, `Perf: <ms> ms (<case>)` rank-max, `[op] path=`), one case per served phase, checked under
+   a GPU group lease.
+2. `kernel_workflow/kernel_mega.js`, called directly (one nesting level), on `gpu_ids` with the serving EP/TP size
+   as `gpus_per_job`; Expert Skills off unless `mega_args` pins one. It is cut where packaging still ends before
+   the stage's 85% stop.
+3. `kf:mega package`: only a delivered candidate (`mega_deliverable`) becomes an overlay, guarded to the cases where
+   it is correct and faster; it then goes through the same Integration Review and A/B as any other kernel.
+
+A mode=mega run takes hours (Setup + controls ~1–2 h, each candidate 1–3 h): raise `budget_s` (e.g. 24 h) and the
+run's timeout with it.
 
 Synthetic speculative acceptance (`SGLANG_SIMULATE_ACC_*`, `TILERT_SIMULATE_ACC_*`,
 `TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS`, as InferenceX AgentX throughput runs set) stays on for

@@ -479,3 +479,21 @@ def test_an_accepted_overlay_that_fails_validation_is_not_handed_on(tmp_path):
     kf = kf_stage.run_stage({"kernel_fusion": True}, pa, 36000, R)
     assert kf["status"] == "rejected_overlay" and "does not compile" in kf["reason"]
     assert pa["initial_overlay_pythonpath"] == "/base" and "main_initial_overlay" not in kf
+
+
+def test_the_mega_knobs_reach_the_stage_and_a_mega_prepare_is_reused(tmp_path, monkeypatch):
+    monkeypatch.setenv("GEAK_KF_MEGA", "1")
+    monkeypatch.setenv("GEAK_KF_MEGA_ARGS", '{"budget": 2}')
+    cfg = kf_stage.config({})
+    a = kf_stage.build_args(cfg, {"eval_dir": str(tmp_path / "e2e_x")}, 100)
+    assert a["kf_mega"] == "1" and a["kf_mega_args"] == '{"budget": 2}' and "kf_mega_time_budget_s" not in a
+    j = tmp_path / "journal.jsonl"
+    prep = {"ok": True, "kernel_path": "/b", "benchmark_harness": "/b/ut.py", "target_guards": ["64"], "gpus_per_job": 8,
+            "log": "z" * 9000}
+    rows = [{"type": "started", "key": "m", "label": "kf:mega prepare c3"}, {"type": "result", "key": "m", "result": prep},
+            {"type": "started", "key": "p", "label": "kf:mega package c3"}, {"type": "result", "key": "p", "result": {}}]
+    j.write_text("\n".join(json.dumps(r) for r in rows))
+    a = kf_stage.build_args({"reuse_journal": str(j)}, {"eval_dir": str(tmp_path / "e2e_x")}, 100)
+    assert list(a["kf_reuse"]) == ["kf:mega prepare c3"]          # the package step follows a fresh mode=mega run
+    slim = a["kf_reuse"]["kf:mega prepare c3"]
+    assert slim["benchmark_harness"] == "/b/ut.py" and slim["gpus_per_job"] == 8 and "log" not in slim

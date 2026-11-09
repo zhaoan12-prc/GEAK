@@ -1,12 +1,14 @@
 // Runs kf_workflow.js against scripted agent / nested-workflow answers (no GPU, no LLM).
 //   node kf_workflow_mockrun.mjs <scenario> <workflow_dir>
-// Prints one JSON line: {result, calls: [{label, phase, prompt}], workflows: [args]}.
+// Prints one JSON line: {result, calls: [{label, phase, prompt}], workflows: [args], nested: [{scriptPath, args}]}.
 import { readFile } from 'node:fs/promises';
 
 const [scenario, WF_DIR] = process.argv.slice(2);
 const KF = '/tmp/kf_mock/kf';
 const calls = [];
 const workflows = [];
+const nested = [];
+const MEGA = scenario.startsWith('mega');
 
 // c1 (difficulty 3) is recommended; c1s is its smaller exclusive alternative (the fallback).
 const CANDS = [
@@ -19,6 +21,8 @@ const CANDS = [
     exclusive_with: ['c1'], seam: { target_callable: 'pkg.moe:compact' }, est_gain_pct_expected: 1.6 },
   { id: 'c3', rank: 5, level: 'L3', region: 'moe stage', kernels: ['a', 'b'], difficulty: 2, seam: {}, est_gain_pct_expected: 9 },
 ];
+// mega scenarios: c3 is an L3 MegaKernel with a seam every rank runs
+if (MEGA) Object.assign(CANDS[3], { region: 'dispatch + expert GEMM + combine (MegaKernel)', seam: { target_callable: 'pkg.moe:EPMoE.forward' } });
 const ISO = { c1: scenario === 'fallback' ? 0.97 : 1.4, c2: (scenario === 'accept' || scenario === 'stack_fail' || scenario === 'reuse') ? 1.2 : 0.95, c1s: 1.6 };
 // the select agent's picks (it sees every UT result; the script enforces only the exclusivity line)
 // default: every UT result that beats stock, in the order given
@@ -63,6 +67,9 @@ const answers = {
   // which patterns get a kernel + UT: the agent's call (c3 has no seam, the script drops it)
   'kf:feasibility-review': () => (scenario === 'triage_none' ? null
     : scenario === 'no_seam' ? { selected: [{ id: 'c3' }], skipped: [] }
+    // c3 overlaps c1 (exclusive_with): the mega scenarios leave c1 out so c3 can reach the stack
+    : scenario === 'mega' || scenario === 'mega_fail' ? { selected: [{ id: 'c2', route: 'author' }, { id: 'c3', route: 'mega' }], skipped: [] }
+    : scenario === 'mega_noroute' ? { selected: [{ id: 'c2' }, { id: 'c3' }], skipped: [] }
     : { selected: [{ id: 'c1' }, { id: 'c1s' }, { id: 'c2' }, { id: 'c3' }], skipped: [] }),
   'kf:integration-review': (prompt) => {
     const ut = JSON.parse(prompt.split('## UT results\n')[1].split('\n')[0]);
@@ -82,6 +89,16 @@ const answers = {
     small_gain: { ...won('stack', 0.22), accepted_overlay: `${KF}/overlay/cand_kf_stack` },
     retry: { gate: 'incomplete', ab_complete: false, e2e_throughput_tok_s: 0, ref_med: 100 },
   }[scenario] || { ...won('accepted', 2.5), accepted_overlay: `${KF}/overlay/cand_kf_stack` }),
+  'kf:mega prepare c3': () => ({ ok: scenario !== 'mega_noprep', kernel_path: `${KF}/kernels/c3/mega_base`,
+    benchmark_harness: `${KF}/kernels/c3/mega_ut.py`, case_ids: ['decode_64', 'prefill_4096'],
+    case_weights: { decode_64: 0.9, prefill_4096: 0.1 }, target_guards: ['decode_64'], regression_guards: ['prefill_4096'],
+    required_accuracy_cases: ['decode_64', 'prefill_4096'], gpus_per_job: 2, candidate_import_modules: ['pkg'],
+    ut_command: 'torchrun mega_ut.py', task: 'EP2 bf16 MoE', notes: scenario === 'mega_noprep' ? 'weights not loadable' : '' }),
+  'kf:mega prepare c3 (retry)': () => ({ ok: false, kernel_path: '', benchmark_harness: '', target_guards: [], gpus_per_job: 2,
+    notes: 'still not loadable' }),
+  'kf:mega package c3': () => ({ final_patch: `${KF}/kernels/c3/final_patch.diff`, work_dir: `${KF}/kernels/c3/kernel`,
+    overlay_dir: `${KF}/kernels/c3/overlay`, banner: '[kf-c3] ENGAGED', isolated_speedup: 1.3, correctness: 'pass',
+    launches_after: 2, engaged_envelope: 'decode_64' }),
   'kf:integrate kf_stack (finish 1)': () => ({ ...won('accepted', 2), accepted_overlay: `${KF}/overlay/cand_kf_stack` }),
 };
 for (const id of Object.keys(ISO)) {
@@ -105,7 +122,19 @@ async function agent(prompt, opts) {
   if (!f) throw new Error(`unscripted agent ${opts.label}`);
   return f(prompt);
 }
-async function workflow() { throw new Error('KernelFusion must not start a nested GEAK workflow'); }
+// the only nested workflow KernelFusion may start: the kernel workflow's mode=mega worker (kf_mega)
+async function workflow(ref, a) {
+  if (!String(ref && ref.scriptPath).endsWith('/kernel_workflow/kernel_mega.js')) throw new Error(`unexpected nested workflow ${ref && ref.scriptPath}`);
+  nested.push({ scriptPath: ref.scriptPath, args: a });
+  return scenario === 'mega_fail'
+    ? { mode: 'mega', mega_deliverable: false, mega_selected_candidate: '', final_speedup: 0.91,
+        mega_note: 'mega: no fully verified finalist cleared the common correctness/guard/performance contract',
+        mega_candidate_registry: [{ id: 's1', status: 'runnable', next_blocker: 'graph replay hangs at decode_64' }] }
+    : { mode: 'mega', mega_deliverable: true, mega_selected_candidate: 's2', final_speedup: 1.3,
+        eval_dir: `${KF}/kernels/c3/mega/team_0/x`, report_path: `${KF}/kernels/c3/mega/tech_lead_report.md`,
+        final_patch: `${KF}/kernels/c3/mega/final_patch.diff`,
+        mega_candidate_registry: [{ id: 's2', status: 'finalist', tree: '/t/s2', head: 'abc', launches: 2, absolute_score: 1.3 }] };
+}
 const parallel = (ts) => Promise.all(ts.map((t) => Promise.resolve().then(t).catch(() => null)));
 const pipeline = null;
 const phase = () => {};
@@ -116,6 +145,7 @@ const args = { workflow_dir: WF_DIR, kf_dir: KF, model_path: '/models/M', gpu_id
   kf_prompt: '/prompts/p.txt,/prompts/deploy.txt', agent_timeout_ms: 0, kf_task: 'Do not read /answers.',
   initial_extra_env: 'SGLANG_USE_AITER=1 SGLANG_SIMULATE_ACC_LEN=4.05 SGLANG_SIMULATE_ACC_METHOD=match-expected HF_HUB_OFFLINE=1',
   correctness_unset_env: 'SGLANG_SIMULATE_ACC_LEN,SGLANG_SIMULATE_ACC_METHOD' };
+if (MEGA) Object.assign(args, { kf_mega: '1', kf_mega_args: '{"budget": 2}' });
 if (scenario === 'analysis_only') Object.assign(args, { kf_steps: 'topk', kf_trace_dir: '/traces/x' });
 if (scenario === 'reuse') args.kf_reuse = { 'kf:author c1': { final_patch: 'old c1', isolated_speedup: 1.3, correctness: 'pass',
   overlay_dir: '/old/c1/overlay', banner: '[kf-c1] ENGAGED' } };
@@ -128,4 +158,4 @@ const src = (await readFile(`${WF_DIR}/kernel_fusion/kf_workflow.js`, 'utf8'))
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 const fn = new AsyncFunction('agent', 'parallel', 'pipeline', 'phase', 'log', 'workflow', 'args', 'budget', src);
 const result = await fn(agent, parallel, pipeline, phase, log, workflow, args, {});
-process.stdout.write(JSON.stringify({ result, calls, workflows }) + '\n');
+process.stdout.write(JSON.stringify({ result, calls, workflows, nested }) + '\n');
