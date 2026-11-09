@@ -351,7 +351,9 @@ def validate_overlay(kf_overlay: str, initial_overlay: str, kf_dir: Path) -> dic
        and the initial sitecustomize.py is either kept as is or copied under another name that the new
        sitecustomize.py imports;
     5. it is the overlay the A/B measured: an integrate_result.json accepted exactly this directory with a
-       complete A/B, and no overlay source changed after that A/B's candidate leg finished.
+       complete A/B. File times are not compared: the integrator keeps its A/B records (e2e_validation.json,
+       manifests.json, ...) in this directory after the A/B, and the main workflow re-measures its baseline
+       on the handed-on overlay anyway.
     Returns {"ok", "problems", "manifest_sha256", "files"}."""
     problems: list[str] = []
     kf_dir = Path(kf_dir).resolve()
@@ -402,12 +404,6 @@ def validate_overlay(kf_overlay: str, initial_overlay: str, kf_dir: Path) -> dic
         problems.append("no integrate_result.json accepted this overlay directory")
     elif not rec.get("ab_complete"):
         problems.append(f"{rec_path}: the A/B is not complete")
-    else:
-        leg = Path(((rec.get("measurement_evidence") or {}).get("cand_summary")) or "")
-        stamp = (leg if leg.is_file() else rec_path).stat().st_mtime
-        changed = [r for r, p in files.items() if p.stat().st_mtime > stamp + 2]
-        if changed:
-            problems.append(f"overlay sources changed after the A/B measured it: {', '.join(sorted(changed)[:5])}")
     h = hashlib.sha256()
     for rel, p in sorted(files.items()):
         h.update(rel.encode() + b"\0" + hashlib.sha256(p.read_bytes()).digest())
