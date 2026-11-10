@@ -1,0 +1,462 @@
+{
+ "optimize": {
+  "calls": [
+   [
+    "director:setup",
+    "Setup",
+    "fe6869d09bd35f4c482278bfd39c4270be06dfd0d6551dc60a188025d4061efa"
+   ],
+   [
+    "tech_lead:analyze",
+    "Analyze",
+    "ec75ce987534a20ea358c7f6275a2f1b208eb748e2f5ae072a8c4ba36dae730c"
+   ],
+   [
+    "benchmark_engineer",
+    "Benchmark",
+    "428a769329b3d4a7b8d6385e41c6c4a44fe695b2e46580d41e17bcadb738f03b"
+   ],
+   [
+    "profile_engineer:baseline",
+    "Profile",
+    "28eff1d2ef2b6e90aaf6c45744ebc18f97dd1a14eab7e0a0c9cc254f0a8b32f7"
+   ],
+   [
+    "tech_lead:plan r1",
+    "Optimize",
+    "41c6241015c7ccae3d3eb6d21a7d133786e64477485ab2fbc039fb0b4aa30d33"
+   ],
+   [
+    "eng d1:memory",
+    "Optimize",
+    "34a0d334e0cbc10c634a2155c295618629e386396df68e0b015162a9a7659793"
+   ],
+   [
+    "eng d2:compute",
+    "Optimize",
+    "7893112cb6c3a878f268f93470f6aa0b967abd2d0bc70201e9b41a23654ec925"
+   ],
+   [
+    "verify d1",
+    "Verify",
+    "75f742a785b506c9566b00b76441ba700e5e82b1995b7085f5660637a1ebfab0"
+   ],
+   [
+    "verify d2",
+    "Verify",
+    "2c73611f6476bbf4d75173c74e5204db06174958b54e4dca9071ce5df3a0c719"
+   ],
+   [
+    "tech_lead:memory r1",
+    "Optimize",
+    "accc11ca347cbb452e2d881eac6eba44770a100ca001b33b8375d56be6f3d6a4"
+   ],
+   [
+    "storage:reclaim r1",
+    "Optimize",
+    "4b648947fa9ad5dc37cad02cf8788f26906252141f33200587820598a4912054"
+   ],
+   [
+    "tech_lead:plan r2",
+    "Optimize",
+    "b928a03ac5e7f9b2e75798f8bfb250b305ddf36cd8144bcb4f9b34da9c07a47e"
+   ],
+   [
+    "eng d3:algorithm",
+    "Optimize",
+    "b217d0164b6bc2cb18c43257eab48acd5cf5e5c3d812655232670b74371135f6"
+   ],
+   [
+    "verify d3",
+    "Verify",
+    "a33aaba1ba858d2e61d9078b544083c1ae2c16624115dedd15ee628d128454ad"
+   ],
+   [
+    "tech_lead:memory r2",
+    "Optimize",
+    "a2f356bb1f86ec936b102c98296fbefa8546efe05550517435f59fd297eb17ee"
+   ],
+   [
+    "storage:reclaim r2",
+    "Optimize",
+    "f0d87ac8e1d24af9fe5eab941e522a8354aa79004c9d2bb5fe9202dc9f59a605"
+   ],
+   [
+    "tech_lead:report",
+    "Report",
+    "19d40294fb54dea4dd8f5f3cb1df4cb3ed8424cb37512fa605b1dc940c6d4b91"
+   ],
+   [
+    "director:validate",
+    "Validate",
+    "19f9e536ca3353af7ee8a917b1104677f2ca0463b4ef9979a3d4af91aa31fd01"
+   ],
+   [
+    "kb:write",
+    "Validate",
+    "7de9c78b7f96b359d6934a4412050dc0ba53281e01ce5332ca0ac6a842ebd2cf"
+   ]
+  ],
+  "result": "6e42105f20853cfa159557fb03c1926e84332f66a82ffd4fc185132f4f0843db"
+ },
+ "author": {
+  "calls": [
+   [
+    "director:setup",
+    "Setup",
+    "64778c536871556b2f9ddd0572039e401b8547be7128a954ba9c160016de6083"
+   ],
+   [
+    "author:triton",
+    "Author",
+    "31420b27e336bdc17d775c69ecc6802063a4f799e14271c0598b06bd276d6889"
+   ],
+   [
+    "tech_lead:analyze",
+    "Analyze",
+    "ec75ce987534a20ea358c7f6275a2f1b208eb748e2f5ae072a8c4ba36dae730c"
+   ],
+   [
+    "benchmark_engineer",
+    "Benchmark",
+    "428a769329b3d4a7b8d6385e41c6c4a44fe695b2e46580d41e17bcadb738f03b"
+   ],
+   [
+    "profile_engineer:baseline",
+    "Profile",
+    "28eff1d2ef2b6e90aaf6c45744ebc18f97dd1a14eab7e0a0c9cc254f0a8b32f7"
+   ],
+   [
+    "tech_lead:plan r1",
+    "Optimize",
+    "41c6241015c7ccae3d3eb6d21a7d133786e64477485ab2fbc039fb0b4aa30d33"
+   ],
+   [
+    "eng d1:memory",
+    "Optimize",
+    "34a0d334e0cbc10c634a2155c295618629e386396df68e0b015162a9a7659793"
+   ],
+   [
+    "eng d2:compute",
+    "Optimize",
+    "7893112cb6c3a878f268f93470f6aa0b967abd2d0bc70201e9b41a23654ec925"
+   ],
+   [
+    "verify d1",
+    "Verify",
+    "75f742a785b506c9566b00b76441ba700e5e82b1995b7085f5660637a1ebfab0"
+   ],
+   [
+    "verify d2",
+    "Verify",
+    "2c73611f6476bbf4d75173c74e5204db06174958b54e4dca9071ce5df3a0c719"
+   ],
+   [
+    "tech_lead:memory r1",
+    "Optimize",
+    "accc11ca347cbb452e2d881eac6eba44770a100ca001b33b8375d56be6f3d6a4"
+   ],
+   [
+    "storage:reclaim r1",
+    "Optimize",
+    "4b648947fa9ad5dc37cad02cf8788f26906252141f33200587820598a4912054"
+   ],
+   [
+    "tech_lead:plan r2",
+    "Optimize",
+    "b928a03ac5e7f9b2e75798f8bfb250b305ddf36cd8144bcb4f9b34da9c07a47e"
+   ],
+   [
+    "eng d3:algorithm",
+    "Optimize",
+    "b217d0164b6bc2cb18c43257eab48acd5cf5e5c3d812655232670b74371135f6"
+   ],
+   [
+    "verify d3",
+    "Verify",
+    "a33aaba1ba858d2e61d9078b544083c1ae2c16624115dedd15ee628d128454ad"
+   ],
+   [
+    "tech_lead:memory r2",
+    "Optimize",
+    "a2f356bb1f86ec936b102c98296fbefa8546efe05550517435f59fd297eb17ee"
+   ],
+   [
+    "storage:reclaim r2",
+    "Optimize",
+    "f0d87ac8e1d24af9fe5eab941e522a8354aa79004c9d2bb5fe9202dc9f59a605"
+   ],
+   [
+    "tech_lead:report",
+    "Report",
+    "19d40294fb54dea4dd8f5f3cb1df4cb3ed8424cb37512fa605b1dc940c6d4b91"
+   ],
+   [
+    "director:validate",
+    "Validate",
+    "19f9e536ca3353af7ee8a917b1104677f2ca0463b4ef9979a3d4af91aa31fd01"
+   ],
+   [
+    "kb:write",
+    "Validate",
+    "7de9c78b7f96b359d6934a4412050dc0ba53281e01ce5332ca0ac6a842ebd2cf"
+   ]
+  ],
+  "result": "67b22a5ef03f43cbf0cef693b79cbdab2720670b9440e1e2341ad464a60c1e67"
+ },
+ "multigpu": {
+  "calls": [
+   [
+    "director:setup",
+    "Setup",
+    "fe6869d09bd35f4c482278bfd39c4270be06dfd0d6551dc60a188025d4061efa"
+   ],
+   [
+    "tech_lead:analyze",
+    "Analyze",
+    "3342f54fba9d2c8d1e93614c2ab48e335460f45b5a1a8812c489fd46640d9b66"
+   ],
+   [
+    "benchmark_engineer",
+    "Benchmark",
+    "acfe279e978994271f8c7b1e2190477ae5d9c5e1752c62595f78d2cdf989f7b1"
+   ],
+   [
+    "profile_engineer:baseline",
+    "Profile",
+    "a701ffa2b8d7537ce1351abdf3b03225da158960d5ffc818702a1bd996aabeb1"
+   ],
+   [
+    "tech_lead:plan r1",
+    "Optimize",
+    "4abcf8f36e3a4f9e6d6b6ba8fb7a429b15ce57f0d529eadac24a928c2e97b8b3"
+   ],
+   [
+    "eng d1:memory",
+    "Optimize",
+    "39b9e4fff25f93efecce255c5963736f98eef40fb60532eb72d3be353a769ec3"
+   ],
+   [
+    "eng d2:compute",
+    "Optimize",
+    "c5c2b4dc006d2c62141192791fb9a053b6f5697367eca892d50a5e8f40f96f49"
+   ],
+   [
+    "verify d1",
+    "Verify",
+    "c4b9f82b689d94499834f3983a0f5c001ad5a3c71f0d42bded704d59948c8cc2"
+   ],
+   [
+    "verify d2",
+    "Verify",
+    "2526a6ba9d0dedf789128a52f05e584a67705e77246008ecbd311127d049cedc"
+   ],
+   [
+    "tech_lead:memory r1",
+    "Optimize",
+    "eb43d5bfc4d12a0c64777332722cea577f413de1f09077ddd9d8d3eb72d857d3"
+   ],
+   [
+    "storage:reclaim r1",
+    "Optimize",
+    "4b648947fa9ad5dc37cad02cf8788f26906252141f33200587820598a4912054"
+   ],
+   [
+    "tech_lead:plan r2",
+    "Optimize",
+    "ae275ccc303fc75b3438b8de0266804ef2fca93c5227916c0628802ab2bc1437"
+   ],
+   [
+    "eng d3:algorithm",
+    "Optimize",
+    "25193512719052c7964633a24290c91ad645d5fde639fbda87687747a20cfb72"
+   ],
+   [
+    "verify d3",
+    "Verify",
+    "5cb205de5c70032e4ff418a2ae1b27840fe00c7b4aa1a8905d5e51ea723d00a5"
+   ],
+   [
+    "tech_lead:memory r2",
+    "Optimize",
+    "d6ef5fc1106cb69c5215ef33f201b8a9f6e9da423e0f2ed61f952767b4d89ac5"
+   ],
+   [
+    "storage:reclaim r2",
+    "Optimize",
+    "f0d87ac8e1d24af9fe5eab941e522a8354aa79004c9d2bb5fe9202dc9f59a605"
+   ],
+   [
+    "tech_lead:report",
+    "Report",
+    "3ca0c2ee2b62c791d289fbe04b5497faaaded19eef75c74072f5bb185b6a71e0"
+   ],
+   [
+    "director:validate",
+    "Validate",
+    "536933aa1c41e42c7460f97eec3a5a63a44cbc916018ab7e7e517e4e6cdbe803"
+   ],
+   [
+    "kb:write",
+    "Validate",
+    "7de9c78b7f96b359d6934a4412050dc0ba53281e01ce5332ca0ac6a842ebd2cf"
+   ]
+  ],
+  "result": "6e42105f20853cfa159557fb03c1926e84332f66a82ffd4fc185132f4f0843db"
+ },
+ "stop": {
+  "calls": [
+   [
+    "director:setup",
+    "Setup",
+    "fe6869d09bd35f4c482278bfd39c4270be06dfd0d6551dc60a188025d4061efa"
+   ],
+   [
+    "tech_lead:analyze",
+    "Analyze",
+    "ec75ce987534a20ea358c7f6275a2f1b208eb748e2f5ae072a8c4ba36dae730c"
+   ],
+   [
+    "benchmark_engineer",
+    "Benchmark",
+    "428a769329b3d4a7b8d6385e41c6c4a44fe695b2e46580d41e17bcadb738f03b"
+   ],
+   [
+    "profile_engineer:baseline",
+    "Profile",
+    "28eff1d2ef2b6e90aaf6c45744ebc18f97dd1a14eab7e0a0c9cc254f0a8b32f7"
+   ],
+   [
+    "tech_lead:plan r1",
+    "Optimize",
+    "41c6241015c7ccae3d3eb6d21a7d133786e64477485ab2fbc039fb0b4aa30d33"
+   ],
+   [
+    "tech_lead:report",
+    "Report",
+    "7332ea6c94478d83904a2a953af77a787856738ef840c5cb2020dcb051527d26"
+   ],
+   [
+    "director:validate",
+    "Validate",
+    "19f9e536ca3353af7ee8a917b1104677f2ca0463b4ef9979a3d4af91aa31fd01"
+   ],
+   [
+    "kb:write",
+    "Validate",
+    "7de9c78b7f96b359d6934a4412050dc0ba53281e01ce5332ca0ac6a842ebd2cf"
+   ]
+  ],
+  "result": "c32967b852e7772e3ef66be9009f7065b2b00bcd6a403962895c5cea59078d63"
+ },
+ "deadline": {
+  "calls": [
+   [
+    "director:setup",
+    "Setup",
+    "fe6869d09bd35f4c482278bfd39c4270be06dfd0d6551dc60a188025d4061efa"
+   ],
+   [
+    "tech_lead:analyze",
+    "Analyze",
+    "ec75ce987534a20ea358c7f6275a2f1b208eb748e2f5ae072a8c4ba36dae730c"
+   ],
+   [
+    "benchmark_engineer",
+    "Benchmark",
+    "428a769329b3d4a7b8d6385e41c6c4a44fe695b2e46580d41e17bcadb738f03b"
+   ],
+   [
+    "profile_engineer:baseline",
+    "Profile",
+    "28eff1d2ef2b6e90aaf6c45744ebc18f97dd1a14eab7e0a0c9cc254f0a8b32f7"
+   ],
+   [
+    "clock pre-r1",
+    "Optimize",
+    "2cb5e2ec23c6d0a664a817f12aa78ab9e673d136e87cb05d07c3717d24d2de44"
+   ],
+   [
+    "tech_lead:plan r1",
+    "Optimize",
+    "710deb0d12fb74a1406dd7f7ec0bb18133ef557befbb9321692cafbb9ddac853"
+   ],
+   [
+    "eng d1:memory",
+    "Optimize",
+    "34a0d334e0cbc10c634a2155c295618629e386396df68e0b015162a9a7659793"
+   ],
+   [
+    "eng d2:compute",
+    "Optimize",
+    "7893112cb6c3a878f268f93470f6aa0b967abd2d0bc70201e9b41a23654ec925"
+   ],
+   [
+    "verify d1",
+    "Verify",
+    "75f742a785b506c9566b00b76441ba700e5e82b1995b7085f5660637a1ebfab0"
+   ],
+   [
+    "verify d2",
+    "Verify",
+    "2c73611f6476bbf4d75173c74e5204db06174958b54e4dca9071ce5df3a0c719"
+   ],
+   [
+    "tech_lead:memory r1",
+    "Optimize",
+    "accc11ca347cbb452e2d881eac6eba44770a100ca001b33b8375d56be6f3d6a4"
+   ],
+   [
+    "storage:reclaim r1",
+    "Optimize",
+    "4b648947fa9ad5dc37cad02cf8788f26906252141f33200587820598a4912054"
+   ],
+   [
+    "clock pre-r2",
+    "Optimize",
+    "2cb5e2ec23c6d0a664a817f12aa78ab9e673d136e87cb05d07c3717d24d2de44"
+   ],
+   [
+    "tech_lead:plan r2",
+    "Optimize",
+    "1d17826bf0d20f3061c2abf1f8832bfb1e8d16af41d5c59fa548b55f75b1c6ba"
+   ],
+   [
+    "eng d3:algorithm",
+    "Optimize",
+    "b217d0164b6bc2cb18c43257eab48acd5cf5e5c3d812655232670b74371135f6"
+   ],
+   [
+    "verify d3",
+    "Verify",
+    "a33aaba1ba858d2e61d9078b544083c1ae2c16624115dedd15ee628d128454ad"
+   ],
+   [
+    "tech_lead:memory r2",
+    "Optimize",
+    "a2f356bb1f86ec936b102c98296fbefa8546efe05550517435f59fd297eb17ee"
+   ],
+   [
+    "storage:reclaim r2",
+    "Optimize",
+    "f0d87ac8e1d24af9fe5eab941e522a8354aa79004c9d2bb5fe9202dc9f59a605"
+   ],
+   [
+    "tech_lead:report",
+    "Report",
+    "19d40294fb54dea4dd8f5f3cb1df4cb3ed8424cb37512fa605b1dc940c6d4b91"
+   ],
+   [
+    "director:validate",
+    "Validate",
+    "19f9e536ca3353af7ee8a917b1104677f2ca0463b4ef9979a3d4af91aa31fd01"
+   ],
+   [
+    "kb:write",
+    "Validate",
+    "7de9c78b7f96b359d6934a4412050dc0ba53281e01ce5332ca0ac6a842ebd2cf"
+   ]
+  ],
+  "result": "ff05a9003c4ff49c6e57223bfd7f50be8f6505ac84f88ae689db014427f8ee7e"
+ }
+}
