@@ -124,9 +124,9 @@ async function agent(prompt, opts) {
   if (!f) throw new Error(`unscripted agent ${opts.label}`);
   return f(prompt);
 }
-// the only nested workflow KernelFusion may start: the kernel workflow's mode=mega worker (kf_mega)
+// the only nested workflow KernelFusion may start: the kernel workflow's lane worker in mode=mega (kf_mega)
 async function workflow(ref, a) {
-  if (!String(ref && ref.scriptPath).endsWith('/kernel_workflow/kernel_mega.js')) throw new Error(`unexpected nested workflow ${ref && ref.scriptPath}`);
+  if (!String(ref && ref.scriptPath).endsWith('/kernel_workflow/kernel_lane.js') || !a || a.mode !== 'mega') throw new Error(`unexpected nested workflow ${ref && ref.scriptPath}`);
   nested.push({ scriptPath: ref.scriptPath, args: a });
   return scenario === 'mega_fail'
     ? { mode: 'mega', mega_deliverable: false, mega_selected_candidate: '', final_speedup: 0.91,

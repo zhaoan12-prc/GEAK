@@ -6,7 +6,7 @@ export const meta = {
     { title: 'Setup', detail: 'e2e Director builds the KF eval dir + baseline throughput, one fresh server and one timed round, no warmup round (roles/director.md PHASE=setup)' },
     { title: 'Trace', detail: 'AgentX: kernel-extract skill sampling capture (points from the baseline log, one probe each); else roles/profiler.md; or kf_trace_dir' },
     { title: 'OpportunityAnalysis', detail: 'Opportunity Analysis: kf_trace_digest.py + the user prompt -> ranked fusion opportunities (topk.json)' },
-    { title: 'Author', detail: 'the Feasibility Review agent picks the opportunities worth authoring (no cap, no gain floor); each: region UT (AgentX: kernel-extract skill prepare; else roles/kernel_extractor.md), then one author agent writes the fused kernel against that UT; an L3 MegaKernel gets a multi-rank UT and the kernel workflow mode=mega (kernel_mega.js) instead (kf_mega=0: off)' },
+    { title: 'Author', detail: 'the Feasibility Review agent picks the opportunities worth authoring (no cap, no gain floor); each: region UT (AgentX: kernel-extract skill prepare; else roles/kernel_extractor.md), then one author agent writes the fused kernel against that UT; an L3 MegaKernel gets a multi-rank UT and the kernel workflow mode=mega (kernel_lane.js) instead (kf_mega=0: off)' },
     { title: 'ApplyBack', detail: 'the Integration Review agent picks from the UT results which kernels go on; they go in as one combined overlay on one e2e_integrator A/B (gsm8k on the whole stack first); only if the stack fails accuracy is each kernel checked alone and the A/B re-run without the failing ones' },
   ],
 };
@@ -136,8 +136,8 @@ if (TIME_BUDGET_MS && typeof setTimeout === 'function') {
   setTimeout(() => { RERUN_LATE = true; }, Math.max(0, Math.floor(hardMs - (AB_NEEDS_S + SCREEN_NEEDS_S) * 1000)));
 }
 
-// mode=mega (kf_mega): the kernel workflow's multi-GPU worker, called directly -- through the kernel_workflow.js
-// dispatcher it would nest 3 levels, which the runtime forbids. Its clock is modeled, so the nested run is also cut
+// mode=mega (kf_mega): the kernel workflow's lane worker with mode 'mega', called directly -- through the
+// kernel_workflow.js dispatcher it would nest 3 levels, which the runtime forbids. Its clock is modeled, so the nested run is also cut
 // (MEGA_CUT) where packaging (MEGA_PACKAGE_S) still ends before the 85% stop, so the ApplyBack can start. The default
 // budget also leaves an hour for the steps before Author.
 const KERNEL_WF_DIR = String(A.kernel_workflow_dir ||
@@ -881,7 +881,7 @@ async function megaOne(c) {
   };
   let mr = null;
   try {
-    mr = await Promise.race([workflow({ scriptPath: `${KERNEL_WF_DIR}/kernel_mega.js` }, megaArgs), MEGA_CUT]);
+    mr = await Promise.race([workflow({ scriptPath: `${KERNEL_WF_DIR}/kernel_lane.js` }, megaArgs), MEGA_CUT]);
   } catch (e) { return out(`mode=mega failed: ${String(e).slice(0, 600)}`); }
   if (!mr) return out(MEGA_LATE ? 'mode=mega cut at the stage deadline' : 'mode=mega returned nothing');
   const sel = (Array.isArray(mr.mega_candidate_registry) ? mr.mega_candidate_registry : [])

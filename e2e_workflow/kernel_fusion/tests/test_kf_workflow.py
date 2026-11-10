@@ -406,7 +406,7 @@ def test_kf_mega_routes_an_l3_megakernel_to_mode_mega_after_the_single_gpu_autho
     assert ls.index("kf:author c2") < ls.index("kf:mega prepare c3") < ls.index("kf:mega package c3") < ls.index("kf:integration-review")
     assert "kf:author c3" not in ls and "kf:extract c3" not in ls
     (n,) = out["nested"]
-    assert n["scriptPath"].endswith("/kernel_workflow/kernel_mega.js")       # the worker, not the dispatcher
+    assert n["scriptPath"].endswith("/kernel_workflow/kernel_lane.js")       # the worker, not the dispatcher
     a = n["args"]
     assert a["mode"] == "mega" and a["gpus_per_job"] == 2 and a["gpu_ids"] == "0,1" and a["budget"] == 2
     assert a["kernel_path"] == f"{KF}/kernels/c3/mega_base" and a["target_guards"] == ["decode_64"]
@@ -443,7 +443,7 @@ def test_a_megakernel_whose_multi_rank_ut_fails_twice_never_starts_mode_mega():
 
 def test_mode_mega_is_cut_where_packaging_still_ends_before_the_85pct_stop():
     src = (E2E_DIR / "kernel_fusion" / "kf_workflow.js").read_text()
-    assert "Promise.race([workflow({ scriptPath: `${KERNEL_WF_DIR}/kernel_mega.js` }, megaArgs), MEGA_CUT])" in src
+    assert "Promise.race([workflow({ scriptPath: `${KERNEL_WF_DIR}/kernel_lane.js` }, megaArgs), MEGA_CUT])" in src
     assert "TIME_BUDGET_MS * 0.85 - MEGA_PACKAGE_S * 1000" in src
     assert "if (DEADLINE_HIT || MEGA_LATE) return out('stage deadline');" in src
 

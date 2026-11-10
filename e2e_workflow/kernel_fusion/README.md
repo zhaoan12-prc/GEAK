@@ -72,7 +72,7 @@ less than `mega_min_s` is left. After the single-GPU authors, for each such patt
 1. `kf:mega prepare`: a frozen copy of the operator source and a multi-rank UT (`mega_ut_template.py` contract:
    `[RESULT] ... relL2`, `Perf: <ms> ms (<case>)` rank-max, `[op] path=`), one case per served phase, checked under
    a GPU group lease.
-2. `kernel_workflow/kernel_mega.js`, called directly (one nesting level), on `gpu_ids` with the serving EP/TP size
+2. `kernel_workflow/kernel_lane.js` with `mode: "mega"`, called directly (one nesting level), on `gpu_ids` with the serving EP/TP size
    as `gpus_per_job`; Expert Skills off unless `mega_args` pins one. It is cut where packaging still ends before
    the stage's 85% stop.
 3. `kf:mega package`: only a delivered candidate (`mega_deliverable`) becomes an overlay, guarded to the cases where
