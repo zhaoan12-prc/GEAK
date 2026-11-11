@@ -98,6 +98,8 @@ async function agent(prompt, opts) {
     const kernel_path = prompt.match(/TASK_DIR=(\S+)/)[1];
     workflows.push({ kernel_path, task: prompt });
     const id = kernel_path.split('/').pop().replace(/_task$/, '');
+    // author_gate: c2's author is still running when the author gate opens
+    if (scenario === 'author_gate' && id === 'c2') await new Promise((r) => setTimeout(r, 3000));
     return { final_patch: `diff ${id}`, isolated_speedup: ISO[id], correctness: 'pass', notes: '',
       overlay_dir: `${KF}/kernels/${id}/overlay`, banner: `[kf-${id}] ENGAGED` };
   }
@@ -116,6 +118,8 @@ const args = { workflow_dir: WF_DIR, kf_dir: KF, model_path: '/models/M', gpu_id
   kf_prompt: '/prompts/p.txt,/prompts/deploy.txt', agent_timeout_ms: 0, kf_task: 'Do not read /answers.',
   initial_extra_env: 'SGLANG_USE_AITER=1 SGLANG_SIMULATE_ACC_LEN=4.05 SGLANG_SIMULATE_ACC_METHOD=match-expected HF_HUB_OFFLINE=1',
   correctness_unset_env: 'SGLANG_SIMULATE_ACC_LEN,SGLANG_SIMULATE_ACC_METHOD' };
+// author_gate: hard limit 1.1 x 1 s + 900 s; the gate opens 900 s (review) before it, at ~1.1 s, the A/B gate stays open
+if (scenario === 'author_gate') Object.assign(args, { time_budget_s: 1, kf_ab_needs_s: 0, kf_review_needs_s: 900 });
 if (scenario === 'analysis_only') Object.assign(args, { kf_steps: 'topk', kf_trace_dir: '/traces/x' });
 if (scenario === 'reuse') args.kf_reuse = { 'kf:author c1': { final_patch: 'old c1', isolated_speedup: 1.3, correctness: 'pass',
   overlay_dir: '/old/c1/overlay', banner: '[kf-c1] ENGAGED' } };
@@ -128,4 +132,5 @@ const src = (await readFile(`${WF_DIR}/kernel_fusion/kf_workflow.js`, 'utf8'))
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 const fn = new AsyncFunction('agent', 'parallel', 'pipeline', 'phase', 'log', 'workflow', 'args', 'budget', src);
 const result = await fn(agent, parallel, pipeline, phase, log, workflow, args, {});
-process.stdout.write(JSON.stringify({ result, calls, workflows }) + '\n');
+// exit once written: the stage's budget timers would otherwise keep node alive
+process.stdout.write(JSON.stringify({ result, calls, workflows }) + '\n', () => process.exit(0));

@@ -110,25 +110,41 @@ const CAPTURE_STORAGE_ENV = `CAPTURE_BYTE_BUDGET=${A.capture_byte_budget || '8Gi
 const AUTHOR_K = parseInt(A.kf_author_k != null ? A.kf_author_k : 0, 10);   // 0 = no cap: the Feasibility Review decides
 const AGENT_TIMEOUT_MS = parseInt(A.agent_timeout_ms != null ? A.agent_timeout_ms : 7200000, 10);
 
-// Stop STARTING author/apply work once 85% of the stage budget is gone; in-flight work finishes and the
-// stage returns whatever was accepted. Inert without time_budget_s.
+// Stop STARTING author work once 85% of the stage budget is gone. The Integration Review and the A/B are gated by
+// AB_LATE (what the hard limit still leaves), not by this. Inert without time_budget_s.
 const TIME_BUDGET_MS = A.time_budget_s ? parseInt(A.time_budget_s, 10) * 1000 : null;
 let DEADLINE_HIT = false;
 if (TIME_BUDGET_MS && typeof setTimeout === 'function') {
-  setTimeout(() => { DEADLINE_HIT = true; log('[kf] 85% of the stage budget spent: no new author/apply work starts.'); },
+  setTimeout(() => { DEADLINE_HIT = true; log('[kf] 85% of the stage budget spent: no new author work starts.'); },
     Math.floor(TIME_BUDGET_MS * 0.85));
 }
 // kf_stage stops the stage at 1.1 x budget + 900 s. A combined A/B (stack gsm8k, a reference leg and a candidate
 // leg) starts only while that hard limit still leaves AB_NEEDS_S; a re-run after a failed stack also needs the
 // per-kernel screen. An A/B cut off mid-leg measures nothing and leaves detached legs on the serving GPUs.
-const AB_NEEDS_S = parseInt(A.kf_ab_needs_s != null ? A.kf_ab_needs_s : 5400, 10);
+// AgentX: stack gsm8k + two 3600 s legs, each with its own boot, measured 2.3-2.7 h (DSv4.1-Flash c32/c64).
+const AB_NEEDS_S = parseInt(A.kf_ab_needs_s != null ? A.kf_ab_needs_s : (IS_AGENTX ? 10800 : 5400), 10);
 const SCREEN_NEEDS_S = parseInt(A.kf_screen_needs_s != null ? A.kf_screen_needs_s : 1800, 10);
-let AB_LATE = false, RERUN_LATE = false;
+// The Author gate: UT prepare / authoring still running when only the Integration Review (REVIEW_NEEDS_S) and the
+// combined A/B are left is not waited for -- the kernels done by then go on, the rest are recorded as cut by the
+// budget. Without it the stage waited for its slowest author and then had no time left for any A/B.
+const REVIEW_NEEDS_S = parseInt(A.kf_review_needs_s != null ? A.kf_review_needs_s : 900, 10);
+let AB_LATE = false, RERUN_LATE = false, AUTHOR_LATE = false;
+let openAuthorGate = () => {};
+const AUTHOR_GATE = new Promise((resolve) => { openAuthorGate = resolve; });
 if (TIME_BUDGET_MS && typeof setTimeout === 'function') {
   const hardMs = TIME_BUDGET_MS * 1.1 + 900000;
   setTimeout(() => { AB_LATE = true; }, Math.max(0, Math.floor(hardMs - AB_NEEDS_S * 1000)));
   setTimeout(() => { RERUN_LATE = true; }, Math.max(0, Math.floor(hardMs - (AB_NEEDS_S + SCREEN_NEEDS_S) * 1000)));
+  setTimeout(() => {
+    AUTHOR_LATE = true;
+    log(`[kf] author gate: less than ${AB_NEEDS_S + REVIEW_NEEDS_S}s left before the hard stop; ` +
+      'the kernels done so far go on to the Integration Review, unfinished ones are left out.');
+    openAuthorGate();
+  }, Math.max(0, Math.floor(hardMs - (AB_NEEDS_S + REVIEW_NEEDS_S) * 1000)));
 }
+const BUDGET_CUT = 'stage budget: not finished before the author gate (time reserved for the Integration Review and the combined A/B)';
+// Resolves with `late` once the author gate opens; the work keeps running (an agent cannot be cancelled) but is ignored.
+const beforeGate = (p, late) => Promise.race([p, AUTHOR_GATE.then(() => late)]);
 
 // Same deployment requirement e2e_workflow.js injects into every kernel task (derived the same way).
 const GRAPH_REQ = ((BACKEND === 'vllm' || BACKEND === 'sglang') && !/enforce[-_]eager/i.test(INIT_FLAGS))
@@ -648,18 +664,20 @@ async function prepareOne(c, i, previous) {
     .filter(Boolean).join('; ');
   return { ok: false, notes: why || (prep ? 'no task in the delivery' : 'no result') };
 }
-if (IS_AGENTX && jobs.length && !DEADLINE_HIT) {
-  const res = await parallel(jobs.map((c, i) => async () => {
+if (IS_AGENTX && jobs.length && !DEADLINE_HIT && !AUTHOR_LATE) {
+  const res = await parallel(jobs.map((c, i) => () => beforeGate((async () => {
     let r = await prepareOne(c, i, null);
-    if (!(r && r.ok) && !DEADLINE_HIT) r = await prepareOne(c, i, String((r && r.notes) || 'no result').slice(0, 1500));
+    if (!(r && r.ok) && !DEADLINE_HIT && !AUTHOR_LATE) r = await prepareOne(c, i, String((r && r.notes) || 'no result').slice(0, 1500));
     return [shortOf(c), r];
-  }));
+  })(), [shortOf(c), { ok: false, late: true, notes: BUDGET_CUT }])));
   for (const x of res) if (x) preparedById.set(x[0], x[1]);
   log(`[kf] kernel-extract prepared ${[...preparedById.values()].filter((r) => r && r.ok).length}/${jobs.length} fusion UT(s)`);
 }
 
 async function authorOne(c, i) {
+  if (AUTHOR_LATE) return { c, skip: BUDGET_CUT, late: true };
   if (DEADLINE_HIT) return { c, skip: 'stage deadline' };
+  if (IS_AGENTX && preparedById.get(shortOf(c)) && preparedById.get(shortOf(c)).late) return { c, skip: BUDGET_CUT, late: true };
   const gpu = GPU_LIST[i % GPU_LIST.length];
   const short = shortOf(c);
   const ext = IS_AGENTX ? (preparedById.get(short) || null) : await safeAgent(roleAgent('kernel_extractor', 'extract',
@@ -744,7 +762,7 @@ whether or not it beats stock -- the next step judges it) or "" if you have no c
   const iso = kl ? (kl.final_weighted != null ? kl.final_weighted : kl.final_geomean) : 0;
   return { c, ext, kl, lang, iso };
 }
-const authored = await parallel(jobs.map((c, i) => () => authorOne(c, i)));
+const authored = await parallel(jobs.map((c, i) => () => beforeGate(authorOne(c, i), { c, skip: BUDGET_CUT, late: true })));
 const authoredById = new Map(authored.filter(Boolean).map((r) => [String(r.c.id), r]));
 // A kernel can go on only if it exists, passed its UT and has an overlay: everything else is the Integration Review's call.
 const usable = (r) => r && !r.skip && r.kl && r.kl.authored !== false && r.kl.final_patch && r.kl.overlay_dir;
@@ -752,7 +770,8 @@ for (const r of authored) {
   if (r && !usable(r)) {
     const why = r.skip || `no correct kernel (${r.kl ? r.kl.reason || r.kl.validation_status || '' : 'none'})`;
     log(`[kf] ${r.c.id}: ${why}`);
-    result.rejected.push({ id: r.c.id, stage: r.skip ? 'extract' : 'author', reason: why, isolated_speedup: r.iso || 0 });
+    result.rejected.push({ id: r.c.id, stage: r.late ? 'author' : (r.skip ? 'extract' : 'author'), reason: why,
+      isolated_speedup: r.iso || 0, ...(r.late ? { est_gain_pct_expected: r.c.est_gain_pct_expected || 0 } : {}) });
   }
 }
 const ready = authored.filter(usable);
@@ -771,7 +790,7 @@ const utView = (r) => ({ id: r.c.id, level: r.c.level, region: r.c.region, phase
   launches_before: r.c.launches_before || (r.c.kernels || []).length,
   final_patch: r.kl.final_patch, author_notes: String(r.kl.reason || '').slice(0, 3000) });
 let winners = [];
-if (ready.length && want('apply') && !DEADLINE_HIT) {
+if (ready.length && want('apply') && !AB_LATE) {
   const sel = await safeAgent(`Integration Review. You decide which fused kernels go on to the e2e accuracy check and the e2e A/B of a
 live LLM serving stack. Each one below passed its region unit test; the A/B puts all you pick into the server
 together. Judge from the UT results (speedup on the served shapes, per-shape notes, how much of the step the region
@@ -838,10 +857,13 @@ async function screen(list, label) {
   }
   return failed;
 }
-if (!want('apply') || !winners.length || DEADLINE_HIT || AB_LATE) {
-  for (const r of winners) result.rejected.push({ id: r.c.id, stage: 'apply', isolated_speedup: r.iso,
-    reason: !want('apply') ? 'apply step disabled'
-      : AB_LATE && !DEADLINE_HIT ? `stage deadline: less than ${AB_NEEDS_S}s left for the combined A/B` : 'stage deadline' });
+if (!want('apply') || !winners.length || AB_LATE) {
+  // every finished kernel is accounted for: picked ones, or all of them when the review itself was too late
+  const reviewed = new Set(result.rejected.map((x) => String(x.id)));
+  for (const r of (winners.length ? winners : ready.filter((q) => !reviewed.has(String(q.c.id))))) {
+    result.rejected.push({ id: r.c.id, stage: 'apply', isolated_speedup: r.iso,
+      reason: !want('apply') ? 'apply step disabled' : `stage deadline: less than ${AB_NEEDS_S}s left for the combined A/B` });
+  }
   result.status = 'no_gain';
   return result;
 }
@@ -887,7 +909,7 @@ async function stackAB(members, suffix) {
 let integ = await stackAB(winners, '');
 const correctnessFail = (x) => x && x.gate === 'rejected' &&
   (CORRECTNESS_FAIL.test(String(x.reason || '')) || /fail/i.test(String(x.output_parity || '')));
-if (correctnessFail(integ) && winners.length > 1 && !DEADLINE_HIT && !RERUN_LATE) {
+if (correctnessFail(integ) && winners.length > 1 && !RERUN_LATE) {
   const failed = await screen(winners, 'kf:integrate screen');
   if (failed && failed.length && failed.length < winners.length) {
     winners = winners.filter((r) => !failed.includes(r));
