@@ -55,6 +55,8 @@ GEAK_KERNEL_FUSION=1|0                                     # env
 | `accuracy_confirm_limit` | `GEAK_KF_ACCURACY_CONFIRM_LIMIT` | 1319 (full gsm8k test set) | when the fused stack misses the gsm8k gate on the 200-question sample, both sides are re-scored on this many questions and that result decides; the per-kernel screen (only if it still fails) uses it too |
 | `min_gain_pct` | `GEAK_KF_MIN_GAIN_PCT` | 0.5 | the combined A/B hands the overlay on only when its gain exceeds max(measured noise band, this) |
 | `validation_mode` / `validation_replicas` | `GEAK_KF_VALIDATION_MODE` / `_REPLICAS` | `isolated_server` / 1 | measurement mode / replicas of the combined A/B (one A/B) |
+| `ab_needs_s` | `GEAK_KF_AB_NEEDS_S` | 10800 (AgentX) / 5400 | time the combined A/B needs (AgentX: stack gsm8k + two 3600 s legs, measured 2.3–2.7 h); it starts only while the hard stop leaves this much |
+| `review_needs_s` | `GEAK_KF_REVIEW_NEEDS_S` | 900 | the author gate opens `ab_needs_s + review_needs_s` before the hard stop: UT prepare / authors not finished by then are left out (recorded in `rejected`, stage `author`, with their expected gain) and the finished ones go on to the Integration Review (prepares and authors run in parallel, so a slow one never holds back the rest) |
 | `task` | `GEAK_KF_TASK` | — | operator constraints appended to every agent prompt (e.g. directories it must not read) |
 | `budget_s` | `GEAK_KF_BUDGET_S` | min(12 h, ⅓ of the run) | stage wall clock, capped so the hard stop (1.1 × budget + 900 s) stays within 40% of the run; below 2 h the stage is skipped. The main workflow gets the run's timeout minus what the stage used |
 | `kf_dir` | `GEAK_KF_DIR` | `<exp_root>/kf_<main eval dir suffix>` | stage output dir |

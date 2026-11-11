@@ -327,8 +327,21 @@ def test_the_workflow_owns_the_output_format_and_the_schema_types_the_seam():
 def test_a_combined_ab_starts_only_while_the_hard_limit_leaves_room_for_it():
     src = (E2E_DIR / "kernel_fusion" / "kf_workflow.js").read_text()
     assert re.search(r"hardMs = TIME_BUDGET_MS \* 1\.1 \+ 900000", src)           # kf_stage's hard limit
-    assert "|| DEADLINE_HIT || AB_LATE)" in src and "!DEADLINE_HIT && !RERUN_LATE)" in src
+    assert "|| !winners.length || AB_LATE)" in src and "winners.length > 1 && !RERUN_LATE)" in src
+    assert "ready.length && want('apply') && !AB_LATE)" in src          # the 85% mark does not block the A/B
     assert "stage deadline: less than ${AB_NEEDS_S}s left for the combined A/B" in src
+    assert "(IS_AGENTX ? 10800 : 5400)" in src                          # AgentX A/B: gsm8k + two 3600 s legs
+
+
+def test_the_author_gate_sends_finished_kernels_on_and_records_the_cut_ones():
+    # c32 run9: 10 authors in parallel, the stage waited for the slowest one and then had no time for any A/B.
+    out = run("author_gate")
+    r = out["result"]
+    assert r["status"] == "accepted" and [a["id"] for a in r["accepted"]] == ["c1"]
+    cut = [x for x in r["rejected"] if x["id"] == "c2"]
+    assert cut and cut[0]["stage"] == "author" and cut[0]["reason"].startswith("stage budget: not finished before the author gate")
+    assert cut[0]["est_gain_pct_expected"] == 1.5
+    assert "kf:integration-review" in labels(out)
 
 
 def test_a_gain_inside_the_noise_band_is_not_handed_on():

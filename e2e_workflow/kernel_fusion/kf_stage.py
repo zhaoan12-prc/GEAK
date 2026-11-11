@@ -56,6 +56,8 @@ _KNOBS = {
     "accuracy_confirm_limit": ("GEAK_KF_ACCURACY_CONFIRM_LIMIT", "kf_accuracy_confirm_limit"),
     "min_gain_pct": ("GEAK_KF_MIN_GAIN_PCT", "kf_min_gain_pct"),
     "task": ("GEAK_KF_TASK", "kf_task"),
+    "ab_needs_s": ("GEAK_KF_AB_NEEDS_S", "kf_ab_needs_s"),
+    "review_needs_s": ("GEAK_KF_REVIEW_NEEDS_S", "kf_review_needs_s"),
     "budget_s": ("GEAK_KF_BUDGET_S", None),
     "kf_dir": ("GEAK_KF_DIR", "kf_dir"),
 }
